@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# Next.js builds
+.next/
+out/
+
+# local tooling and visual checks
+.playwright-cli/
+output/
+
+# deployment metadata
+.vercel/
+
+# environment and secrets
+.env
+.env.*
+!.env.example
+
+# system files
+.DS_Store
+*.log
+
+# TypeScript cache
+*.tsbuildinfo
