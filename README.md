@@ -2,6 +2,10 @@
 
 Prototype interactif d’un cockpit de prospection B2B agentique, conçu dans le langage visuel minimal de SOMA.
 
+## Démo publique
+
+[Ouvrir Revenue OS](https://revenue-os-prospection-b2b.vercel.app)
+
 ## Ce que montre le prototype
 
 - Cockpit IA et missions persistantes
