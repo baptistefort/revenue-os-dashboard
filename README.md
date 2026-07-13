@@ -4,7 +4,7 @@ Prototype interactif d’un cockpit de prospection B2B agentique, conçu dans le
 
 ## Démo publique
 
-[Ouvrir Revenue OS](https://revenue-os-prospection-b2b.vercel.app)
+[Ouvrir Revenue OS](https://revenue-os-dashboard-nu.vercel.app)
 
 ## Ce que montre le prototype
 
