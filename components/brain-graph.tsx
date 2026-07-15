@@ -144,7 +144,14 @@ const generatedEdges: BrainEdge[] = memorySeeds
   .filter((edge) => fallbackIds.has(edge.to) || generatedIds.has(edge.to));
 
 const demoNodes = [...fallbackNodes, ...generatedNodes];
-const demoEdges = [...fallbackEdges, ...generatedEdges];
+const semanticDemoEdges = [...fallbackEdges, ...generatedEdges];
+const connectedToCompany = new Set(
+  semanticDemoEdges.flatMap((edge) => edge.from === "ORG-001" ? [edge.to] : edge.to === "ORG-001" ? [edge.from] : []),
+);
+const memorySpineEdges: BrainEdge[] = demoNodes
+  .filter((node) => node.id !== "ORG-001" && !connectedToCompany.has(node.id))
+  .map((node) => ({ from: "ORG-001", to: node.id, type: "knowledge" }));
+const demoEdges = [...semanticDemoEdges, ...memorySpineEdges];
 const evidenceIds = new Set(["PROJET-241", "TEMPS-086", "ACHAT-109", "DEC-063", "CLI-001"]);
 
 function nodeRadius(node: BrainNode) {
