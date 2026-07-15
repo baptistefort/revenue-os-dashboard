@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BrainGraph } from "@/components/brain-graph";
 import { OpsIcon } from "@/components/ops-icons";
+import { VoiceMode, type VoiceModeHandle } from "@/components/voice-mode";
 import {
   acquisitionChannels,
   agentScenarios,
@@ -13,7 +14,6 @@ import {
   cycleStages,
   documents,
   emailThreads,
-  findScenario,
   kpis,
   missions,
   navGroups,
@@ -23,8 +23,10 @@ import {
   planningRows,
   type AgentScenario,
   type IconName,
+  type OpsDocument,
   type PageId,
 } from "@/lib/ops-demo-data";
+import { asksForPdf, buildFallbackScenario, extractPdfTopic } from "@/lib/ops-agent-engine";
 
 type OpenAgent = (prompt?: string) => void;
 
@@ -183,12 +185,40 @@ function TodayPage({ setPage, openAgent }: { setPage: (page: PageId) => void; op
   );
 }
 
-type ChatMessage = { id: number; role: "user" | "assistant"; prompt?: string; scenario?: AgentScenario; text?: string; loading?: boolean };
+type ChatMessage = {
+  id: number;
+  role: "user" | "assistant";
+  prompt?: string;
+  scenario?: AgentScenario;
+  text?: string;
+  loading?: boolean;
+  statusText?: string;
+  document?: OpsDocument;
+};
 
-function FullComposer({ value, setValue, onSubmit, processing, centered = false }: {
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("PDF illisible"));
+    reader.onerror = () => reject(reader.error ?? new Error("PDF illisible"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} o`;
+  return `${Math.max(1, Math.round(bytes / 1024))} Ko`;
+}
+
+function createReply(id: string, lead: string, body: string[], sources: string[], followups: string[]): AgentScenario {
+  return { id, label: lead, keywords: [], lead, body, sources, followups };
+}
+
+function FullComposer({ value, setValue, onSubmit, onVoice, processing, centered = false }: {
   value: string;
   setValue: (value: string) => void;
   onSubmit: () => void;
+  onVoice: () => void;
   processing: boolean;
   centered?: boolean;
 }) {
@@ -203,21 +233,28 @@ function FullComposer({ value, setValue, onSubmit, processing, centered = false 
       />
       <div className="composer-actions">
         <div><button aria-label="Joindre"><OpsIcon name="plus" size={23} /></button><span className="context-select">Toute l’entreprise <OpsIcon name="chevron" size={13} /></span></div>
-        <div><button aria-label="Dicter"><OpsIcon name="microphone" size={21} /></button><button className="voice-button" onClick={onSubmit} aria-label={processing ? "Interrompre" : "Envoyer"}>{processing ? <span className="stop-square" /> : <OpsIcon name="send" size={20} />}</button></div>
+        <div><button type="button" aria-label="Démarrer une conversation vocale" onClick={onVoice}><OpsIcon name="microphone" size={21} /></button><button type="button" className="voice-button" onClick={onSubmit} aria-label={processing ? "Interrompre" : "Envoyer"}>{processing ? <span className="stop-square" /> : <OpsIcon name="send" size={20} />}</button></div>
       </div>
     </div>
   );
 }
 
-function ScenarioResponse({ scenario, text }: { scenario: AgentScenario; text?: string }) {
-  const body = text ? [text] : scenario.body;
+function ScenarioResponse({ scenario, text, document, openDocuments, onSpeak }: {
+  scenario: AgentScenario;
+  text?: string;
+  document?: OpsDocument;
+  openDocuments: (documentId?: string) => void;
+  onSpeak: (text: string) => void;
+}) {
+  const body = text ? text.split(/\n{2,}/).filter(Boolean) : scenario.body;
+  const answerText = [scenario.lead, ...body].filter(Boolean).join("\n\n");
   return (
     <div className="assistant-answer">
       <div className="assistant-mark"><OpsIcon name="spark" size={18} /></div>
       <div className="assistant-content">
-        <strong className="answer-lead">{scenario.lead}</strong>
-        <div className="answer-body">{body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>
-        <SourceChips sources={scenario.sources} />
+        {scenario.lead ? <strong className="answer-lead">{scenario.lead}</strong> : null}
+        <div className="answer-body">{body.map((paragraph, index) => <p key={`${index}-${paragraph.slice(0, 24)}`}>{paragraph}</p>)}</div>
+        {scenario.sources.length ? <SourceChips sources={scenario.sources} /> : null}
         {scenario.artifact && (
           <article className="agent-artifact">
             <span>{scenario.artifact.kicker}</span><h3>{scenario.artifact.title}</h3>
@@ -225,40 +262,153 @@ function ScenarioResponse({ scenario, text }: { scenario: AgentScenario; text?: 
             <footer><small><OpsIcon name="shield" size={13} /> Aucune action externe sans validation</small><button>{scenario.artifact.action}</button></footer>
           </article>
         )}
-        <div className="response-actions"><button>Copier</button><button>Utile</button><button>Corriger</button></div>
+        {document?.dataUrl ? (
+          <article className="document-artifact">
+            <div className="document-artifact-icon"><OpsIcon name="document" size={22} /></div>
+            <div className="document-artifact-copy">
+              <span>PDF généré par OPS</span>
+              <strong>{document.name}</strong>
+              <small>{document.pages ?? 3} pages · {document.size ?? "—"} · {document.facts} sources reliées</small>
+            </div>
+            <div className="document-artifact-actions">
+              <a href={document.dataUrl} target="_blank" rel="noreferrer"><OpsIcon name="folder" size={15} /> Ouvrir</a>
+              <a href={document.dataUrl} download={document.name}><OpsIcon name="download" size={15} /> Télécharger</a>
+              <button type="button" onClick={() => openDocuments(document.id)}>Voir dans Documents <OpsIcon name="arrow" size={14} /></button>
+            </div>
+          </article>
+        ) : null}
+        <div className="response-actions">
+          <button type="button" onClick={() => navigator.clipboard?.writeText(answerText)}><OpsIcon name="copy" size={14} /> Copier</button>
+          <button type="button"><OpsIcon name="thumb" size={14} /> Utile</button>
+          <button type="button"><OpsIcon name="edit" size={14} /> Corriger</button>
+          <button type="button" onClick={() => onSpeak(answerText)}><OpsIcon name="volume" size={14} /> Écouter</button>
+        </div>
       </div>
     </div>
   );
 }
 
-function AgentPage({ initialPrompt, consumePrompt }: { initialPrompt: string; consumePrompt: () => void }) {
+function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocuments }: {
+  initialPrompt: string;
+  consumePrompt: () => void;
+  onDocumentGenerated: (document: OpsDocument) => void;
+  openDocuments: (documentId?: string) => void;
+}) {
   const [value, setValue] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [processing, setProcessing] = useState(false);
+  const [pendingPdf, setPendingPdf] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const voiceModeRef = useRef<VoiceModeHandle>(null);
 
-  const submit = useCallback(async (override?: string) => {
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  const speak = useCallback((text: string) => {
+    if (voiceOpen && voiceModeRef.current) {
+      voiceModeRef.current.speak(text);
+      return;
+    }
+    if (!("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text.replace(/\b[A-Z]{2,}-[A-Z0-9-]+\b/g, ""));
+    utterance.lang = "fr-FR";
+    utterance.rate = 0.98;
+    const voice = window.speechSynthesis.getVoices().find((candidate) => candidate.lang.toLocaleLowerCase().startsWith("fr"));
+    if (voice) utterance.voice = voice;
+    window.speechSynthesis.speak(utterance);
+  }, [voiceOpen]);
+
+  const submit = useCallback(async (override?: string, fromVoice = false) => {
     const prompt = (override ?? value).trim();
     if (!prompt || processing) return;
     setValue("");
     setProcessing(true);
     const userId = Date.now();
-    const scenario = findScenario(prompt);
-    setMessages((current) => [...current, { id: userId, role: "user", prompt }, { id: userId + 1, role: "assistant", scenario, loading: true }]);
+    const fallbackScenario = buildFallbackScenario(prompt);
+    const shouldResolvePdf = pendingPdf || asksForPdf(prompt);
+    const pdfTopic = extractPdfTopic(prompt);
 
-    if (scenario.id !== "general") {
-      window.setTimeout(() => {
-        setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false } : message));
-        setProcessing(false);
-      }, 900);
+    if (asksForPdf(prompt) && !pdfTopic) {
+      const clarification = createReply(
+        "pdf-clarification",
+        "D’accord. Quel document souhaitez-vous créer ?",
+        ["Vous pouvez me demander, par exemple, le rapport de direction 2026, un brief CODIR, une analyse de marge ou une stratégie à 90 jours."],
+        [],
+        ["Le rapport de direction 2026", "Un brief CODIR", "La stratégie à 90 jours"],
+      );
+      setMessages((current) => [...current, { id: userId, role: "user", prompt }, { id: userId + 1, role: "assistant", scenario: clarification }]);
+      setPendingPdf(true);
+      setProcessing(false);
+      if (fromVoice) speak([clarification.lead, ...clarification.body].join(" "));
       return;
     }
 
+    if (shouldResolvePdf && pdfTopic) {
+      const buildingScenario = createReply(
+        "pdf-building",
+        `Je prépare « ${pdfTopic} » à partir de la mémoire de l’entreprise.`,
+        ["Je rapproche les chiffres, les décisions, le CRM, les projets et l’acquisition, puis je relie chaque conclusion à ses sources."],
+        ["FIN-SNAPSHOT-20260715", "CRM-SNAPSHOT-20260715", "STRAT-2026-Q3"],
+        [],
+      );
+      setMessages((current) => [...current, { id: userId, role: "user", prompt }, { id: userId + 1, role: "assistant", scenario: buildingScenario, loading: true, statusText: "Construction du rapport et mise en page" }]);
+
+      try {
+        const response = await fetch("/api/documents/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: pdfTopic, topic: pdfTopic }),
+        });
+        if (!response.ok) throw new Error("La génération du PDF a échoué");
+        const blob = await response.blob();
+        const dataUrl = await blobToDataUrl(blob);
+        const document: OpsDocument = {
+          id: response.headers.get("X-Document-Id") ?? `RAPPORT-${Date.now()}`,
+          name: `${pdfTopic}.pdf`,
+          type: "Rapport PDF",
+          linked: "Direction",
+          owner: "OPS",
+          updated: "À l’instant",
+          status: "Généré",
+          facts: 9,
+          dataUrl,
+          size: formatBytes(blob.size),
+          pages: Number(response.headers.get("X-Document-Pages") ?? 3),
+          generated: true,
+        };
+        const readyScenario = createReply(
+          "pdf-ready",
+          `${pdfTopic} est prêt.`,
+          ["Je l’ai ajouté à Documents et relié aux neuf sources utilisées. Vous pouvez l’ouvrir ou le télécharger directement ici."],
+          ["STRAT-2026-Q3", "FIN-SNAPSHOT-20260715", "CRM-SNAPSHOT-20260715", "PROJET-241", "GADS-2026-07"],
+          ["Résume les trois décisions", "Prépare l’email d’accompagnement", "Crée les missions du rapport"],
+        );
+        onDocumentGenerated(document);
+        setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, scenario: readyScenario, document, loading: false } : message));
+        setPendingPdf(false);
+        if (fromVoice) speak(`${readyScenario.lead} ${readyScenario.body.join(" ")}`);
+      } catch {
+        const errorScenario = createReply("pdf-error", "Je n’ai pas pu finaliser le PDF.", ["Aucune donnée n’a été perdue. Vous pouvez relancer la génération ; le brouillon reste prêt."], [], ["Relance la génération du PDF"]);
+        setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, scenario: errorScenario, loading: false } : message));
+      } finally {
+        setProcessing(false);
+      }
+      return;
+    }
+
+    setMessages((current) => [...current, { id: userId, role: "user", prompt }, { id: userId + 1, role: "assistant", scenario: fallbackScenario, loading: true, statusText: "Analyse de la mémoire de l’entreprise" }]);
+
     try {
+      const history = messagesRef.current.slice(-8).map((message) => ({
+        role: message.role,
+        content: message.role === "user" ? message.prompt ?? "" : message.text ?? [message.scenario?.lead, ...(message.scenario?.body ?? [])].filter(Boolean).join("\n\n"),
+      })).filter((entry) => entry.content);
       const response = await fetch("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: prompt }),
+        body: JSON.stringify({ message: prompt, history }),
       });
       if (!response.ok || !response.body) throw new Error("agent unavailable");
       const reader = response.body.getReader();
@@ -271,14 +421,15 @@ function AgentPage({ initialPrompt, consumePrompt }: { initialPrompt: string; co
         text += decoder.decode(chunk, { stream: true });
         setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false, text } : message));
       }
+      if (fromVoice && text.trim()) speak(text);
     } catch {
-      window.setTimeout(() => {
-        setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false } : message));
-      }, 650);
+      await new Promise((resolve) => window.setTimeout(resolve, 520));
+      setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false } : message));
+      if (fromVoice) speak(`${fallbackScenario.lead} ${fallbackScenario.body.join(" ")}`);
     } finally {
       setProcessing(false);
     }
-  }, [processing, value]);
+  }, [onDocumentGenerated, pendingPdf, processing, speak, value]);
 
   useEffect(() => {
     if (!initialPrompt) return;
@@ -287,47 +438,58 @@ function AgentPage({ initialPrompt, consumePrompt }: { initialPrompt: string; co
   }, [consumePrompt, initialPrompt, submit]);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages]);
+    const lastUser = [...messages].reverse().find((message) => message.role === "user");
+    const container = scrollRef.current;
+    if (!lastUser || !container) return;
+    const node = container.querySelector<HTMLElement>(`[data-message-id="${lastUser.id}"]`);
+    if (!node) return;
+    container.scrollTo({ top: Math.max(0, node.offsetTop - 22), behavior: "smooth" });
+  }, [messages.length]);
 
   if (!messages.length) {
     return (
-      <div className="agent-empty-page">
-        <div className="agent-empty-center">
-          <h1>Bonjour Marie. On commence&nbsp;?</h1>
-          <FullComposer value={value} setValue={setValue} onSubmit={() => submit()} processing={processing} centered />
-          <div className="agent-starters">
-            {agentScenarios.slice(0, 4).map((scenario, index) => (
-              <button key={scenario.id} onClick={() => submit(scenario.label)}><OpsIcon name={(["invoice", "trend", "target", "brain"] as IconName[])[index]} size={20} /><span>{scenario.label}</span></button>
-            ))}
+      <>
+        <div className="agent-empty-page">
+          <div className="agent-empty-center">
+            <h1>Bonjour Marie. On commence&nbsp;?</h1>
+            <FullComposer value={value} setValue={setValue} onSubmit={() => submit()} onVoice={() => setVoiceOpen(true)} processing={processing} centered />
+            <div className="agent-starters">
+              {agentScenarios.slice(0, 4).map((scenario, index) => (
+                <button key={scenario.id} onClick={() => submit(scenario.label)}><OpsIcon name={(["invoice", "trend", "target", "brain"] as IconName[])[index]} size={20} /><span>{scenario.label}</span></button>
+              ))}
+            </div>
           </div>
+          <p className="agent-disclaimer">OPS peut faire des erreurs. Les réponses importantes restent reliées à leurs sources.</p>
         </div>
-        <p className="agent-disclaimer">OPS peut faire des erreurs. Les réponses importantes restent reliées à leurs sources.</p>
-      </div>
+        <VoiceMode ref={voiceModeRef} open={voiceOpen} onClose={() => setVoiceOpen(false)} onSubmit={submit} busy={processing} />
+      </>
     );
   }
 
   return (
-    <div className="agent-thread-page">
-      <div className="thread-toolbar"><button><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button><OpsIcon name="dots" size={18} /></button></div>
-      <div className="thread-scroll" ref={scrollRef}>
-        <div className="thread-content">
-          {messages.map((message) => message.role === "user" ? (
-            <div className="user-message" key={message.id}>{message.prompt}</div>
-          ) : (
-            <div key={message.id}>
-              {message.loading ? (
-                <div className="agent-thinking"><span className="assistant-mark"><OpsIcon name="spark" size={18} /></span><div><i /><span>Recherche dans 7 sources</span></div></div>
-              ) : message.scenario ? <ScenarioResponse scenario={message.scenario} text={message.text} /> : null}
-              {!message.loading && message.scenario && (
-                <div className="followups">{message.scenario.followups.map((followup) => <button key={followup} onClick={() => submit(followup)}>{followup}<OpsIcon name="arrow" size={13} /></button>)}</div>
-              )}
-            </div>
-          ))}
+    <>
+      <div className="agent-thread-page">
+        <div className="thread-toolbar"><button onClick={() => { setMessages([]); setPendingPdf(false); }}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button><OpsIcon name="dots" size={18} /></button></div>
+        <div className="thread-scroll" ref={scrollRef}>
+          <div className="thread-content">
+            {messages.map((message) => message.role === "user" ? (
+              <div className="user-message" data-message-id={message.id} key={message.id}>{message.prompt}</div>
+            ) : (
+              <div key={message.id}>
+                {message.loading ? (
+                  <div className="agent-thinking"><span className="assistant-mark"><OpsIcon name="spark" size={18} /></span><div><i /><span>{message.statusText ?? "Recherche dans 7 sources"}</span></div></div>
+                ) : message.scenario ? <ScenarioResponse scenario={message.scenario} text={message.text} document={message.document} openDocuments={openDocuments} onSpeak={speak} /> : null}
+                {!message.loading && message.scenario && (
+                  <div className="followups">{message.scenario.followups.map((followup) => <button key={followup} onClick={() => submit(followup)}>{followup}<OpsIcon name="arrow" size={13} /></button>)}</div>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
+        <div className="thread-composer-wrap"><FullComposer value={value} setValue={setValue} onSubmit={() => submit()} onVoice={() => setVoiceOpen(true)} processing={processing} /><p>OPS cite ses sources et demande votre validation avant toute action externe.</p></div>
       </div>
-      <div className="thread-composer-wrap"><FullComposer value={value} setValue={setValue} onSubmit={() => submit()} processing={processing} /><p>OPS cite ses sources et demande votre validation avant toute action externe.</p></div>
-    </div>
+      <VoiceMode ref={voiceModeRef} open={voiceOpen} onClose={() => setVoiceOpen(false)} onSubmit={submit} busy={processing} />
+    </>
   );
 }
 
@@ -363,14 +525,25 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
   );
 }
 
-function DocumentsPage({ openAgent }: { openAgent: OpenAgent }) {
-  const [selected, setSelected] = useState(documents[0]);
+function DocumentsPage({ openAgent, generatedDocuments, preferredDocumentId }: {
+  openAgent: OpenAgent;
+  generatedDocuments: OpsDocument[];
+  preferredDocumentId?: string;
+}) {
+  const allDocuments = useMemo(() => [...generatedDocuments, ...documents], [generatedDocuments]);
+  const [selectedId, setSelectedId] = useState(preferredDocumentId ?? allDocuments[0].id);
+  const selected = allDocuments.find((document) => document.id === selectedId) ?? allDocuments[0];
+
+  useEffect(() => {
+    if (preferredDocumentId && allDocuments.some((document) => document.id === preferredDocumentId)) setSelectedId(preferredDocumentId);
+  }, [allDocuments, preferredDocumentId]);
+
   return (
     <div className="content-page">
       <PageHeading page="documents" action={<button className="primary-button"><OpsIcon name="plus" size={16} /> Importer</button>} />
       <div className="documents-layout">
-        <section className="panel documents-panel"><div className="panel-title"><div><span>286 documents</span><small>17 ajoutés cette semaine</small></div><div className="table-actions"><button><OpsIcon name="search" size={15} /> Rechercher</button><button><OpsIcon name="filter" size={15} /> Filtrer</button></div></div><div className="entity-table documents-table"><div className="table-head"><span>Document</span><span>Type</span><span>Lié à</span><span>Responsable</span><span>Mise à jour</span><span>État OPS</span></div>{documents.map((document) => <button className={`table-row ${selected.id === document.id ? "selected" : ""}`} onClick={() => setSelected(document)} key={document.id}><span><i className="doc-type"><OpsIcon name="document" size={16} /></i><span><strong>{document.name}</strong><small>{document.id}</small></span></span><span>{document.type}</span><span>{document.linked}</span><span>{document.owner}</span><span>{document.updated}</span><span className={`doc-status status-${document.status.toLocaleLowerCase("fr").replace("à ", "").replaceAll(" ", "-")}`}>{document.status}</span></button>)}</div></section>
-        <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p><div className="doc-preview-lines"><i /><i /><i /><i /><i /></div><div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} faits exploitables</strong><p>Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné.</p><button onClick={() => openAgent(`Résume et analyse ${selected.name}`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside>
+        <section className="panel documents-panel"><div className="panel-title"><div><span>{286 + generatedDocuments.length} documents</span><small>{17 + generatedDocuments.length} ajoutés cette semaine</small></div><div className="table-actions"><button><OpsIcon name="search" size={15} /> Rechercher</button><button><OpsIcon name="filter" size={15} /> Filtrer</button></div></div><div className="entity-table documents-table"><div className="table-head"><span>Document</span><span>Type</span><span>Lié à</span><span>Responsable</span><span>Mise à jour</span><span>État OPS</span></div>{allDocuments.map((document) => <button className={`table-row ${selected.id === document.id ? "selected" : ""}`} onClick={() => setSelectedId(document.id)} key={document.id}><span><i className="doc-type"><OpsIcon name={document.generated ? "download" : "document"} size={16} /></i><span><strong>{document.name}</strong><small>{document.id}</small></span></span><span>{document.type}</span><span>{document.linked}</span><span>{document.owner}</span><span>{document.updated}</span><span className={`doc-status status-${document.status.toLocaleLowerCase("fr").replace("à ", "").replaceAll(" ", "-")}`}>{document.status}</span></button>)}</div></section>
+        <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.dataUrl ? <object className="pdf-preview" data={selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} faits exploitables</strong><p>Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné.</p>{selected.dataUrl ? <a className="document-download" href={selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse ${selected.name}`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside>
       </div>
     </div>
   );
@@ -415,10 +588,35 @@ export function OpsApp() {
   const [collapsed, setCollapsed] = useState(false);
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [commandOpen, setCommandOpen] = useState(false);
+  const [generatedDocuments, setGeneratedDocuments] = useState<OpsDocument[]>([]);
+  const [preferredDocumentId, setPreferredDocumentId] = useState<string>();
 
   const openAgent: OpenAgent = useCallback((prompt = "") => {
     setPage("agent");
     setPendingPrompt(prompt);
+  }, []);
+
+  const consumePendingPrompt = useCallback(() => setPendingPrompt(""), []);
+
+  const addGeneratedDocument = useCallback((document: OpsDocument) => {
+    setGeneratedDocuments((current) => {
+      const next = [document, ...current.filter((item) => item.id !== document.id)];
+      try { window.localStorage.setItem("ops-generated-documents-v1", JSON.stringify(next.slice(0, 6))); } catch { /* Le chat reste fonctionnel même si le stockage est saturé. */ }
+      return next;
+    });
+    setPreferredDocumentId(document.id);
+  }, []);
+
+  const openDocuments = useCallback((documentId?: string) => {
+    if (documentId) setPreferredDocumentId(documentId);
+    setPage("documents");
+  }, []);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem("ops-generated-documents-v1");
+      if (stored) setGeneratedDocuments(JSON.parse(stored) as OpsDocument[]);
+    } catch { /* La démonstration repart simplement sans documents générés. */ }
   }, []);
 
   useEffect(() => {
@@ -435,17 +633,17 @@ export function OpsApp() {
   const content = useMemo(() => {
     switch (page) {
       case "today": return <TodayPage setPage={setPage} openAgent={openAgent} />;
-      case "agent": return <AgentPage initialPrompt={pendingPrompt} consumePrompt={() => setPendingPrompt("")} />;
+      case "agent": return <AgentPage initialPrompt={pendingPrompt} consumePrompt={consumePendingPrompt} onDocumentGenerated={addGeneratedDocument} openDocuments={openDocuments} />;
       case "cycle": return <CyclePage openAgent={openAgent} />;
       case "emails": return <EmailsPage openAgent={openAgent} />;
-      case "documents": return <DocumentsPage openAgent={openAgent} />;
+      case "documents": return <DocumentsPage openAgent={openAgent} generatedDocuments={generatedDocuments} preferredDocumentId={preferredDocumentId} />;
       case "clients": return <ClientsPage openAgent={openAgent} />;
       case "planning": return <PlanningPage openAgent={openAgent} />;
       case "crm": return <CRMPage openAgent={openAgent} />;
       case "numbers": return <NumbersPage openAgent={openAgent} />;
       case "brain": return <BrainPage openAgent={openAgent} />;
     }
-  }, [openAgent, page, pendingPrompt]);
+  }, [addGeneratedDocument, consumePendingPrompt, generatedDocuments, openAgent, openDocuments, page, pendingPrompt, preferredDocumentId]);
 
   return (
     <div className={`ops-app ${collapsed ? "sidebar-is-collapsed" : ""}`}>

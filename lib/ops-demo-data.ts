@@ -43,7 +43,15 @@ export type IconName =
   | "link"
   | "shield"
   | "invoice"
-  | "project";
+  | "project"
+  | "copy"
+  | "thumb"
+  | "edit"
+  | "download"
+  | "volume"
+  | "pause"
+  | "waveform"
+  | "folder";
 
 export const navGroups: Array<{
   label: string;
@@ -361,7 +369,22 @@ export const emailThreads = [
   { id: "EMAIL-908", sender: "Élodie Perrin", company: "Hôtel Orsay", subject: "Plans techniques", preview: "Le comité se réunit jeudi à 14 h…", time: "Lun.", tag: "Prioritaire", unread: false, linked: "OPP-401" },
 ];
 
-export const documents = [
+export type OpsDocument = {
+  id: string;
+  name: string;
+  type: string;
+  linked: string;
+  owner: string;
+  updated: string;
+  status: string;
+  facts: number;
+  dataUrl?: string;
+  size?: string;
+  pages?: number;
+  generated?: boolean;
+};
+
+export const documents: OpsDocument[] = [
   { id: "CONTRAT-241", name: "Contrat Rivoli signé", type: "Contrat", linked: "Projet Rivoli", owner: "Hugo Bernard", updated: "14 juil. · 17:42", status: "Compris", facts: 14 },
   { id: "DEV-317", name: "Devis Hôtel Orsay v3", type: "Devis", linked: "Hôtel Orsay", owner: "Camille Laurent", updated: "15 juil. · 08:12", status: "À valider", facts: 9 },
   { id: "FACT-879", name: "Facture Atelier Sud — 12 400 €", type: "Facture", linked: "Atelier Sud", owner: "Inès Martin", updated: "15 juil. · 07:58", status: "En retard", facts: 8 },
