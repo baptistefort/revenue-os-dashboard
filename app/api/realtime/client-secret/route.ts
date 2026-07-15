@@ -13,7 +13,7 @@ export async function POST(request: Request) {
       {
         configured: false,
         error: "realtime_not_configured",
-        fallback: "browser_voice",
+        fallback: "recorded_audio",
       },
       { status: 200, headers: { "Cache-Control": "no-store" } },
     );
@@ -52,7 +52,7 @@ export async function POST(request: Request) {
     });
   } catch {
     return NextResponse.json(
-      { error: "realtime_upstream_unavailable", fallback: "browser_voice" },
+      { error: "realtime_upstream_unavailable", fallback: "recorded_audio" },
       { status: 503, headers: { "Cache-Control": "no-store" } },
     );
   }

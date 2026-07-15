@@ -81,6 +81,7 @@ type SpeechRecognitionLike = {
   continuous: boolean;
   interimResults: boolean;
   maxAlternatives: number;
+  processLocally?: boolean;
   onstart: ((event: Event) => void) | null;
   onresult: ((event: SpeechRecognitionEventLike) => void) | null;
   onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
@@ -90,7 +91,18 @@ type SpeechRecognitionLike = {
   abort: () => void;
 };
 
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+type SpeechRecognitionAvailability = "available" | "downloadable" | "downloading" | "unavailable";
+
+type SpeechRecognitionLocalOptions = {
+  langs: string[];
+  processLocally: true;
+};
+
+type SpeechRecognitionConstructor = {
+  new (): SpeechRecognitionLike;
+  available?: (options: SpeechRecognitionLocalOptions) => Promise<SpeechRecognitionAvailability>;
+  install?: (options: SpeechRecognitionLocalOptions) => Promise<boolean>;
+};
 
 type VoiceWindow = Window &
   typeof globalThis & {
@@ -161,6 +173,41 @@ function blobToDataUrl(blob: Blob) {
     reader.onerror = () => reject(reader.error ?? new Error("Lecture du document impossible"));
     reader.readAsDataURL(blob);
   });
+}
+
+function supportedRecordingMimeType() {
+  if (typeof MediaRecorder === "undefined") return "";
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4;codecs=mp4a.40.2",
+    "audio/mp4",
+    "audio/ogg;codecs=opus",
+  ];
+  if (typeof MediaRecorder.isTypeSupported !== "function") return "";
+  return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) ?? "";
+}
+
+function audioFileExtension(mimeType: string) {
+  if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("ogg")) return "ogg";
+  return "webm";
+}
+
+function extractTranscription(payload: unknown) {
+  if (!payload || typeof payload !== "object") return "";
+  const record = payload as Record<string, unknown>;
+  for (const candidate of [record.text, record.transcript, record.transcription]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  const result = record.result;
+  if (result && typeof result === "object") {
+    const nested = result as Record<string, unknown>;
+    for (const candidate of [nested.text, nested.transcript, nested.transcription]) {
+      if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+    }
+  }
+  return "";
 }
 
 function splitForSpeech(text: string, maxLength = 190) {
@@ -261,10 +308,16 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
   const [assistantTranscript, setAssistantTranscript] = useState("");
   const [errorDetail, setErrorDetail] = useState("");
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordingDeadlineRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const captureGenerationRef = useRef(0);
+  const transcriptionAbortRef = useRef<AbortController | null>(null);
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const realtimeConnectRef = useRef<Promise<void> | null>(null);
   const connectionGenerationRef = useRef(0);
   const backendRef = useRef<VoiceBackend>(null);
+  const serverVoiceConfiguredRef = useRef<boolean | null>(null);
   const stateRef = useRef<VoiceModeState>("idle");
   const openRef = useRef(open);
   const callbacksRef = useRef({ onDocumentGenerated, openDocuments });
@@ -296,6 +349,39 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
     if (typeof window !== "undefined") window.speechSynthesis?.cancel();
   }, []);
 
+  const cancelFallbackCapture = useCallback(() => {
+    captureGenerationRef.current += 1;
+    transcriptionAbortRef.current?.abort();
+    transcriptionAbortRef.current = null;
+    if (recordingDeadlineRef.current) clearTimeout(recordingDeadlineRef.current);
+    recordingDeadlineRef.current = null;
+
+    const recorder = mediaRecorderRef.current;
+    mediaRecorderRef.current = null;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onerror = null;
+      if (recorder.state !== "inactive") {
+        try {
+          recorder.stop();
+        } catch {
+          // The recorder may already be stopping.
+        }
+      }
+    }
+
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    if (recognition) {
+      recognition.onend = null;
+      recognition.abort();
+    }
+  }, []);
+
   const stopListening = useCallback(() => {
     if (autoRestartTimerRef.current) clearTimeout(autoRestartTimerRef.current);
     if (recognitionDeadlineRef.current) clearTimeout(recognitionDeadlineRef.current);
@@ -310,14 +396,35 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
       }
     }
 
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      if (recordingDeadlineRef.current) clearTimeout(recordingDeadlineRef.current);
+      recordingDeadlineRef.current = null;
+      setErrorDetail("Enregistrement terminé. Transcription sécurisée en cours…");
+      updateState("thinking");
+      try {
+        recorder.stop();
+      } catch {
+        cancelFallbackCapture();
+        setErrorDetail("L’enregistrement n’a pas pu être finalisé. Réessayez dans un instant.");
+        updateState("idle");
+      }
+      return;
+    }
+
     const recognition = recognitionRef.current;
     if (recognition) {
-      recognition.onend = null;
-      recognition.abort();
-      recognitionRef.current = null;
+      try {
+        recognition.stop();
+      } catch {
+        recognition.onend = null;
+        recognition.abort();
+        recognitionRef.current = null;
+      }
+      return;
     }
     if (stateRef.current === "listening") updateState("idle");
-  }, [updateState]);
+  }, [cancelFallbackCapture, updateState]);
 
   const submitText = useCallback(
     async (rawText: string, fromVoice: boolean) => {
@@ -340,8 +447,8 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
     [onSubmit, updateState],
   );
 
-  const startFallbackListening = useCallback(() => {
-    if (!openRef.current || stateRef.current === "thinking" || stateRef.current === "connecting") return;
+  const startSpeechRecognitionFallback = useCallback(() => {
+    if (!openRef.current || stateRef.current === "thinking") return;
     stopBrowserSpeech();
     if (recognitionDeadlineRef.current) clearTimeout(recognitionDeadlineRef.current);
     const previous = recognitionRef.current;
@@ -433,14 +540,229 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
     };
 
     recognitionRef.current = recognition;
-    try {
-      recognition.start();
-    } catch {
-      recognitionRef.current = null;
-      setErrorDetail("Le micro est déjà sollicité. Réessayez dans un instant.");
-      updateState("idle");
+    const startRecognition = () => {
+      if (!openRef.current || recognitionRef.current !== recognition) return;
+      try {
+        recognition.start();
+      } catch {
+        recognitionRef.current = null;
+        setErrorDetail("Le micro est déjà sollicité. Réessayez dans un instant.");
+        updateState("idle");
+      }
+    };
+
+    const localOptions: SpeechRecognitionLocalOptions = { langs: ["fr-FR"], processLocally: true };
+    if (Recognition.available && Recognition.install && "processLocally" in recognition) {
+      setErrorDetail("Préparation de la reconnaissance locale…");
+      updateState("connecting");
+      void (async () => {
+        try {
+          const availability = await Recognition.available?.(localOptions);
+          if (!openRef.current || recognitionRef.current !== recognition) return;
+          if (availability === "available") {
+            recognition.processLocally = true;
+            startRecognition();
+            return;
+          }
+          if (availability === "downloadable" || availability === "downloading") {
+            setErrorDetail("Installation du module vocal français sur cet appareil…");
+            const installed = await Recognition.install?.(localOptions);
+            if (!openRef.current || recognitionRef.current !== recognition) return;
+            if (installed) {
+              recognition.processLocally = true;
+              startRecognition();
+              return;
+            }
+          }
+
+          recognitionRef.current = null;
+          setErrorDetail(
+            serverVoiceConfiguredRef.current === false
+              ? "Le module vocal français n’est pas disponible sur cet appareil. Vous pouvez continuer par écrit."
+              : "La reconnaissance locale n’est pas disponible. Passage au service vocal standard…",
+          );
+          if (serverVoiceConfiguredRef.current === false) {
+            updateState("idle");
+            return;
+          }
+          recognitionRef.current = recognition;
+          recognition.processLocally = false;
+          startRecognition();
+        } catch {
+          if (!openRef.current || recognitionRef.current !== recognition) return;
+          if (serverVoiceConfiguredRef.current === false) {
+            recognitionRef.current = null;
+            setErrorDetail("Le module vocal local n’a pas pu être préparé. Réessayez ou écrivez votre demande.");
+            updateState("idle");
+            return;
+          }
+          recognition.processLocally = false;
+          startRecognition();
+        }
+      })();
+      return;
     }
+
+    startRecognition();
   }, [stopBrowserSpeech, submitText, updateState]);
+
+  const startFallbackListening = useCallback(async () => {
+    if (!openRef.current || stateRef.current === "thinking" || stateRef.current === "connecting") return;
+    stopBrowserSpeech();
+    cancelFallbackCapture();
+
+    if (serverVoiceConfiguredRef.current === false) {
+      startSpeechRecognitionFallback();
+      return;
+    }
+
+    const canRecord =
+      typeof window !== "undefined" &&
+      typeof MediaRecorder !== "undefined" &&
+      Boolean(navigator.mediaDevices?.getUserMedia);
+    if (!canRecord) {
+      startSpeechRecognitionFallback();
+      return;
+    }
+
+    const generation = ++captureGenerationRef.current;
+    setTranscript("");
+    setAssistantTranscript("");
+    setErrorDetail("Ouverture du microphone…");
+    updateState("connecting");
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          autoGainControl: true,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+        video: false,
+      });
+    } catch (error) {
+      if (generation !== captureGenerationRef.current || !openRef.current) return;
+      const name = error instanceof DOMException ? error.name : "";
+      const blocked = name === "NotAllowedError" || name === "SecurityError";
+      const missing = name === "NotFoundError" || name === "DevicesNotFoundError";
+      setErrorDetail(
+        blocked
+          ? "Autorisez l’accès au micro dans votre navigateur pour parler à OPS."
+          : missing
+            ? "Aucun microphone n’est disponible. Vérifiez le périphérique sélectionné."
+            : "Le microphone n’a pas pu être ouvert. Réessayez ou écrivez votre demande.",
+      );
+      updateState(blocked || missing ? "unsupported" : "idle");
+      return;
+    }
+
+    if (generation !== captureGenerationRef.current || !openRef.current) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    mediaStreamRef.current = stream;
+
+    const preferredMimeType = supportedRecordingMimeType();
+    let recorder: MediaRecorder;
+    try {
+      recorder = preferredMimeType
+        ? new MediaRecorder(stream, { mimeType: preferredMimeType, audioBitsPerSecond: 64_000 })
+        : new MediaRecorder(stream);
+    } catch {
+      stream.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+      if (generation !== captureGenerationRef.current || !openRef.current) return;
+      startSpeechRecognitionFallback();
+      return;
+    }
+
+    const chunks: Blob[] = [];
+    mediaRecorderRef.current = recorder;
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) chunks.push(event.data);
+    };
+    recorder.onerror = () => {
+      if (generation !== captureGenerationRef.current || !openRef.current) return;
+      cancelFallbackCapture();
+      setErrorDetail("L’enregistrement audio s’est interrompu. Réessayez ou écrivez votre demande.");
+      updateState("idle");
+    };
+    recorder.onstop = async () => {
+      if (recordingDeadlineRef.current) clearTimeout(recordingDeadlineRef.current);
+      recordingDeadlineRef.current = null;
+      if (mediaRecorderRef.current === recorder) mediaRecorderRef.current = null;
+      stream.getTracks().forEach((track) => track.stop());
+      if (mediaStreamRef.current === stream) mediaStreamRef.current = null;
+      if (generation !== captureGenerationRef.current || !openRef.current) return;
+
+      const mimeType = recorder.mimeType || preferredMimeType || chunks[0]?.type || "audio/webm";
+      const audio = new Blob(chunks, { type: mimeType });
+      if (audio.size < 256) {
+        setErrorDetail("Je n’ai pas reçu assez d’audio. Maintenez une phrase complète puis arrêtez l’écoute.");
+        updateState("idle");
+        return;
+      }
+
+      setErrorDetail("Votre demande est enregistrée. Transcription en cours…");
+      updateState("thinking");
+      const controller = new AbortController();
+      transcriptionAbortRef.current = controller;
+      const formData = new FormData();
+      formData.append("audio", audio, `demande-ops.${audioFileExtension(mimeType)}`);
+      formData.append("language", "fr");
+
+      try {
+        const response = await fetch("/api/audio/transcribe", {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok) {
+          const code =
+            payload && typeof payload === "object" && typeof (payload as Record<string, unknown>).error === "string"
+              ? String((payload as Record<string, unknown>).error)
+              : `transcription_${response.status}`;
+          throw new Error(code);
+        }
+        const text = extractTranscription(payload);
+        if (!text) throw new Error("transcription_empty");
+        if (generation !== captureGenerationRef.current || !openRef.current) return;
+        setTranscript(text);
+        await submitText(text, true);
+      } catch (error) {
+        if (controller.signal.aborted || generation !== captureGenerationRef.current || !openRef.current) return;
+        setErrorDetail(
+          error instanceof Error && error.message === "transcription_empty"
+            ? "Je n’ai pas distingué de parole dans cet enregistrement. Réessayez en parlant un peu plus près du micro."
+            : error instanceof Error && error.message === "audio_transcription_not_configured"
+              ? "Le micro fonctionne, mais la transcription OPS n’est pas encore activée sur le serveur. Une clé OpenAI serveur neuve est nécessaire."
+            : "La transcription audio n’est pas disponible pour le moment. Vous pouvez réessayer ou écrire votre demande.",
+        );
+        updateState("idle");
+      } finally {
+        if (transcriptionAbortRef.current === controller) transcriptionAbortRef.current = null;
+      }
+    };
+
+    try {
+      recorder.start(250);
+      setErrorDetail("");
+      updateState("listening");
+      recordingDeadlineRef.current = setTimeout(() => {
+        if (generation !== captureGenerationRef.current || recorder.state === "inactive") return;
+        setErrorDetail("Limite de 30 secondes atteinte. Transcription en cours…");
+        updateState("thinking");
+        recorder.stop();
+      }, 30_000);
+    } catch {
+      cancelFallbackCapture();
+      if (!openRef.current) return;
+      startSpeechRecognitionFallback();
+    }
+  }, [cancelFallbackCapture, startSpeechRecognitionFallback, stopBrowserSpeech, submitText, updateState]);
 
   const createRealtimeSession = useCallback(() => {
     const memoryTool = tool({
@@ -593,8 +915,12 @@ RÈGLES ABSOLUES
         });
         if (!tokenResponse.ok) throw new Error(`realtime_token_${tokenResponse.status}`);
         const payload = await tokenResponse.json().catch(() => null);
+        if (payload && typeof payload === "object" && (payload as Record<string, unknown>).configured === false) {
+          serverVoiceConfiguredRef.current = false;
+        }
         const clientSecret = extractClientSecret(payload);
         if (!clientSecret) throw new Error("realtime_token_missing");
+        serverVoiceConfiguredRef.current = true;
         if (generation !== connectionGenerationRef.current || !openRef.current) return;
 
         session = createRealtimeSession();
@@ -682,7 +1008,11 @@ RÈGLES ABSOLUES
         if (realtimeSessionRef.current === session) realtimeSessionRef.current = null;
         if (generation !== connectionGenerationRef.current || !openRef.current) return;
         backendRef.current = "fallback";
-        setErrorDetail("Le temps réel n’est pas disponible. Cliquez sur le micro pour utiliser le mode vocal de secours.");
+        setErrorDetail(
+          serverVoiceConfiguredRef.current === false
+            ? "Mode vocal local prêt. Cliquez sur le micro pour parler sans dépendre du réseau de reconnaissance Chrome."
+            : "Le temps réel n’est pas disponible. Cliquez sur le micro pour utiliser la transcription sécurisée.",
+        );
         updateState("idle");
       } finally {
         if (generation === connectionGenerationRef.current) realtimeConnectRef.current = null;
@@ -729,6 +1059,7 @@ RÈGLES ABSOLUES
         recognitionRef.current = null;
       }
       stopBrowserSpeech();
+      cancelFallbackCapture();
 
       const chunks = splitForSpeech(rawText);
       if (!chunks.length) return;
@@ -785,7 +1116,7 @@ RÈGLES ABSOLUES
 
       playNext();
     },
-    [autoListenAfterResponse, startFallbackListening, stopBrowserSpeech, updateState],
+    [autoListenAfterResponse, cancelFallbackCapture, startFallbackListening, stopBrowserSpeech, updateState],
   );
 
   useImperativeHandle(
@@ -802,6 +1133,7 @@ RÈGLES ABSOLUES
     openRef.current = open;
     if (!open) {
       connectionGenerationRef.current += 1;
+      cancelFallbackCapture();
       stopListening();
       stopBrowserSpeech();
       realtimeSessionRef.current?.close();
@@ -821,7 +1153,7 @@ RÈGLES ABSOLUES
     if (autoStart) {
       void connectRealtime();
     }
-  }, [autoStart, connectRealtime, open, stopBrowserSpeech, stopListening, updateState]);
+  }, [autoStart, cancelFallbackCapture, connectRealtime, open, stopBrowserSpeech, stopListening, updateState]);
 
   useEffect(() => {
     if (busy && open) updateState("thinking");
@@ -838,13 +1170,13 @@ RÈGLES ABSOLUES
   useEffect(
     () => () => {
       connectionGenerationRef.current += 1;
-      recognitionRef.current?.abort();
+      cancelFallbackCapture();
       realtimeSessionRef.current?.close();
       if (autoRestartTimerRef.current) clearTimeout(autoRestartTimerRef.current);
       if (recognitionDeadlineRef.current) clearTimeout(recognitionDeadlineRef.current);
       stopBrowserSpeech();
     },
-    [stopBrowserSpeech],
+    [cancelFallbackCapture, stopBrowserSpeech],
   );
 
   useEffect(() => {
@@ -873,7 +1205,9 @@ RÈGLES ABSOLUES
   }, [onClose, open]);
 
   const close = useCallback(() => {
+    openRef.current = false;
     connectionGenerationRef.current += 1;
+    cancelFallbackCapture();
     stopListening();
     stopBrowserSpeech();
     realtimeSessionRef.current?.close();
@@ -881,7 +1215,7 @@ RÈGLES ABSOLUES
     realtimeConnectRef.current = null;
     backendRef.current = null;
     onClose();
-  }, [onClose, stopBrowserSpeech, stopListening]);
+  }, [cancelFallbackCapture, onClose, stopBrowserSpeech, stopListening]);
 
   const submitDraft = useCallback(() => {
     const text = draft.trim();
