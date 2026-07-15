@@ -522,5 +522,6 @@ Pipeline : Hôtel Orsay 58 000 € (Google Ads), Maison Lenoir 34 000 € (archi
 Rivoli : projet 120 000 €, avancement 62 %, marge prévue 31 %, projetée 28,9 %. 14 heures non facturées coûtent 630 €. Achat de placage : budget 8 202 €, réel 9 640 €, écart 1 438 €. Ces deux causes expliquent 82 % de l’écart.
 Factures en retard : Atelier Sud 12 400 € / 28 jours ; Nova 7 800 € / 12 jours ; Maison Cobalt 4 100 € / 8 jours mais son dernier email demande d’attendre lundi.
 Acquisition : Google Ads 684 € dépensés, 11 leads, 4 qualifiés, 58 000 € de pipeline. Meta 312 €, 3 leads, aucun qualifié. Instagram timelapse Rivoli : 18 400 vues, 612 enregistrements, opportunité Studio Cime 20 000 €. SEO “agencement hôtel Paris” : position 7, 96 clics mensuels, 4 conversions.
+Validations : VAL-061 autorise deux relances déjà préparées, Atelier Sud 12 400 € et Nova Hôtels 7 800 €, soit 20 200 € au total. Maison Cobalt est exclue car son email EMAIL-905 demande d’attendre lundi. VAL-063 concerne l’avenant Rivoli de 6 800 € qui protège environ 1,9 point de marge.
 Règles : toute action externe exige une validation. Les affirmations importantes doivent citer les identifiants des sources entre crochets. Ne jamais inventer une donnée manquante.
 `;

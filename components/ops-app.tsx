@@ -214,6 +214,12 @@ function createReply(id: string, lead: string, body: string[], sources: string[]
   return { id, label: lead, keywords: [], lead, body, sources, followups };
 }
 
+type AgentStreamEvent =
+  | { type: "meta"; scenario: AgentScenario; mode?: string }
+  | { type: "delta"; delta: string }
+  | { type: "error"; message: string; retryable?: boolean }
+  | { type: "done" };
+
 function FullComposer({ value, setValue, onSubmit, onVoice, processing, centered = false }: {
   value: string;
   setValue: (value: string) => void;
@@ -305,6 +311,21 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
 
+  const registerVoiceDocument = useCallback((document: OpsDocument) => {
+    onDocumentGenerated(document);
+    const readyScenario = createReply(
+      "voice-pdf-ready",
+      `${document.name.replace(/\.pdf$/i, "")} est prêt.`,
+      ["Le PDF a été ajouté à Documents et reste disponible dans cette conversation."],
+      [document.id, "FIN-SNAPSHOT-20260715", "CRM-SNAPSHOT-20260715"],
+      ["Résume le document", "Prépare l’email d’accompagnement", "Crée les missions associées"],
+    );
+    setMessages((current) => [
+      ...current,
+      { id: Date.now(), role: "assistant", scenario: readyScenario, document },
+    ]);
+  }, [onDocumentGenerated]);
+
   const speak = useCallback((text: string) => {
     if (voiceOpen && voiceModeRef.current) {
       voiceModeRef.current.speak(text);
@@ -326,7 +347,13 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
     setValue("");
     setProcessing(true);
     const userId = Date.now();
-    const fallbackScenario = buildFallbackScenario(prompt);
+    const priorHistory = messagesRef.current.slice(-12).map((message) => ({
+      role: message.role,
+      content: message.role === "user"
+        ? message.prompt ?? ""
+        : message.text ?? [message.scenario?.lead, ...(message.scenario?.body ?? [])].filter(Boolean).join("\n\n"),
+    })).filter((entry) => entry.content);
+    const fallbackScenario = buildFallbackScenario(prompt, priorHistory);
     const shouldResolvePdf = pendingPdf || asksForPdf(prompt);
     const pdfTopic = extractPdfTopic(prompt);
 
@@ -401,27 +428,61 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
     setMessages((current) => [...current, { id: userId, role: "user", prompt }, { id: userId + 1, role: "assistant", scenario: fallbackScenario, loading: true, statusText: "Analyse de la mémoire de l’entreprise" }]);
 
     try {
-      const history = messagesRef.current.slice(-8).map((message) => ({
-        role: message.role,
-        content: message.role === "user" ? message.prompt ?? "" : message.text ?? [message.scenario?.lead, ...(message.scenario?.body ?? [])].filter(Boolean).join("\n\n"),
-      })).filter((entry) => entry.content);
       const response = await fetch("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: prompt, history }),
+        body: JSON.stringify({ message: prompt, history: priorHistory }),
       });
       if (!response.ok || !response.body) throw new Error("agent unavailable");
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let text = "";
+      let serverScenario = fallbackScenario;
+      let lineBuffer = "";
+      const structured = response.headers.get("content-type")?.includes("application/x-ndjson") ?? false;
+
+      const applyEvent = (event: AgentStreamEvent) => {
+        if (event.type === "meta") {
+          serverScenario = event.scenario;
+          setMessages((current) => current.map((message) => message.id === userId + 1
+            ? { ...message, scenario: serverScenario, loading: false, text }
+            : message));
+        } else if (event.type === "delta") {
+          text += event.delta;
+          setMessages((current) => current.map((message) => message.id === userId + 1
+            ? { ...message, scenario: serverScenario, loading: false, text }
+            : message));
+        } else if (event.type === "error") {
+          text = `${text}${text ? "\n\n" : ""}${event.message}`;
+          setMessages((current) => current.map((message) => message.id === userId + 1
+            ? { ...message, scenario: serverScenario, loading: false, text }
+            : message));
+        }
+      };
+
       setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false, text: "" } : message));
       while (true) {
         const { done, value: chunk } = await reader.read();
         if (done) break;
-        text += decoder.decode(chunk, { stream: true });
-        setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false, text } : message));
+        const decoded = decoder.decode(chunk, { stream: true });
+        if (!structured) {
+          text += decoded;
+          setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false, text } : message));
+          continue;
+        }
+        lineBuffer += decoded;
+        const lines = lineBuffer.split("\n");
+        lineBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try { applyEvent(JSON.parse(line) as AgentStreamEvent); } catch { /* Ignore uniquement une ligne de transport corrompue. */ }
+        }
       }
-      if (fromVoice && text.trim()) speak(text);
+      lineBuffer += decoder.decode();
+      if (structured && lineBuffer.trim()) {
+        try { applyEvent(JSON.parse(lineBuffer) as AgentStreamEvent); } catch { /* La réponse déjà reçue reste affichée. */ }
+      }
+      if (fromVoice && text.trim()) speak([serverScenario.lead, text].filter(Boolean).join("\n\n"));
     } catch {
       await new Promise((resolve) => window.setTimeout(resolve, 520));
       setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false } : message));
@@ -461,7 +522,15 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
           </div>
           <p className="agent-disclaimer">OPS peut faire des erreurs. Les réponses importantes restent reliées à leurs sources.</p>
         </div>
-        <VoiceMode ref={voiceModeRef} open={voiceOpen} onClose={() => setVoiceOpen(false)} onSubmit={submit} busy={processing} />
+        <VoiceMode
+          ref={voiceModeRef}
+          open={voiceOpen}
+          onClose={() => setVoiceOpen(false)}
+          onSubmit={submit}
+          onDocumentGenerated={registerVoiceDocument}
+          openDocuments={openDocuments}
+          busy={processing}
+        />
       </>
     );
   }
@@ -488,7 +557,15 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         </div>
         <div className="thread-composer-wrap"><FullComposer value={value} setValue={setValue} onSubmit={() => submit()} onVoice={() => setVoiceOpen(true)} processing={processing} /><p>OPS cite ses sources et demande votre validation avant toute action externe.</p></div>
       </div>
-      <VoiceMode ref={voiceModeRef} open={voiceOpen} onClose={() => setVoiceOpen(false)} onSubmit={submit} busy={processing} />
+      <VoiceMode
+        ref={voiceModeRef}
+        open={voiceOpen}
+        onClose={() => setVoiceOpen(false)}
+        onSubmit={submit}
+        onDocumentGenerated={registerVoiceDocument}
+        openDocuments={openDocuments}
+        busy={processing}
+      />
     </>
   );
 }

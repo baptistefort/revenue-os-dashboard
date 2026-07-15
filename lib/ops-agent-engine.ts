@@ -1,11 +1,128 @@
 import { findScenario, type AgentScenario } from "@/lib/ops-demo-data";
+import {
+  extractMemoryIds,
+  findContextualMemoryId,
+  getMemoryRecord,
+  getRelatedMemory,
+  normalizeMemoryQuery,
+  searchCompanyMemory,
+  type AgentHistoryTurn,
+} from "@/lib/ops-memory";
 
 function reply(id: string, label: string, lead: string, body: string[], sources: string[], followups: string[]): AgentScenario {
   return { id, label, keywords: [], lead, body, sources, followups };
 }
 
-export function buildFallbackScenario(prompt: string): AgentScenario {
-  const normalized = prompt.toLocaleLowerCase("fr").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+function approvalScenario(id: "VAL-061" | "VAL-063", prompt: string) {
+  if (id === "VAL-061") {
+    return reply(
+      "validation-061",
+      prompt,
+      "VAL-061 autorise l’envoi de deux relances déjà préparées, pour 20,2 K€ au total.",
+      [
+        "Atelier Sud · 12,4 K€ · 28 jours de retard. Le brouillon reste direct mais chaleureux, car la relation est ancienne et le client annonce un traitement cette semaine.",
+        "Nova Hôtels · 7,8 K€ · 12 jours de retard. Le cycle habituel est dépassé : le message est plus ferme et joint le duplicata demandé.",
+        "Maison Cobalt n’est pas incluse. Son dernier email annonce un virement lundi ; la relancer aujourd’hui contredirait l’engagement enregistré.",
+        "Le risque est faible : aucun prix, contrat ou engagement nouveau n’est modifié. En revanche, RULE-001 interdit tout envoi externe avant la validation explicite de Marie.",
+      ],
+      ["VAL-061", "MIS-031", "FACT-879", "EMAIL-901", "FACT-886", "EMAIL-902", "FACT-890", "EMAIL-905", "RULE-001", "RULE-002"],
+      ["Montre les deux brouillons", "Compare le ton des relances", "Quels contrôles avant envoi ?"],
+    );
+  }
+
+  return reply(
+    "validation-063",
+    prompt,
+    "VAL-063 porte sur l’avenant Rivoli de 6,8 K€ et protège environ 1,9 point de marge.",
+    [
+      "Le client a confirmé le changement de finition sous réserve de chiffrage. L’avenant transforme cette modification en périmètre facturable.",
+      "Sans avenant, la marge du chantier reste projetée à 28,9 % contre 31 % initialement. La décision est attendue avant midi.",
+      "Le risque est moyen : le document engage le client. OPS peut préparer l’envoi, mais Marie doit relire le montant, le périmètre et l’échéancier avant validation.",
+    ],
+    ["VAL-063", "PROJET-241", "DEC-063", "EMAIL-903", "CR-1207", "ALERT-201", "RULE-001"],
+    ["Montre l’avenant", "Décompose les 6,8 K€", "Que se passe-t-il si je refuse ?"],
+  );
+}
+
+function recordScenario(id: string, prompt: string): AgentScenario | null {
+  const record = getMemoryRecord(id);
+  if (!record) return null;
+  if (record.id === "VAL-061" || record.id === "VAL-063") return approvalScenario(record.id, prompt);
+  const related = getRelatedMemory(record).slice(0, 5);
+  return reply(
+    `record-${record.id.toLocaleLowerCase("fr")}`,
+    prompt,
+    `${record.id} — ${record.title}`,
+    [record.summary, ...record.facts, related.length ? `Éléments directement reliés : ${related.map((item) => `${item.id} (${item.title})`).join(", ")}.` : ""].filter(Boolean),
+    [record.id, ...related.map((item) => item.id)],
+    [`Montre les relations de ${record.id}`, `Quelle décision dépend de ${record.id} ?`, `Génère une fiche PDF de ${record.id}`],
+  );
+}
+
+export function buildFallbackScenario(prompt: string, history: AgentHistoryTurn[] = []): AgentScenario {
+  const normalized = normalizeMemoryQuery(prompt);
+  const explicitIds = extractMemoryIds(prompt);
+  const explicitId = explicitIds.find((candidate) => getMemoryRecord(candidate));
+  if (explicitIds.length && !explicitId) {
+    return reply(
+      "unknown-record",
+      prompt,
+      `${explicitIds[0]} n’existe pas dans la mémoire disponible.`,
+      ["Je ne le remplace pas par un autre dossier. Vérifiez l’identifiant ou indiquez le client, le projet ou le document recherché."],
+      [],
+      ["Recherche les validations en attente", "Ouvre le Cerveau", "Que dois-je valider aujourd’hui ?"],
+    );
+  }
+  const contextualId = /\b(la|le|elle|lui|cette|ce|detail|détail|brouillon|compare|explique)\b/i.test(prompt)
+    ? findContextualMemoryId(history)
+    : null;
+  const recordMatch = explicitId ? recordScenario(explicitId, prompt) : contextualId ? recordScenario(contextualId, prompt) : null;
+  if (recordMatch) return recordMatch;
+
+  if (/^(bonjour|bonsoir|salut|hello|coucou|hey)(\s|[!,.?]|$)/.test(normalized)) {
+    return reply(
+      "greeting",
+      prompt,
+      "Bonjour Marie. Oui, merci — je suis prêt.",
+      ["Vous pouvez me demander une décision précise, un état de l’entreprise, une analyse ou un document."],
+      [],
+      ["Que dois-je valider aujourd’hui ?", "Analyse les priorités du jour", "Prépare mon brief CODIR"],
+    );
+  }
+
+  if (/^(merci|parfait|ok|d.accord|tres bien|très bien)(\s|[!,.?]|$)/.test(normalized)) {
+    return reply("acknowledgement", prompt, "Avec plaisir.", ["Je garde le contexte de cette conversation. Dites-moi simplement la prochaine décision ou le prochain livrable à préparer."], [], ["Continue", "Résume la décision", "Prépare la suite"]);
+  }
+
+  if (/que dois.je valider|validation.*aujourd|validations? en attente/.test(normalized)) {
+    return reply(
+      "pending-validations",
+      prompt,
+      "Deux validations demandent votre décision avant midi.",
+      [
+        "VAL-061 · Envoyer deux relances clients · 20,2 K€ concernés · risque faible · avant 10 h.",
+        "VAL-063 · Avenant Rivoli de 6,8 K€ · protège 1,9 point de marge · risque moyen · avant midi.",
+        "Ordre recommandé : examiner d’abord VAL-061, car les brouillons sont prêts et l’impact cash est immédiat ; traiter ensuite l’avenant Rivoli.",
+      ],
+      ["VAL-061", "VAL-063", "MIS-031", "PROJET-241", "RULE-001"],
+      ["Explique VAL-061", "Explique VAL-063", "Prépare mon arbitrage"],
+    );
+  }
+
+  if (/brouillon/.test(normalized) && history.some((turn) => turn.content.includes("VAL-061"))) {
+    return reply(
+      "validation-061-drafts",
+      prompt,
+      "Les deux brouillons de VAL-061 sont prêts ; aucun message n’est encore parti.",
+      [
+        "Atelier Sud · Objet : “Point sur la facture de juin”. Ton chaleureux, rappel du montant de 12,4 K€ et demande d’une date de virement précise.",
+        "Nova Hôtels · Objet : “Duplicata et échéance de la facture”. Ton ferme, duplicata joint, rappel des 7,8 K€ et demande de validation du règlement aujourd’hui.",
+        "Contrôle restant : vérifier les pièces jointes, les destinataires et la date promise avant de valider l’envoi.",
+      ],
+      ["VAL-061", "MIS-031", "FACT-879", "EMAIL-901", "FACT-886", "EMAIL-902", "RULE-001", "RULE-002"],
+      ["Compare phrase par phrase", "Valide seulement Atelier Sud", "Quels risques avant envoi ?"],
+    );
+  }
 
   if (/brief|codir|comite de direction/.test(normalized)) {
     return reply(
@@ -121,17 +238,28 @@ export function buildFallbackScenario(prompt: string): AgentScenario {
   const scenario = findScenario(prompt);
   if (scenario.id !== "general") return scenario;
 
+  const retrieved = searchCompanyMemory(prompt, history, 5);
+  if (retrieved.length) {
+    const [primary, ...related] = retrieved;
+    return reply(
+      "memory-search",
+      prompt,
+      `J’ai trouvé ${retrieved.length} élément${retrieved.length > 1 ? "s" : ""} pertinent${retrieved.length > 1 ? "s" : ""} dans la mémoire.`,
+      [primary.summary, ...primary.facts.slice(0, 3), related.length ? `À rapprocher de : ${related.map((record) => `${record.id} — ${record.title}`).join(" ; ")}.` : ""].filter(Boolean),
+      retrieved.map((record) => record.id),
+      [`Approfondis ${primary.id}`, "Montre seulement les faits confirmés", "Prépare la prochaine décision"],
+    );
+  }
+
   return reply(
     "contextual-general",
     prompt,
-    "Je peux répondre, mais je distingue d’abord le fait établi de l’hypothèse de travail.",
+    "Je n’ai pas trouvé de fait suffisamment précis pour répondre sans inventer.",
     [
-      "Faits établis : pipeline de 184 K€, marge moyenne de 29 %, 24,3 K€ de créances et visibilité de trésorerie de 67 jours.",
-      "Hypothèse utile : votre question semble toucher à une décision de direction. Je peux l’analyser par client, projet, période, équipe ou canal d’acquisition sans perdre les sources utilisées.",
-      "Donnez-moi simplement le résultat attendu — décider, expliquer, planifier, comparer ou produire un document — et je construis la réponse dans ce format.",
+      "Indiquez l’identifiant, le client, le projet ou la période concernée. Par exemple : “Explique VAL-061”, “Résume Nova Hôtels” ou “Analyse la marge de juillet”.",
     ],
-    ["CRM-SNAPSHOT-20260715", "FIN-SNAPSHOT-20260715", "STRAT-2026-Q3"],
-    ["Analyse les priorités du jour", "Prépare mon brief CODIR", "Produis un rapport PDF"],
+    [],
+    ["Que dois-je valider aujourd’hui ?", "Analyse les priorités du jour", "Recherche dans la mémoire"],
   );
 }
 
