@@ -9,6 +9,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "d3-force": "^3.0.0",
     "lucide-react": "^0.468.0",
     "next": "16.2.6",
     "openai": "^6.47.0",
@@ -16,6 +17,7 @@
     "react-dom": "19.2.0"
   },
   "devDependencies": {
+    "@types/d3-force": "^3.0.10",
     "@types/node": "^22.10.2",
     "@types/react": "^19.0.3",
     "@types/react-dom": "^19.0.2",

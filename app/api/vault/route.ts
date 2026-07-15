@@ -94,7 +94,7 @@ export async function GET() {
     };
     const records = parsedRecords
       .sort((a, b) => typePriority[a.type] - typePriority[b.type] || b.links.length - a.links.length)
-      .slice(0, 52);
+      .slice(0, 180);
 
     const aliasToId = new Map<string, string>();
     records.forEach((record) => {

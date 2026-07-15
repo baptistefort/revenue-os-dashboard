@@ -67,7 +67,9 @@ function Sidebar({ page, setPage, collapsed, setCollapsed }: {
                 key={item.id}
                 className={`nav-item ${page === item.id ? "active" : ""}`}
                 onClick={() => setPage(item.id)}
-                title={collapsed ? item.label : undefined}
+                title={item.label}
+                aria-label={item.label}
+                aria-current={page === item.id ? "page" : undefined}
               >
                 <IconTile name={item.icon} active={page === item.id} />
                 <span className="nav-label">{item.label}</span>
@@ -398,7 +400,7 @@ function NumbersPage({ openAgent }: { openAgent: OpenAgent }) {
 }
 
 function BrainPage({ openAgent }: { openAgent: OpenAgent }) {
-  return <div className="content-page brain-page"><PageHeading page="brain" action={<div className="brain-stats"><span><strong>286</strong> éléments</span><span><strong>412</strong> relations</span><span><i /> mémoire active</span></div>} /><BrainGraph onAsk={(prompt) => openAgent(prompt)} /></div>;
+  return <div className="content-page brain-page"><PageHeading page="brain" action={<button className="brain-page-action" onClick={() => openAgent("Que dois-je comprendre de l’entreprise aujourd’hui ?")}><OpsIcon name="spark" size={15} /> Interroger le Cerveau</button>} /><BrainGraph onAsk={(prompt) => openAgent(prompt)} /></div>;
 }
 
 function CommandMenu({ open, setOpen, setPage, openAgent }: { open: boolean; setOpen: (value: boolean) => void; setPage: (page: PageId) => void; openAgent: OpenAgent }) {

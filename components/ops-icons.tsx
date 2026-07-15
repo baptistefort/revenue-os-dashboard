@@ -20,6 +20,8 @@ const paths: Record<IconName, React.ReactNode> = {
   brain: <><path d="M9 4.2a3.7 3.7 0 0 0-5 4.3A3.8 3.8 0 0 0 4.8 15 3.5 3.5 0 0 0 9 19.8V4.2Z" /><path d="M15 4.2a3.7 3.7 0 0 1 5 4.3 3.8 3.8 0 0 1-.8 6.5 3.5 3.5 0 0 1-4.2 4.8V4.2Z" /><path d="M9 8c-2 0-3-1-3.3-2.2M9 13c-2.4 0-4 .9-4.6 2.1M15 8c2 0 3-1 3.3-2.2M15 13c2.4 0 4 .9 4.6 2.1M12 3v18" /></>,
   search: <><circle cx="10.5" cy="10.5" r="6.5" /><path d="m15.5 15.5 5 5" /></>,
   plus: <path d="M12 4v16M4 12h16" />,
+  minus: <path d="M4 12h16" />,
+  fit: <><path d="M9 4H4v5M15 4h5v5M20 15v5h-5M4 15v5h5" /><path d="M4 9 9 4M15 4l5 5M20 15l-5 5M9 20l-5-5" /></>,
   chevron: <path d="m8 9 4 4 4-4" />,
   arrow: <><path d="M5 12h14" /><path d="m14 7 5 5-5 5" /></>,
   microphone: <><rect x="8" y="3" width="8" height="13" rx="4" /><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7" /></>,

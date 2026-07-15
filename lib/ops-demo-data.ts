@@ -23,6 +23,8 @@ export type IconName =
   | "brain"
   | "search"
   | "plus"
+  | "minus"
+  | "fit"
   | "chevron"
   | "arrow"
   | "microphone"
