@@ -719,7 +719,8 @@ export class OpenCodeAdapter {
         target: "draft-07",
         io: "output",
       });
-      const finalRequest = prompt.researchWithTools === false
+      const usesTools = prompt.researchWithTools !== false;
+      const finalRequest = !usesTools
         ? `${message}
 
 RÉPONSE DIRECTE
@@ -732,7 +733,9 @@ RECHERCHE ET RÉPONSE EN UNE SEULE PASSE
 - Un résultat de recherche contient déjà les faits complets utiles : ne relis pas chaque identifiant.
 - Ne lance jamais deux fois la même requête ou le même identifiant.
 - Maximum deux tours de recherche et quatre appels d’outils.
-- Dès que les preuves suffisent, produis directement la sortie structurée finale.`;
+- Dès que les preuves suffisent, produis directement la sortie structurée finale.
+- Retourne uniquement un objet JSON valide conforme à ce schéma :
+${JSON.stringify(outputSchema)}`;
 
       const liveDeltas = await this.subscribeToAnswerDeltas(
         handle.session.id,
@@ -747,12 +750,14 @@ RECHERCHE ET RÉPONSE EN UNE SEULE PASSE
           agent,
           model: model ? { providerID: model.providerID, modelID: model.modelID } : undefined,
           variant: model?.variant,
-          tools: prompt.researchWithTools === false ? this.finalizationTools : this.tools,
-          format: {
-            type: "json_schema",
-            schema: outputSchema,
-            retryCount: this.options.structuredOutputRetries,
-          },
+          tools: usesTools ? this.tools : this.finalizationTools,
+          format: usesTools
+            ? { type: "text" }
+            : {
+                type: "json_schema",
+                schema: outputSchema,
+                retryCount: this.options.structuredOutputRetries,
+              },
           system,
           parts: [{
             type: "text",

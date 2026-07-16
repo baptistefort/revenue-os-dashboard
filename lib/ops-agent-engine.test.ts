@@ -77,7 +77,7 @@ test("sans historique, le message OpenCode reste direct", () => {
   assert.equal(buildOpenCodeMessage("Bonjour", []), "Bonjour");
 });
 
-test("la compaction serveur conserve uniquement les douze derniers tours", () => {
+test("la compaction serveur conserve uniquement les huit derniers tours", () => {
   const history: AgentHistoryTurn[] = Array.from({ length: 15 }, (_, index) => ({
     role: index % 2 === 0 ? "user" : "assistant",
     content: `tour-${index} ${"x".repeat(2_000)}`,
@@ -85,10 +85,10 @@ test("la compaction serveur conserve uniquement les douze derniers tours", () =>
   const compacted = compactConversationHistory(history);
 
   assert.doesNotMatch(compacted, /tour-0\b/);
-  assert.doesNotMatch(compacted, /tour-2\b/);
-  assert.match(compacted, /tour-3\b/);
+  assert.doesNotMatch(compacted, /tour-6\b/);
+  assert.match(compacted, /tour-7\b/);
   assert.match(compacted, /tour-14\b/);
-  assert.ok(compacted.split("\n").every((line) => line.length <= 1_800));
+  assert.ok(compacted.split("\n").every((line) => line.length <= 1_200));
 });
 
 test("l'identité de conversation survit au digest long de l'interface", () => {

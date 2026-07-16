@@ -21,6 +21,7 @@ import {
   type OpenCodeAdapter,
 } from "@/lib/opencode-adapter";
 import type { OpsDocumentPlan } from "@/lib/ops-document";
+import { buildOpsMemoryContext } from "@/lib/ops-retrieval";
 
 export const runtime = "nodejs";
 
@@ -106,6 +107,7 @@ type OpenCodeOutput =
 const OPEN_CODE_SYSTEM = `Tu es le cerveau privé de l'application OPS, un copilote de direction pour l'entreprise fictive Atelier Beaumarchais.
 
 Tu disposes exclusivement des outils read-only OPS. Pour toute question métier, utilise les outils avant d'affirmer un fait. Pour une salutation, une correction conversationnelle ou une question sociale, réponds naturellement sans recherche inutile.
+Lorsqu'un bloc « CONTEXTE MÉMOIRE OBSIDIAN PRÉCHARGÉ » est fourni, la recherche a déjà été effectuée par OPS : analyse directement ces preuves sans demander d'outil.
 
 BUDGET DE RECHERCHE
 - Un résultat de recherche contient déjà les faits complets utiles : ne relis pas chaque source séparément.
@@ -455,13 +457,19 @@ async function openCodeResponse(
       }
 
       try {
+        const memoryContext = researchRequired
+          ? await buildOpsMemoryContext(message, history)
+          : null;
         let streamedAnswer = "";
         const result = await adapter.runStructured({
-          message: buildOpenCodeMessage(message, history),
+          message: [
+            memoryContext,
+            buildOpenCodeMessage(message, history),
+          ].filter(Boolean).join("\n\n"),
           schema: documentRequested
             ? openCodeDocumentOutputSchema
             : openCodeOutputSchema,
-          researchWithTools: researchRequired,
+          researchWithTools: researchRequired && !memoryContext,
           sessionHandle: session,
           sessionTitle: "Conversation OPS — Marie Delmas",
           system: OPEN_CODE_SYSTEM,

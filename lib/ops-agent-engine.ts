@@ -4,8 +4,8 @@ import {
   type AgentHistoryTurn,
 } from "@/lib/ops-memory";
 
-const MAX_CONTEXT_TURNS = 12;
-const MAX_CONTEXT_TURN_LENGTH = 1_800;
+const MAX_CONTEXT_TURNS = 8;
+const MAX_CONTEXT_TURN_LENGTH = 1_200;
 const MAX_CONVERSATION_IDENTITY_SEED_LENGTH = 460;
 
 /**
