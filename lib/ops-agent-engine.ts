@@ -1,16 +1,117 @@
 import { findScenario, type AgentScenario } from "@/lib/ops-demo-data";
 import {
   extractMemoryIds,
-  findContextualMemoryId,
+  findConversationMemory,
   getMemoryRecord,
   getRelatedMemory,
   normalizeMemoryQuery,
+  resolveImplicitMemory,
   searchCompanyMemory,
   type AgentHistoryTurn,
 } from "@/lib/ops-memory";
 
 function reply(id: string, label: string, lead: string, body: string[], sources: string[], followups: string[]): AgentScenario {
   return { id, label, keywords: [], lead, body, sources, followups };
+}
+
+const MARGIN_EXPLANATION_SOURCE_IDS = ["PROJET-241", "TEMPS-086", "ACHAT-109", "FACT-882", "ALERT-201"];
+
+export type PdfRequestResolution = {
+  requested: boolean;
+  needsClarification: boolean;
+  title: string | null;
+  topic: string | null;
+  sourceIds: string[];
+  contextId: string | null;
+};
+
+function isSimpleGreeting(normalized: string) {
+  return /^(?:(?:bonjour|bonsoir|salut|hello|coucou|hey)[!,. ]*)?(?:ca va|comment (?:ca va|vas.tu|tu vas|allez.vous|vous allez)|(?:est.ce que )?tu vas bien|vous allez bien)[!,.? ]*$/.test(normalized)
+    || /^(bonjour|bonsoir|salut|hello|coucou|hey)[!,.? ]*$/.test(normalized);
+}
+
+function isImplicitFollowup(normalized: string) {
+  return /^(?:et\b|alors\b|donc\b|qu.en est.il\b|(?:montre|explique|detaille|resume|compare|ouvre|continue|approfondis|fais)\b)/.test(normalized)
+    || /\b(?:cela|ca|ce point|cette analyse|le precedent|la precedente)\b/.test(normalized);
+}
+
+function explicitPdfTopic(prompt: string) {
+  const cleaned = prompt.trim();
+  if (/rapport(?:\s+de\s+direction|\s+annuel|\s+d'entreprise)?\s+2026/i.test(cleaned)) return "Rapport de direction 2026";
+  if (/brief\s+(codir|direction)/i.test(cleaned)) return "Brief CODIR — 15 juillet 2026";
+  if (/strat[eé]gie/i.test(cleaned)) return "Stratégie de direction — 90 jours";
+  if (/simulation/i.test(cleaned)) return "Simulation de fin de trimestre 2026";
+  if (/fiche\s+compte/i.test(cleaned)) return "Fiche compte direction";
+
+  const remainder = cleaned
+    .replace(/(?:peux[- ]tu|tu peux|merci de|s'il te plaît|stp|produis|produire|génère|générer|crée|créer|fais[- ]moi|fait[- ]moi|fais|fait|moi|un|une|le|la|pdf|document|rapport)/gi, " ")
+    .replace(/\b(?:explicatif|exaplicatif|explicative|exaplicative|explication|détaillé|détaillée|detaille|detaillee|complet|complète|complete|clair|claire|dessus|précédent|précédente|precedent|precedente|cela|ça|ca)\b/gi, " ")
+    .replace(/\b(?:sur|du|de|des|à propos)\b/gi, " ")
+    .replace(/[-–—_:;,.!?]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return remainder.length >= 4 ? remainder[0].toLocaleUpperCase("fr") + remainder.slice(1) : null;
+}
+
+export function resolvePdfRequest(prompt: string, history: AgentHistoryTurn[] = []): PdfRequestResolution {
+  if (!asksForPdf(prompt)) {
+    return { requested: false, needsClarification: false, title: null, topic: null, sourceIds: [], contextId: null };
+  }
+
+  const normalized = normalizeMemoryQuery(prompt);
+  const directMarginRequest = /\b(marge|rentabilite|rivoli)\b/.test(normalized);
+  const conversationRecords = findConversationMemory(history, 12);
+  const conversationIds = new Set(conversationRecords.map((record) => record.id));
+  const hasMarginContext = MARGIN_EXPLANATION_SOURCE_IDS.some((id) => conversationIds.has(id));
+
+  if (directMarginRequest) {
+    return {
+      requested: true,
+      needsClarification: false,
+      title: "Rapport explicatif — baisse de marge atelier",
+      topic: "Baisse de marge du chantier Rivoli",
+      sourceIds: MARGIN_EXPLANATION_SOURCE_IDS,
+      contextId: "PROJET-241",
+    };
+  }
+
+  const explicitTopic = explicitPdfTopic(prompt);
+  if (explicitTopic) {
+    const records = searchCompanyMemory(prompt, history, 8);
+    return {
+      requested: true,
+      needsClarification: false,
+      title: explicitTopic,
+      topic: explicitTopic,
+      sourceIds: records.map((record) => record.id),
+      contextId: records[0]?.id ?? null,
+    };
+  }
+
+  if (hasMarginContext) {
+    return {
+      requested: true,
+      needsClarification: false,
+      title: "Rapport explicatif — baisse de marge atelier",
+      topic: "Baisse de marge du chantier Rivoli",
+      sourceIds: MARGIN_EXPLANATION_SOURCE_IDS,
+      contextId: "PROJET-241",
+    };
+  }
+
+  if (conversationRecords.length) {
+    const primary = conversationRecords[0];
+    return {
+      requested: true,
+      needsClarification: false,
+      title: `Rapport explicatif — ${primary.title}`,
+      topic: primary.summary,
+      sourceIds: conversationRecords.slice(0, 8).map((record) => record.id),
+      contextId: primary.id,
+    };
+  }
+
+  return { requested: true, needsClarification: true, title: null, topic: null, sourceIds: [], contextId: null };
 }
 
 function approvalScenario(id: "VAL-061" | "VAL-063", prompt: string) {
@@ -73,18 +174,17 @@ export function buildFallbackScenario(prompt: string, history: AgentHistoryTurn[
       ["Recherche les validations en attente", "Ouvre le Cerveau", "Que dois-je valider aujourd’hui ?"],
     );
   }
-  const contextualId = /\b(la|le|elle|lui|cette|ce|detail|détail|brouillon|compare|explique)\b/i.test(prompt)
-    ? findContextualMemoryId(history)
-    : null;
-  const recordMatch = explicitId ? recordScenario(explicitId, prompt) : contextualId ? recordScenario(contextualId, prompt) : null;
-  if (recordMatch) return recordMatch;
+  if (explicitId) {
+    const recordMatch = recordScenario(explicitId, prompt);
+    if (recordMatch) return recordMatch;
+  }
 
-  if (/^(bonjour|bonsoir|salut|hello|coucou|hey)(\s|[!,.?]|$)/.test(normalized)) {
+  if (isSimpleGreeting(normalized)) {
     return reply(
       "greeting",
       prompt,
-      "Bonjour Marie. Oui, merci — je suis prêt.",
-      ["Vous pouvez me demander une décision précise, un état de l’entreprise, une analyse ou un document."],
+      "Salut Marie. Ça va bien, merci. Et vous ?",
+      [],
       [],
       ["Que dois-je valider aujourd’hui ?", "Analyse les priorités du jour", "Prépare mon brief CODIR"],
     );
@@ -92,6 +192,34 @@ export function buildFallbackScenario(prompt: string, history: AgentHistoryTurn[
 
   if (/^(merci|parfait|ok|d.accord|tres bien|très bien)(\s|[!,.?]|$)/.test(normalized)) {
     return reply("acknowledgement", prompt, "Avec plaisir.", ["Je garde le contexte de cette conversation. Dites-moi simplement la prochaine décision ou le prochain livrable à préparer."], [], ["Continue", "Résume la décision", "Prépare la suite"]);
+  }
+
+  const pdfRequest = resolvePdfRequest(prompt, history);
+  if (pdfRequest.requested) {
+    if (pdfRequest.needsClarification || !pdfRequest.title) {
+      return reply(
+        "pdf-clarification",
+        prompt,
+        "D’accord. Quel sujet doit expliquer le PDF ?",
+        ["Vous pouvez préciser un client, un projet, une validation ou reprendre l’analyse précédente."],
+        [],
+        ["Le rapport de direction 2026", "La baisse de marge atelier", "La validation VAL-061"],
+      );
+    }
+
+    return reply(
+      "pdf-generation",
+      prompt,
+      `Je prépare « ${pdfRequest.title} » à partir du contexte de cette conversation.`,
+      [
+        pdfRequest.contextId === "PROJET-241"
+          ? "Le document expliquera l’écart entre la marge prévue et la marge projetée, les heures non facturées, le dépassement d’achat, la situation de facturation et l’alerte de marge."
+          : `Le document sera centré sur ${pdfRequest.topic ?? pdfRequest.title}, sans élargir artificiellement l’analyse.`,
+        "Chaque conclusion sera reliée aux sources utilisées avant la génération du fichier.",
+      ],
+      pdfRequest.sourceIds,
+      ["Génère le PDF", "Montre d’abord le plan", "Ajoute les recommandations"],
+    );
   }
 
   if (/que dois.je valider|validation.*aujourd|validations? en attente/.test(normalized)) {
@@ -235,6 +363,15 @@ export function buildFallbackScenario(prompt: string, history: AgentHistoryTurn[
     );
   }
 
+  if (isImplicitFollowup(normalized)) {
+    const contextualRecords = resolveImplicitMemory(prompt, history, 8);
+    const primary = contextualRecords[0];
+    if (primary) {
+      const contextualScenario = recordScenario(primary.id, prompt);
+      if (contextualScenario) return contextualScenario;
+    }
+  }
+
   const scenario = findScenario(prompt);
   if (scenario.id !== "general") return scenario;
 
@@ -263,22 +400,10 @@ export function buildFallbackScenario(prompt: string, history: AgentHistoryTurn[
   );
 }
 
-export function extractPdfTopic(prompt: string) {
-  const cleaned = prompt.trim();
-  if (/rapport(?:\s+de\s+direction|\s+annuel|\s+d'entreprise)?\s+2026/i.test(cleaned)) return "Rapport de direction 2026";
-  if (/brief\s+(codir|direction)/i.test(cleaned)) return "Brief CODIR — 15 juillet 2026";
-  if (/strategie/i.test(cleaned)) return "Stratégie de direction — 90 jours";
-  if (/simulation/i.test(cleaned)) return "Simulation de fin de trimestre 2026";
-  if (/fiche\s+compte/i.test(cleaned)) return "Fiche compte direction";
-
-  const remainder = cleaned
-    .replace(/(?:peux[- ]tu|tu peux|merci de|s'il te plaît|stp|produis|produire|génère|générer|crée|créer|fais[- ]moi|moi|un|une|le|la|pdf|document|rapport)/gi, " ")
-    .replace(/[-–—_:;,.!?]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return remainder.length >= 4 ? remainder[0].toLocaleUpperCase("fr") + remainder.slice(1) : null;
+export function extractPdfTopic(prompt: string, history: AgentHistoryTurn[] = []) {
+  return resolvePdfRequest(prompt, history).title;
 }
 
 export function asksForPdf(prompt: string) {
-  return /\b(pdf|rapport|document)\b/i.test(prompt) && /(produ|g[eé]n[eè]r|cr[eé]|fais|pr[eé]pare|transforme|exporte)/i.test(prompt);
+  return /\b(pdf|rapport|document)\b/i.test(prompt) && /(produ|g[eé]n[eè]r|cr[eé]|fai[st]|pr[eé]pare|transforme|exporte|relance)/i.test(prompt);
 }

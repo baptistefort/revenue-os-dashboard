@@ -163,7 +163,7 @@ export const opsMemoryRecords: OpsMemoryRecord[] = [
     title: "Chantier Rivoli",
     summary: "Projet de 120 K€ avancé à 62 %, avec une marge projetée à 28,9 % contre 31 % initialement.",
     facts: ["14 heures non facturées coûtent 630 €.", "Le placage dépasse le budget de 1 438 €.", "Ces deux causes expliquent 82 % de l’écart.", "Un avenant de 6,8 K€ protégerait 1,9 point de marge."],
-    relations: ["TEMPS-086", "ACHAT-109", "ALERT-201", "VAL-063"],
+    relations: ["TEMPS-086", "ACHAT-109", "FACT-882", "ALERT-201", "VAL-063"],
     aliases: ["rivoli", "chantier rivoli", "marge atelier"],
     updatedAt: "2026-07-15T07:46:00+02:00",
   },
@@ -218,12 +218,26 @@ export const opsMemoryRecords: OpsMemoryRecord[] = [
     updatedAt: "2026-07-15T07:42:00+02:00",
   },
   {
+    id: "FACT-882",
+    type: "invoice",
+    title: "Situation de facturation Rivoli",
+    summary: "La situation de facturation du chantier Rivoli n’intègre pas encore les heures supplémentaires ni le dépassement de placage chêne.",
+    facts: [
+      "Les 14 heures non facturées de TEMPS-086 représentent 630 €.",
+      "Le dépassement d’achat ACHAT-109 représente 1 438 €.",
+      "Un avenant de 6,8 K€ est proposé avant la prochaine situation client.",
+    ],
+    relations: ["PROJET-241", "TEMPS-086", "ACHAT-109", "ALERT-201", "VAL-063"],
+    aliases: ["facturation rivoli", "situation rivoli", "facture rivoli"],
+    updatedAt: "2026-07-15T07:45:00+02:00",
+  },
+  {
     id: "ALERT-201",
     type: "alert",
     title: "Écart de marge Rivoli",
     summary: "Rivoli explique 82 % de l’écart de marge atelier observé cette semaine.",
     facts: ["Causes confirmées : TEMPS-086 et ACHAT-109.", "Décision liée : VAL-063."],
-    relations: ["PROJET-241", "TEMPS-086", "ACHAT-109", "VAL-063"],
+    relations: ["PROJET-241", "TEMPS-086", "ACHAT-109", "FACT-882", "VAL-063"],
     aliases: ["alerte marge", "écart rivoli"],
     updatedAt: "2026-07-15T07:46:00+02:00",
   },
@@ -291,8 +305,27 @@ export const opsMemoryRecords: OpsMemoryRecord[] = [
 
 const memoryById = new Map(opsMemoryRecords.map((record) => [record.id, record]));
 const searchStopWords = new Set([
-  "alors", "avec", "avoir", "comment", "dans", "des", "elle", "elles", "entre", "est", "etre", "fais", "fait", "faire", "faut", "ici", "les", "leur", "mais", "mes", "moi", "montre", "nous", "par", "pas", "peut", "plus", "pour", "pourquoi", "quelle", "quelles", "quels", "quoi", "rire", "sans", "ses", "son", "sur", "tous", "tout", "une", "vous", "veux",
+  "alors", "avec", "avoir", "cela", "comment", "dans", "des", "elle", "elles", "entre", "est", "etre", "fais", "fait", "faire", "faut", "ici", "les", "leur", "mais", "mes", "moi", "montre", "nous", "par", "pas", "peut", "plus", "pour", "pourquoi", "quelle", "quelles", "quels", "quoi", "rire", "sans", "ses", "son", "sur", "tous", "tout", "une", "vous", "veux",
 ]);
+
+function tokenizeMemoryText(value: string) {
+  return normalizeMemoryQuery(value)
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word.length > 2 && !searchStopWords.has(word))
+    .map((word) => word.length > 4 && word.endsWith("s") ? word.slice(0, -1) : word);
+}
+
+function scoreMemoryRecord(record: OpsMemoryRecord, normalizedQuery: string, queryWords: string[]) {
+  const haystack = normalizeMemoryQuery([record.id, record.title, record.summary, ...record.facts, ...record.aliases].join(" "));
+  const haystackWords = new Set(tokenizeMemoryText(haystack));
+  const titleWords = new Set(tokenizeMemoryText(record.title));
+  const aliasWords = new Set(record.aliases.flatMap(tokenizeMemoryText));
+  const aliasMatch = record.aliases.some((alias) => normalizedQuery.includes(normalizeMemoryQuery(alias)));
+  const bodyScore = queryWords.reduce((total, word) => total + (haystackWords.has(word) ? 1 : 0), 0);
+  const titleScore = queryWords.reduce((total, word) => total + (titleWords.has(word) ? 3 : 0), 0);
+  const aliasScore = queryWords.reduce((total, word) => total + (aliasWords.has(word) ? 2 : 0), 0);
+  return bodyScore + titleScore + aliasScore + (aliasMatch ? 4 : 0);
+}
 
 export function normalizeMemoryQuery(value: string) {
   return value
@@ -317,6 +350,15 @@ export function getRelatedMemory(record: OpsMemoryRecord) {
   return record.relations.map((id) => memoryById.get(id)).filter((candidate): candidate is OpsMemoryRecord => Boolean(candidate));
 }
 
+export function getMemoryRecords(ids: string[]) {
+  return ids.map((id) => memoryById.get(id.toLocaleUpperCase("fr"))).filter((record): record is OpsMemoryRecord => Boolean(record));
+}
+
+export function expandMemoryRecords(records: OpsMemoryRecord[], limit = 12) {
+  const expanded = records.flatMap((record) => [record, ...getRelatedMemory(record)]);
+  return [...new Map(expanded.map((record) => [record.id, record])).values()].slice(0, limit);
+}
+
 export function findContextualMemoryId(history: AgentHistoryTurn[]) {
   for (const role of ["user", "assistant"] as const) {
     for (const turn of [...history].reverse()) {
@@ -328,14 +370,68 @@ export function findContextualMemoryId(history: AgentHistoryTurn[]) {
   return null;
 }
 
-export function searchCompanyMemory(query: string, history: AgentHistoryTurn[] = [], limit = 8) {
+/**
+ * Retrouve le sujet métier d'une conversation même lorsque la réponse affichée
+ * ne contient pas les identifiants de ses sources. Les tours utilisateur sont
+ * prioritaires afin qu'une citation secondaire de l'assistant ne devienne pas
+ * accidentellement le nouveau sujet principal.
+ */
+export function findConversationMemory(history: AgentHistoryTurn[], limit = 10): OpsMemoryRecord[] {
+  const priorTurns: AgentHistoryTurn[] = [];
+  for (const turn of history) {
+    if (turn.role !== "user") continue;
+    priorTurns.push(turn);
+  }
+
+  for (let index = priorTurns.length - 1; index >= 0; index -= 1) {
+    const turn = priorTurns[index];
+    const explicit = getMemoryRecords(extractMemoryIds(turn.content));
+    if (explicit.length) return expandMemoryRecords(explicit, limit);
+
+    const semantic = searchCompanyMemory(turn.content, [], limit);
+    if (semantic.length) return expandMemoryRecords(semantic.slice(0, 2), limit);
+  }
+
+  for (const turn of [...history].reverse()) {
+    if (turn.role !== "assistant") continue;
+    const explicit = getMemoryRecords(extractMemoryIds(turn.content));
+    if (explicit.length) return expandMemoryRecords(explicit, limit);
+  }
+
+  return [];
+}
+
+export function resolveImplicitMemory(query: string, history: AgentHistoryTurn[], limit = 10): OpsMemoryRecord[] {
+  const context = findConversationMemory(history, limit);
+  if (!context.length) return [];
+
   const normalized = normalizeMemoryQuery(query);
+  const words = tokenizeMemoryText(query);
+  const ranked = context
+    .map((record) => ({ record, score: scoreMemoryRecord(record, normalized, words) }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || b.record.updatedAt.localeCompare(a.record.updatedAt))
+    .map(({ record }) => record);
+
+  return ranked.length ? expandMemoryRecords(ranked.slice(0, 2), limit) : context.slice(0, limit);
+}
+
+export function searchCompanyMemory(query: string, history: AgentHistoryTurn[] = [], limit = 8): OpsMemoryRecord[] {
+  const normalized = normalizeMemoryQuery(query);
+  const words = tokenizeMemoryText(query);
   const explicitIds = extractMemoryIds(query);
   const exact = explicitIds.map((id) => memoryById.get(id)).filter((record): record is OpsMemoryRecord => Boolean(record));
   if (explicitIds.length && !exact.length) return [];
   if (exact.length) {
     const related = exact.flatMap(getRelatedMemory);
     return [...new Map([...exact, ...related].map((record) => [record.id, record])).values()].slice(0, limit);
+  }
+
+  // Une demande de document générique ("fais-moi un PDF explicatif")
+  // porte sur le sujet déjà établi, pas sur le mot "PDF" lui-même.
+  if (/\b(pdf|rapport|document)\b/.test(normalized) && history.length) {
+    const conversation = findConversationMemory(history, limit);
+    if (conversation.length) return conversation.slice(0, limit);
   }
 
   const contextId = /\b(la|le|elle|lui|cette|ce|les|brouillon|detail|détail|compare)\b/i.test(query)
@@ -348,14 +444,7 @@ export function searchCompanyMemory(query: string, history: AgentHistoryTurn[] =
 
   return opsMemoryRecords
     .map((record) => {
-      const haystack = normalizeMemoryQuery([record.id, record.title, record.summary, ...record.facts, ...record.aliases].join(" "));
-      const haystackWords = new Set(haystack.split(/[^a-z0-9]+/).filter(Boolean));
-      const words = normalized
-        .split(/[^a-z0-9]+/)
-        .filter((word) => word.length > 2 && !searchStopWords.has(word));
-      const aliasMatch = record.aliases.some((alias) => normalized.includes(normalizeMemoryQuery(alias)));
-      const score = words.reduce((total, word) => total + (haystackWords.has(word) ? 1 : 0), 0) + (aliasMatch ? 3 : 0);
-      return { record, score };
+      return { record, score: scoreMemoryRecord(record, normalized, words) };
     })
     .filter(({ score }) => score > 0)
     .sort((a, b) => b.score - a.score || b.record.updatedAt.localeCompare(a.record.updatedAt))

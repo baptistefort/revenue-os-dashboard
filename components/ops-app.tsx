@@ -26,7 +26,7 @@ import {
   type OpsDocument,
   type PageId,
 } from "@/lib/ops-demo-data";
-import { asksForPdf, buildFallbackScenario, extractPdfTopic } from "@/lib/ops-agent-engine";
+import { buildFallbackScenario, resolvePdfRequest } from "@/lib/ops-agent-engine";
 
 type OpenAgent = (prompt?: string) => void;
 
@@ -194,7 +194,76 @@ type ChatMessage = {
   loading?: boolean;
   statusText?: string;
   document?: OpsDocument;
+  progressKind?: "analysis" | "pdf";
+  progressStartedAt?: number;
+  progressStage?: string;
+  progressLabel?: string;
+  progressDetail?: string;
+  progressEtaMs?: number;
+  progressUpdatedAt?: number;
 };
+
+type ConversationTurn = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+function serializeChatMessage(message: ChatMessage): ConversationTurn | null {
+  if (message.role === "user") {
+    const content = message.prompt?.trim();
+    return content ? { role: "user", content } : null;
+  }
+
+  const answer = (message.text?.trim() || [message.scenario?.lead, ...(message.scenario?.body ?? [])]
+    .filter(Boolean)
+    .join("\n\n"))
+    .trim();
+  const sources = message.scenario?.sources.length
+    ? `Sources citées : ${message.scenario.sources.join(", ")}.`
+    : "";
+  const document = message.document
+    ? `Document produit : ${message.document.name} (${message.document.id}, ${message.document.pages ?? 3} pages, disponible dans Documents).`
+    : "";
+  const content = [answer, sources, document].filter(Boolean).join("\n\n");
+  return content ? { role: "assistant", content } : null;
+}
+
+function buildConversationHistory(messages: ChatMessage[]) {
+  const turns = messages.map(serializeChatMessage).filter((turn): turn is ConversationTurn => Boolean(turn));
+  if (turns.length <= 12) return turns;
+
+  const recent = turns.slice(-11);
+  const older = turns.slice(0, -11);
+  const digest = older
+    .map((turn, index) => {
+      const speaker = turn.role === "user" ? "Marie" : "OPS";
+      const compact = turn.content.replace(/\s+/g, " ").trim().slice(0, 460);
+      return `${index + 1}. ${speaker} — ${compact}`;
+    })
+    .join("\n")
+    .slice(0, 4_700);
+
+  return [
+    {
+      role: "assistant" as const,
+      content: `CONTEXTE STRUCTURÉ DES ÉCHANGES ANTÉRIEURS\nConserver les décisions, identifiants, documents et sujets ouverts ci-dessous pour interpréter les questions de suivi.\n${digest}`,
+    },
+    ...recent,
+  ];
+}
+
+function buildPdfContext(messages: ChatMessage[], userRequest: string, sourceIds: string[]) {
+  const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant" && message.scenario);
+  const streamedBody = lastAssistant?.text?.trim()
+    ? lastAssistant.text.split(/\n{2,}/).map((paragraph) => paragraph.trim()).filter(Boolean)
+    : undefined;
+  return {
+    userRequest,
+    lead: lastAssistant?.scenario?.lead ?? "",
+    body: streamedBody?.length ? streamedBody : lastAssistant?.scenario?.body ?? [],
+    sources: [...new Set([...(lastAssistant?.scenario?.sources ?? []), ...sourceIds])],
+  };
+}
 
 function blobToDataUrl(blob: Blob) {
   return new Promise<string>((resolve, reject) => {
@@ -214,8 +283,92 @@ function createReply(id: string, lead: string, body: string[], sources: string[]
   return { id, label: lead, keywords: [], lead, body, sources, followups };
 }
 
+function AgentProgress({ kind, startedAt, stage, label, detail, etaMs, updatedAt }: {
+  kind: "analysis" | "pdf";
+  startedAt: number;
+  stage?: string;
+  label?: string;
+  detail?: string;
+  etaMs?: number;
+  updatedAt?: number;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 300);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const elapsed = Math.max(0, now - startedAt);
+  const stages = kind === "pdf"
+    ? [
+        { label: "Je consulte la mémoire", icon: "brain" as IconName, at: 0 },
+        { label: "Je rapproche les documents", icon: "project" as IconName, at: 700 },
+        { label: "Je prépare le PDF", icon: "document" as IconName, at: 1_500 },
+      ]
+    : [
+        { label: "Je consulte la mémoire", icon: "brain" as IconName, at: 0 },
+        { label: "Je rapproche les documents", icon: "project" as IconName, at: 650 },
+        { label: "Je structure la réponse", icon: "spark" as IconName, at: 1_450 },
+      ];
+  const localIndex = stages.reduce((current, item, index) => elapsed >= item.at ? index : current, 0);
+  const normalizedStage = `${stage ?? ""} ${label ?? ""}`.toLocaleLowerCase("fr");
+  const serverIndex = /pdf|r[eé]daction|r[eé]ponse|synth[eè]se|compose|final/.test(normalizedStage)
+    ? 2
+    : /document|source|preuve|rapproche|evidence/.test(normalizedStage)
+      ? 1
+      : /m[eé]moire|recherche|search|context/.test(normalizedStage)
+        ? 0
+        : null;
+  const activeIndex = serverIndex ?? localIndex;
+  const target = kind === "pdf" ? 2_600 : 2_200;
+  const serverElapsed = Math.max(0, now - (updatedAt ?? startedAt));
+  const effectiveRemaining = typeof etaMs === "number" ? etaMs - serverElapsed : target - elapsed;
+  const remaining = Math.max(1, Math.ceil(effectiveRemaining / 1_000));
+
+  return (
+    <div className="agent-progress" aria-live="polite">
+      <span className="assistant-mark"><OpsIcon name="spark" size={18} /></span>
+      <div className="agent-progress-card">
+        <header><strong>{label || (kind === "pdf" ? "Création du document" : "Analyse en cours")}</strong><span>{effectiveRemaining > 0 ? `environ ${remaining} s` : "finalisation en cours"}</span></header>
+        {detail ? <p>{detail}</p> : null}
+        <div className="agent-progress-steps">
+          {stages.map((stage, index) => {
+            const state = index < activeIndex ? "done" : index === activeIndex ? "active" : "pending";
+            return (
+              <div className={`agent-progress-step ${state}`} key={stage.label}>
+                <i>{state === "done" ? <OpsIcon name="check" size={12} /> : <OpsIcon name={stage.icon} size={13} />}</i>
+                <span>{stage.label}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <style jsx>{`
+        .agent-progress { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 15px; margin: 0 0 22px; }
+        .agent-progress-card { width: min(570px, 100%); padding: 14px 16px 15px; background: #fbfbfa; border: 1px solid #e8e9e9; border-radius: 15px; }
+        .agent-progress-card header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+        .agent-progress-card header strong { color: #282b2e; font-size: 10px; font-weight: 680; }
+        .agent-progress-card header span { color: #969ba0; font-size: 8px; }
+        .agent-progress-card > p { margin: -4px 0 12px; color: #7d8388; font-size: 8px; line-height: 1.45; }
+        .agent-progress-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+        .agent-progress-step { min-width: 0; display: flex; align-items: center; gap: 7px; color: #afb3b7; font-size: 8px; transition: color 180ms ease; }
+        .agent-progress-step i { width: 23px; height: 23px; flex: 0 0 auto; display: grid; place-items: center; color: #979ca2; background: #f2f3f3; border-radius: 8px; font-style: normal; }
+        .agent-progress-step span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .agent-progress-step.done { color: #5d7568; }
+        .agent-progress-step.done i { color: #4c7860; background: #eaf1ed; }
+        .agent-progress-step.active { color: #25282b; font-weight: 640; }
+        .agent-progress-step.active i { color: #2f67a5; background: #eaf2fb; animation: progress-pulse 1.4s ease-in-out infinite; }
+        @keyframes progress-pulse { 50% { box-shadow: 0 0 0 5px rgba(47, 103, 165, .08); } }
+        @media (max-width: 640px) { .agent-progress-steps { grid-template-columns: 1fr; }.agent-progress-step span { white-space: normal; } }
+        @media (prefers-reduced-motion: reduce) { .agent-progress-step.active i { animation: none; } }
+      `}</style>
+    </div>
+  );
+}
+
 type AgentStreamEvent =
   | { type: "meta"; scenario: AgentScenario; mode?: string }
+  | { type: "progress"; stage: string; label: string; detail?: string; etaMs?: number }
   | { type: "delta"; delta: string }
   | { type: "error"; message: string; retryable?: boolean }
   | { type: "done" };
@@ -245,6 +398,50 @@ function FullComposer({ value, setValue, onSubmit, onVoice, processing, centered
   );
 }
 
+function PdfArtifactCard({ document, openDocuments }: {
+  document: OpsDocument;
+  openDocuments: (documentId?: string) => void;
+}) {
+  if (!document.dataUrl) return null;
+  return (
+    <article className="pdf-result-card">
+      <div className="pdf-result-preview" aria-hidden="true">
+        <OpsIcon name="document" size={21} />
+        <i /><i /><i />
+        <span>PDF</span>
+      </div>
+      <div className="pdf-result-copy">
+        <span className="pdf-result-status"><i /> Document prêt</span>
+        <strong>{document.name}</strong>
+        <small>{document.id} · {document.pages ?? 3} pages · {document.size ?? "—"} · {document.facts} éléments reliés</small>
+      </div>
+      <div className="pdf-result-actions">
+        <a className="primary" href={document.dataUrl} target="_blank" rel="noreferrer"><OpsIcon name="folder" size={14} /> Ouvrir le PDF</a>
+        <a href={document.dataUrl} download={document.name} aria-label={`Télécharger ${document.name}`}><OpsIcon name="download" size={15} /></a>
+        <button type="button" onClick={() => openDocuments(document.id)} aria-label="Voir dans Documents"><OpsIcon name="arrow" size={15} /></button>
+      </div>
+      <style jsx>{`
+        .pdf-result-card { width: min(660px, 100%); margin-top: 20px; padding: 14px; display: grid; grid-template-columns: 52px minmax(0, 1fr) auto; align-items: center; gap: 14px; color: #222529; background: #fff; border: 1px solid #e0e2e3; border-radius: 17px; box-shadow: 0 14px 42px rgba(18, 22, 28, .055); }
+        .pdf-result-preview { position: relative; width: 52px; height: 66px; padding: 10px 9px; display: flex; flex-direction: column; gap: 4px; color: #1d2023; background: linear-gradient(145deg, #fafafa, #f1f2f2); border: 1px solid #e6e7e7; border-radius: 10px; overflow: hidden; }
+        .pdf-result-preview i { width: 26px; height: 2px; display: block; background: #d5d8da; border-radius: 2px; }
+        .pdf-result-preview i:nth-of-type(2) { width: 21px; }
+        .pdf-result-preview span { position: absolute; right: 5px; bottom: 5px; padding: 3px 4px; color: #fff; background: #222529; border-radius: 4px; font-size: 6px; font-weight: 760; letter-spacing: .08em; }
+        .pdf-result-copy { min-width: 0; }
+        .pdf-result-status { display: inline-flex; align-items: center; gap: 5px; color: #4e745e; font-size: 7px; font-weight: 720; letter-spacing: .08em; text-transform: uppercase; }
+        .pdf-result-status i { width: 5px; height: 5px; background: #4e8063; border-radius: 50%; }
+        .pdf-result-copy strong { display: block; margin-top: 6px; overflow: hidden; color: #202326; font-size: 12px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+        .pdf-result-copy small { display: block; margin-top: 5px; color: #8a9095; font-size: 7.5px; }
+        .pdf-result-actions { display: flex; align-items: center; gap: 6px; }
+        .pdf-result-actions a, .pdf-result-actions button { min-width: 34px; min-height: 34px; padding: 0 9px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: #44494d; background: #fff; border: 1px solid #e0e2e3; border-radius: 9px; text-decoration: none; }
+        .pdf-result-actions .primary { color: #fff; background: #202326; border-color: #202326; font-size: 8px; font-weight: 650; }
+        .pdf-result-actions a:hover, .pdf-result-actions button:hover { background: #f6f6f5; }
+        .pdf-result-actions .primary:hover { background: #34383b; }
+        @media (max-width: 640px) { .pdf-result-card { grid-template-columns: 46px minmax(0, 1fr); }.pdf-result-preview { width: 46px; height: 58px; }.pdf-result-actions { grid-column: 1 / -1; justify-content: flex-end; }.pdf-result-actions .primary { margin-right: auto; } }
+      `}</style>
+    </article>
+  );
+}
+
 function ScenarioResponse({ scenario, text, document, openDocuments, onSpeak }: {
   scenario: AgentScenario;
   text?: string;
@@ -268,21 +465,7 @@ function ScenarioResponse({ scenario, text, document, openDocuments, onSpeak }: 
             <footer><small><OpsIcon name="shield" size={13} /> Aucune action externe sans validation</small><button>{scenario.artifact.action}</button></footer>
           </article>
         )}
-        {document?.dataUrl ? (
-          <article className="document-artifact">
-            <div className="document-artifact-icon"><OpsIcon name="document" size={22} /></div>
-            <div className="document-artifact-copy">
-              <span>PDF généré par OPS</span>
-              <strong>{document.name}</strong>
-              <small>{document.pages ?? 3} pages · {document.size ?? "—"} · {document.facts} sources reliées</small>
-            </div>
-            <div className="document-artifact-actions">
-              <a href={document.dataUrl} target="_blank" rel="noreferrer"><OpsIcon name="folder" size={15} /> Ouvrir</a>
-              <a href={document.dataUrl} download={document.name}><OpsIcon name="download" size={15} /> Télécharger</a>
-              <button type="button" onClick={() => openDocuments(document.id)}>Voir dans Documents <OpsIcon name="arrow" size={14} /></button>
-            </div>
-          </article>
-        ) : null}
+        {document ? <PdfArtifactCard document={document} openDocuments={openDocuments} /> : null}
         <div className="response-actions">
           <button type="button" onClick={() => navigator.clipboard?.writeText(answerText)}><OpsIcon name="copy" size={14} /> Copier</button>
           <button type="button"><OpsIcon name="thumb" size={14} /> Utile</button>
@@ -347,17 +530,21 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
     setValue("");
     setProcessing(true);
     const userId = Date.now();
-    const priorHistory = messagesRef.current.slice(-12).map((message) => ({
-      role: message.role,
-      content: message.role === "user"
-        ? message.prompt ?? ""
-        : message.text ?? [message.scenario?.lead, ...(message.scenario?.body ?? [])].filter(Boolean).join("\n\n"),
-    })).filter((entry) => entry.content);
+    const priorHistory = buildConversationHistory(messagesRef.current);
     const fallbackScenario = buildFallbackScenario(prompt, priorHistory);
-    const shouldResolvePdf = pendingPdf || asksForPdf(prompt);
-    const pdfTopic = extractPdfTopic(prompt);
+    const directPdfRequest = resolvePdfRequest(prompt, priorHistory);
+    const pdfRequest = pendingPdf && !directPdfRequest.requested
+      ? resolvePdfRequest(`Produis un PDF : ${prompt}`, priorHistory)
+      : directPdfRequest;
+    const shouldResolvePdf = pdfRequest.requested;
+    const pdfTitle = pdfRequest.title;
+    const pdfTopic = pdfRequest.topic;
+    const pdfSourceIds = [...new Set([
+      ...pdfRequest.sourceIds,
+      ...(pdfRequest.contextId ? [pdfRequest.contextId] : []),
+    ])];
 
-    if (asksForPdf(prompt) && !pdfTopic) {
+    if (shouldResolvePdf && pdfRequest.needsClarification) {
       const clarification = createReply(
         "pdf-clarification",
         "D’accord. Quel document souhaitez-vous créer ?",
@@ -372,34 +559,55 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
       return;
     }
 
-    if (shouldResolvePdf && pdfTopic) {
+    if (shouldResolvePdf && pdfTitle && pdfTopic) {
+      const reportContext = buildPdfContext(messagesRef.current, prompt, pdfSourceIds);
+      const reportSources = pdfSourceIds.length
+        ? pdfSourceIds
+        : ["FIN-SNAPSHOT-20260715", "CRM-SNAPSHOT-20260715", "STRAT-2026-Q3"];
       const buildingScenario = createReply(
         "pdf-building",
-        `Je prépare « ${pdfTopic} » à partir de la mémoire de l’entreprise.`,
+        `Je prépare « ${pdfTitle} » à partir de la mémoire de l’entreprise.`,
         ["Je rapproche les chiffres, les décisions, le CRM, les projets et l’acquisition, puis je relie chaque conclusion à ses sources."],
-        ["FIN-SNAPSHOT-20260715", "CRM-SNAPSHOT-20260715", "STRAT-2026-Q3"],
+        reportSources,
         [],
       );
-      setMessages((current) => [...current, { id: userId, role: "user", prompt }, { id: userId + 1, role: "assistant", scenario: buildingScenario, loading: true, statusText: "Construction du rapport et mise en page" }]);
+      setMessages((current) => [...current, { id: userId, role: "user", prompt }, {
+        id: userId + 1,
+        role: "assistant",
+        scenario: buildingScenario,
+        loading: true,
+        statusText: "Construction du rapport et mise en page",
+        progressKind: "pdf",
+        progressStartedAt: Date.now(),
+      }]);
 
       try {
-        const response = await fetch("/api/documents/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: pdfTopic, topic: pdfTopic }),
-        });
+        const minimumDocumentRun = new Promise((resolve) => window.setTimeout(resolve, 2_400));
+        const [response] = await Promise.all([
+          fetch("/api/documents/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title: pdfTitle,
+              topic: pdfTopic,
+              sourceIds: reportSources,
+              context: reportContext,
+            }),
+          }),
+          minimumDocumentRun,
+        ]);
         if (!response.ok) throw new Error("La génération du PDF a échoué");
         const blob = await response.blob();
         const dataUrl = await blobToDataUrl(blob);
         const document: OpsDocument = {
           id: response.headers.get("X-Document-Id") ?? `RAPPORT-${Date.now()}`,
-          name: `${pdfTopic}.pdf`,
+          name: `${pdfTitle}.pdf`,
           type: "Rapport PDF",
           linked: "Direction",
           owner: "OPS",
           updated: "À l’instant",
           status: "Généré",
-          facts: 9,
+          facts: Number(response.headers.get("X-Document-Sources") ?? Math.max(1, reportSources.length)),
           dataUrl,
           size: formatBytes(blob.size),
           pages: Number(response.headers.get("X-Document-Pages") ?? 3),
@@ -407,25 +615,56 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         };
         const readyScenario = createReply(
           "pdf-ready",
-          `${pdfTopic} est prêt.`,
-          ["Je l’ai ajouté à Documents et relié aux neuf sources utilisées. Vous pouvez l’ouvrir ou le télécharger directement ici."],
-          ["STRAT-2026-Q3", "FIN-SNAPSHOT-20260715", "CRM-SNAPSHOT-20260715", "PROJET-241", "GADS-2026-07"],
+          `${pdfTitle} est prêt.`,
+          [`Je l’ai ajouté à Documents et relié aux ${document.facts} sources utilisées. Vous pouvez l’ouvrir ou le télécharger directement ici.`],
+          reportSources,
           ["Résume les trois décisions", "Prépare l’email d’accompagnement", "Crée les missions du rapport"],
         );
         onDocumentGenerated(document);
-        setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, scenario: readyScenario, document, loading: false } : message));
+        setMessages((current) => current.map((message) => message.id === userId + 1 ? {
+          ...message,
+          scenario: readyScenario,
+          document,
+          loading: false,
+          progressKind: undefined,
+          progressStartedAt: undefined,
+          progressStage: undefined,
+          progressLabel: undefined,
+          progressDetail: undefined,
+          progressEtaMs: undefined,
+          progressUpdatedAt: undefined,
+        } : message));
         setPendingPdf(false);
         if (fromVoice) speak(`${readyScenario.lead} ${readyScenario.body.join(" ")}`);
       } catch {
         const errorScenario = createReply("pdf-error", "Je n’ai pas pu finaliser le PDF.", ["Aucune donnée n’a été perdue. Vous pouvez relancer la génération ; le brouillon reste prêt."], [], ["Relance la génération du PDF"]);
-        setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, scenario: errorScenario, loading: false } : message));
+        setMessages((current) => current.map((message) => message.id === userId + 1 ? {
+          ...message,
+          scenario: errorScenario,
+          loading: false,
+          progressKind: undefined,
+          progressStartedAt: undefined,
+          progressStage: undefined,
+          progressLabel: undefined,
+          progressDetail: undefined,
+          progressEtaMs: undefined,
+          progressUpdatedAt: undefined,
+        } : message));
       } finally {
         setProcessing(false);
       }
       return;
     }
 
-    setMessages((current) => [...current, { id: userId, role: "user", prompt }, { id: userId + 1, role: "assistant", scenario: fallbackScenario, loading: true, statusText: "Analyse de la mémoire de l’entreprise" }]);
+    setMessages((current) => [...current, { id: userId, role: "user", prompt }, {
+      id: userId + 1,
+      role: "assistant",
+      scenario: fallbackScenario,
+      loading: true,
+      statusText: "Analyse de la mémoire de l’entreprise",
+      progressKind: "analysis",
+      progressStartedAt: Date.now(),
+    }]);
 
     try {
       const response = await fetch("/api/agent", {
@@ -442,10 +681,25 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
       const structured = response.headers.get("content-type")?.includes("application/x-ndjson") ?? false;
 
       const applyEvent = (event: AgentStreamEvent) => {
-        if (event.type === "meta") {
+        if (event.type === "progress") {
+          const progressKind = /\bpdf\b|g[eé]n[eè]r(?:e|ation).*(?:rapport|document)/i.test(`${event.stage} ${event.label}`) ? "pdf" : "analysis";
+          const progressUpdatedAt = Date.now();
+          setMessages((current) => current.map((message) => message.id === userId + 1
+            ? {
+                ...message,
+                progressKind,
+                progressStartedAt: message.progressStartedAt ?? progressUpdatedAt,
+                progressStage: event.stage,
+                progressLabel: event.label,
+                progressDetail: event.detail,
+                progressEtaMs: event.etaMs,
+                progressUpdatedAt,
+              }
+            : message));
+        } else if (event.type === "meta") {
           serverScenario = event.scenario;
           setMessages((current) => current.map((message) => message.id === userId + 1
-            ? { ...message, scenario: serverScenario, loading: false, text }
+            ? { ...message, scenario: serverScenario, loading: !text.trim(), text }
             : message));
         } else if (event.type === "delta") {
           text += event.delta;
@@ -457,10 +711,25 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
           setMessages((current) => current.map((message) => message.id === userId + 1
             ? { ...message, scenario: serverScenario, loading: false, text }
             : message));
+        } else if (event.type === "done") {
+          setMessages((current) => current.map((message) => message.id === userId + 1
+            ? {
+                ...message,
+                scenario: serverScenario,
+                loading: false,
+                text,
+                progressKind: undefined,
+                progressStartedAt: undefined,
+                progressStage: undefined,
+                progressLabel: undefined,
+                progressDetail: undefined,
+                progressEtaMs: undefined,
+                progressUpdatedAt: undefined,
+              }
+            : message));
         }
       };
 
-      setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false, text: "" } : message));
       while (true) {
         const { done, value: chunk } = await reader.read();
         if (done) break;
@@ -482,10 +751,33 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
       if (structured && lineBuffer.trim()) {
         try { applyEvent(JSON.parse(lineBuffer) as AgentStreamEvent); } catch { /* La réponse déjà reçue reste affichée. */ }
       }
+      setMessages((current) => current.map((message) => message.id === userId + 1 ? {
+        ...message,
+        scenario: serverScenario,
+        loading: false,
+        text,
+        progressKind: undefined,
+        progressStartedAt: undefined,
+        progressStage: undefined,
+        progressLabel: undefined,
+        progressDetail: undefined,
+        progressEtaMs: undefined,
+        progressUpdatedAt: undefined,
+      } : message));
       if (fromVoice && text.trim()) speak([serverScenario.lead, text].filter(Boolean).join("\n\n"));
     } catch {
       await new Promise((resolve) => window.setTimeout(resolve, 520));
-      setMessages((current) => current.map((message) => message.id === userId + 1 ? { ...message, loading: false } : message));
+      setMessages((current) => current.map((message) => message.id === userId + 1 ? {
+        ...message,
+        loading: false,
+        progressKind: undefined,
+        progressStartedAt: undefined,
+        progressStage: undefined,
+        progressLabel: undefined,
+        progressDetail: undefined,
+        progressEtaMs: undefined,
+        progressUpdatedAt: undefined,
+      } : message));
       if (fromVoice) speak(`${fallbackScenario.lead} ${fallbackScenario.body.join(" ")}`);
     } finally {
       setProcessing(false);
@@ -545,10 +837,21 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
               <div className="user-message" data-message-id={message.id} key={message.id}>{message.prompt}</div>
             ) : (
               <div key={message.id}>
-                {message.loading ? (
+                {message.progressKind && message.progressStartedAt ? (
+                  <AgentProgress
+                    kind={message.progressKind}
+                    startedAt={message.progressStartedAt}
+                    stage={message.progressStage}
+                    label={message.progressLabel}
+                    detail={message.progressDetail}
+                    etaMs={message.progressEtaMs}
+                    updatedAt={message.progressUpdatedAt}
+                  />
+                ) : message.loading ? (
                   <div className="agent-thinking"><span className="assistant-mark"><OpsIcon name="spark" size={18} /></span><div><i /><span>{message.statusText ?? "Recherche dans 7 sources"}</span></div></div>
-                ) : message.scenario ? <ScenarioResponse scenario={message.scenario} text={message.text} document={message.document} openDocuments={openDocuments} onSpeak={speak} /> : null}
-                {!message.loading && message.scenario && (
+                ) : null}
+                {!message.loading && message.scenario ? <ScenarioResponse scenario={message.scenario} text={message.text} document={message.document} openDocuments={openDocuments} onSpeak={speak} /> : null}
+                {!message.loading && !message.progressKind && message.scenario && (
                   <div className="followups">{message.scenario.followups.map((followup) => <button key={followup} onClick={() => submit(followup)}>{followup}<OpsIcon name="arrow" size={13} /></button>)}</div>
                 )}
               </div>
