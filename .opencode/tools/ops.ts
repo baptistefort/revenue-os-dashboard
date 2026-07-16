@@ -1,55 +1,28 @@
 import { promises as fs } from "node:fs";
-import path from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import {
-  getMemoryRecord,
-  getRelatedMemory,
-  searchCompanyMemory,
-  type OpsMemoryRecord,
-} from "../../lib/ops-memory.ts";
+  OBSIDIAN_MEMORY_LIMITS,
+  buildObsidianVaultIndex,
+  findObsidianMemoryRecord,
+  getRelatedObsidianMemory,
+  resolveObsidianVaultRoot,
+  resolveSafeObsidianNote,
+  searchObsidianMemory,
+  type ObsidianMemoryRecord,
+  type ObsidianVaultIndex,
+} from "../../lib/obsidian-vault-memory.ts";
 
 const MAX_MEMORY_RESULTS = 12;
 const MAX_VAULT_RESULTS = 12;
-const MAX_VAULT_FILES_SCANNED = 800;
-const MAX_VAULT_FILE_BYTES = 256 * 1024;
-const MAX_VAULT_TOTAL_BYTES_SCANNED = 24 * 1024 * 1024;
-const MAX_VAULT_READ_CHARS = 24_000;
-const MAX_SNIPPET_CHARS = 700;
-const SKIPPED_DIRECTORIES = new Set([
-  ".git",
-  ".obsidian",
-  ".trash",
-  ".next",
-  "node_modules",
-]);
+const MAX_SNIPPET_CHARS = 900;
+const DEFAULT_CACHE_TTL_MS = 5_000;
 
-type CompactMemoryRecord = {
-  id: string;
-  type: OpsMemoryRecord["type"];
-  title: string;
-  summary: string;
-  facts: string[];
-  relations: string[];
-  updatedAt: string;
-};
-
-type VaultFile = {
-  absolutePath: string;
-  relativePath: string;
-  size: number;
-};
-
-function compactMemory(record: OpsMemoryRecord): CompactMemoryRecord {
-  return {
-    id: record.id,
-    type: record.type,
-    title: record.title,
-    summary: record.summary,
-    facts: record.facts,
-    relations: record.relations,
-    updatedAt: record.updatedAt,
-  };
-}
+let indexCache: {
+  root: string;
+  expiresAt: number;
+  value: ObsidianVaultIndex;
+} | null = null;
+let pendingIndex: Promise<ObsidianVaultIndex> | null = null;
 
 function json(value: unknown) {
   return JSON.stringify(value);
@@ -60,289 +33,249 @@ function clampInteger(value: number | undefined, fallback: number, maximum: numb
   return Math.max(1, Math.min(maximum, Math.trunc(value as number)));
 }
 
-function normalizeSearchText(value: string) {
-  return value
-    .toLocaleLowerCase("fr")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+function cacheTtlMs() {
+  const configured = Number(process.env.OBSIDIAN_MEMORY_CACHE_TTL_MS);
+  return Number.isFinite(configured)
+    ? Math.max(0, Math.min(60_000, configured))
+    : DEFAULT_CACHE_TTL_MS;
 }
 
-function searchTokens(query: string) {
-  return normalizeSearchText(query)
-    .split(/[^a-z0-9]+/)
-    .filter((token) => token.length >= 2)
-    .slice(0, 24);
-}
+async function loadIndex() {
+  const root = await resolveObsidianVaultRoot();
+  if (!root) return null;
+  const now = Date.now();
+  if (indexCache?.root === root && indexCache.expiresAt > now) return indexCache.value;
+  if (pendingIndex) return pendingIndex;
 
-function isInside(root: string, candidate: string) {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
-}
-
-async function vaultRoot() {
-  const configured = process.env.OBSIDIAN_VAULT_PATH?.trim();
-  if (!configured) return null;
-
+  pendingIndex = buildObsidianVaultIndex(root);
   try {
-    const resolved = await fs.realpath(path.resolve(configured));
-    const stats = await fs.stat(resolved);
-    return stats.isDirectory() ? resolved : null;
-  } catch {
-    return null;
+    const value = await pendingIndex;
+    indexCache = {
+      root,
+      value,
+      expiresAt: Date.now() + cacheTtlMs(),
+    };
+    return value;
+  } finally {
+    pendingIndex = null;
   }
 }
 
-function posixRelative(root: string, absolutePath: string) {
-  return path.relative(root, absolutePath).split(path.sep).join("/");
+function boundedContent(content: string, maximum = OBSIDIAN_MEMORY_LIMITS.maxRecordContentChars) {
+  if (content.length <= maximum) return content;
+  return `${content.slice(0, maximum)}\n\n[contenu tronqué]`;
 }
 
-async function listVaultMarkdownFiles(root: string) {
-  const files: VaultFile[] = [];
-  const pending = [root];
-  let totalBytes = 0;
-  let capped = false;
-
-  while (
-    pending.length
-    && files.length < MAX_VAULT_FILES_SCANNED
-    && totalBytes < MAX_VAULT_TOTAL_BYTES_SCANNED
-  ) {
-    const directory = pending.shift();
-    if (!directory) break;
-
-    let entries: Awaited<ReturnType<typeof fs.readdir>>;
-    try {
-      entries = await fs.readdir(directory, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    entries.sort((a, b) => a.name.localeCompare(b.name, "fr"));
-    for (const entry of entries) {
-      if (
-        files.length >= MAX_VAULT_FILES_SCANNED
-        || totalBytes >= MAX_VAULT_TOTAL_BYTES_SCANNED
-      ) break;
-      if (entry.isSymbolicLink()) continue;
-      if (entry.name.startsWith(".") || SKIPPED_DIRECTORIES.has(entry.name)) continue;
-
-      const absolutePath = path.join(directory, entry.name);
-      if (!isInside(root, absolutePath)) continue;
-
-      if (entry.isDirectory()) {
-        pending.push(absolutePath);
-        continue;
-      }
-      if (!entry.isFile() || path.extname(entry.name).toLocaleLowerCase("fr") !== ".md") continue;
-
-      try {
-        const stats = await fs.stat(absolutePath);
-        if (stats.size > MAX_VAULT_FILE_BYTES) continue;
-        if (totalBytes + stats.size > MAX_VAULT_TOTAL_BYTES_SCANNED) {
-          capped = true;
-          continue;
-        }
-        files.push({
-          absolutePath,
-          relativePath: posixRelative(root, absolutePath),
-          size: stats.size,
-        });
-        totalBytes += stats.size;
-      } catch {
-        // A file can disappear while the vault is being synchronized.
-      }
-    }
-  }
-
+function compactRecord(record: ObsidianMemoryRecord) {
   return {
-    files,
-    scannedBytes: totalBytes,
-    capped: capped || pending.length > 0 || files.length >= MAX_VAULT_FILES_SCANNED,
+    id: record.id,
+    type: record.type,
+    title: record.title,
+    summary: record.summary,
+    facts: record.facts,
+    relations: record.relations,
+    aliases: record.aliases,
+    updatedAt: record.updatedAt,
+    source: record.source,
+    path: record.path,
+    attributes: record.attributes,
+    content: boundedContent(record.content),
   };
 }
 
-function stripFrontmatter(content: string) {
-  return content.replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, "");
-}
-
-function noteTitle(content: string, relativePath: string) {
-  const frontmatterTitle = content.match(/^title:\s*["']?(.+?)["']?\s*$/mi)?.[1]?.trim();
-  const heading = stripFrontmatter(content).match(/^#\s+(.+?)\s*$/m)?.[1]?.trim();
-  return frontmatterTitle || heading || path.basename(relativePath, path.extname(relativePath));
-}
-
-function buildSnippet(content: string, tokens: string[]) {
-  const clean = stripFrontmatter(content)
+function searchSnippet(record: ObsidianMemoryRecord, query: string) {
+  const clean = record.content
     .replace(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g, "$1")
-    .replace(/[`*_>#-]+/g, " ")
+    .replace(/[`*_>#]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (!clean) return "";
+  if (!clean) return record.summary;
 
-  const normalized = normalizeSearchText(clean);
-  const indexes = tokens
-    .map((token) => normalized.indexOf(token))
-    .filter((index) => index >= 0);
-  const firstMatch = indexes.length ? Math.min(...indexes) : 0;
-  const start = Math.max(0, firstMatch - 160);
+  const normalized = clean.toLocaleLowerCase("fr").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const tokens = query
+    .toLocaleLowerCase("fr")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 2);
+  const matches = tokens.map((token) => normalized.indexOf(token)).filter((position) => position >= 0);
+  const first = matches.length ? Math.min(...matches) : 0;
+  const start = Math.max(0, first - 180);
   const end = Math.min(clean.length, start + MAX_SNIPPET_CHARS);
   return `${start > 0 ? "…" : ""}${clean.slice(start, end)}${end < clean.length ? "…" : ""}`;
 }
 
-function vaultScore(content: string, relativePath: string, tokens: string[]) {
-  const normalizedBody = normalizeSearchText(content);
-  const normalizedPath = normalizeSearchText(relativePath);
-  return tokens.reduce((score, token) => {
-    const pathMatch = normalizedPath.includes(token) ? 4 : 0;
-    const bodyMatches = normalizedBody.split(token).length - 1;
-    return score + pathMatch + Math.min(bodyMatches, 6);
-  }, 0);
-}
-
-async function resolveVaultNote(root: string, relativePath: string) {
-  if (!relativePath || relativePath.includes("\0") || path.isAbsolute(relativePath)) return null;
-
-  const candidate = path.resolve(root, relativePath);
-  if (!isInside(root, candidate)) return null;
-
-  try {
-    const realCandidate = await fs.realpath(candidate);
-    if (!isInside(root, realCandidate)) return null;
-    const stats = await fs.stat(realCandidate);
-    if (!stats.isFile() || stats.size > MAX_VAULT_FILE_BYTES) return null;
-    if (path.extname(realCandidate).toLocaleLowerCase("fr") !== ".md") return null;
-    return { absolutePath: realCandidate, size: stats.size };
-  } catch {
-    return null;
-  }
+function indexMeta(index: ObsidianVaultIndex) {
+  return {
+    indexedAt: index.indexedAt,
+    scannedFiles: index.scannedFiles,
+    scannedBytes: index.scannedBytes,
+    truncatedScan: index.truncated,
+  };
 }
 
 export const memory_search = tool({
   description:
-    "Recherche read-only dans la mémoire structurée OPS. Chaque résultat contient déjà les faits complets : ne pas relire ensuite chaque identifiant.",
+    "Recherche read-only dans la vraie mémoire Obsidian de l'entreprise. Les résultats proviennent exclusivement des notes Markdown indexées et contiennent leurs identifiants, chemins, faits et relations.",
   args: {
-    query: tool.schema.string().min(2).max(500).describe("Question, sujet, client, projet ou identifiant recherché."),
-    limit: tool.schema.number().int().min(1).max(MAX_MEMORY_RESULTS).optional().describe("Nombre maximal de résultats."),
+    query: tool.schema.string().min(2).max(500).describe(
+      "Question, sujet, client, projet, période ou identifiant à rechercher dans la mémoire Obsidian.",
+    ),
+    limit: tool.schema.number().int().min(1).max(MAX_MEMORY_RESULTS).optional().describe(
+      "Nombre maximal de notes retournées.",
+    ),
   },
   async execute({ query, limit }) {
+    const index = await loadIndex();
+    if (!index) return json({ ok: false, error: "vault_not_configured" });
     const cappedLimit = clampInteger(limit, 8, MAX_MEMORY_RESULTS);
-    const records = searchCompanyMemory(query, [], cappedLimit);
+    const matches = searchObsidianMemory(index, query, cappedLimit);
     return json({
       ok: true,
+      memory: "obsidian",
       query,
-      count: records.length,
-      records: records.map(compactMemory),
+      count: matches.length,
+      ...indexMeta(index),
+      records: matches.map(({ record, score }) => ({
+        score,
+        ...compactRecord(record),
+      })),
     });
   },
 });
 
 export const memory_get = tool({
-  description: "Lit un enregistrement précis de la mémoire OPS à partir de son identifiant exact.",
+  description:
+    "Lit une note précise de la mémoire Obsidian à partir de son identifiant, de son alias ou de son chemin. N'invente jamais un enregistrement absent.",
   args: {
-    id: tool.schema.string().min(2).max(80).describe("Identifiant exact, par exemple VAL-061 ou PROJET-241."),
+    id: tool.schema.string().min(2).max(1_000).describe(
+      "Identifiant exact ou chemin de note, par exemple VAL-061, PROJET-241 ou 07_Finance/Factures/....md.",
+    ),
   },
   async execute({ id }) {
-    const record = getMemoryRecord(id.trim());
-    if (!record) return json({ ok: false, error: "not_found", id: id.trim().toLocaleUpperCase("fr") });
-    return json({ ok: true, record: compactMemory(record) });
+    const index = await loadIndex();
+    if (!index) return json({ ok: false, error: "vault_not_configured" });
+    const record = findObsidianMemoryRecord(index, id.trim());
+    if (!record) {
+      return json({
+        ok: false,
+        error: "not_found",
+        requested: id.trim(),
+        ...indexMeta(index),
+      });
+    }
+    return json({
+      ok: true,
+      memory: "obsidian",
+      ...indexMeta(index),
+      record: compactRecord(record),
+    });
   },
 });
 
 export const memory_related = tool({
-  description: "Retourne les relations directes avec leurs faits complets. Une seule lecture suffit ; ne pas relire chaque relation séparément.",
+  description:
+    "Suit les wikilinks et backlinks réels d'une note Obsidian. Retourne les relations sortantes et entrantes avec leur contenu sourcé.",
   args: {
-    id: tool.schema.string().min(2).max(80).describe("Identifiant exact de l'enregistrement source."),
-    limit: tool.schema.number().int().min(1).max(MAX_MEMORY_RESULTS).optional().describe("Nombre maximal de relations."),
+    id: tool.schema.string().min(2).max(1_000).describe(
+      "Identifiant, alias ou chemin de la note source.",
+    ),
+    limit: tool.schema.number().int().min(1).max(MAX_MEMORY_RESULTS).optional().describe(
+      "Nombre maximal de relations directes retournées.",
+    ),
   },
   async execute({ id, limit }) {
-    const record = getMemoryRecord(id.trim());
-    if (!record) return json({ ok: false, error: "not_found", id: id.trim().toLocaleUpperCase("fr") });
+    const index = await loadIndex();
+    if (!index) return json({ ok: false, error: "vault_not_configured" });
+    const source = findObsidianMemoryRecord(index, id.trim());
+    if (!source) {
+      return json({
+        ok: false,
+        error: "not_found",
+        requested: id.trim(),
+        ...indexMeta(index),
+      });
+    }
     const cappedLimit = clampInteger(limit, MAX_MEMORY_RESULTS, MAX_MEMORY_RESULTS);
-    const related = getRelatedMemory(record).slice(0, cappedLimit);
+    const related = getRelatedObsidianMemory(index, source, cappedLimit);
     return json({
       ok: true,
-      source: record.id,
+      memory: "obsidian",
+      source: {
+        id: source.id,
+        title: source.title,
+        path: source.path,
+      },
       count: related.length,
-      records: related.map(compactMemory),
+      ...indexMeta(index),
+      records: related.map(({ record, relation }) => ({
+        relation,
+        ...compactRecord(record),
+      })),
     });
   },
 });
 
 export const vault_search = tool({
   description:
-    "Recherche read-only dans les notes Markdown du vault Obsidian configuré. Retourne des chemins relatifs sûrs et des extraits.",
+    "Recherche read-only dans les fichiers Markdown du vault Obsidian. Retourne des chemins relatifs sûrs, identifiants, titres et extraits ; aucun fichier externe au vault n'est accessible.",
   args: {
-    query: tool.schema.string().min(2).max(500).describe("Mots, titre, identifiant ou sujet à rechercher dans le vault."),
-    limit: tool.schema.number().int().min(1).max(MAX_VAULT_RESULTS).optional().describe("Nombre maximal de notes retournées."),
+    query: tool.schema.string().min(2).max(500).describe(
+      "Mots, titre, identifiant ou sujet à rechercher dans le vault.",
+    ),
+    limit: tool.schema.number().int().min(1).max(MAX_VAULT_RESULTS).optional().describe(
+      "Nombre maximal de notes retournées.",
+    ),
   },
   async execute({ query, limit }) {
-    const root = await vaultRoot();
-    if (!root) return json({ ok: false, error: "vault_not_configured" });
-
-    const tokens = searchTokens(query);
-    if (!tokens.length) return json({ ok: false, error: "invalid_query" });
-
-    const scan = await listVaultMarkdownFiles(root);
-    const files = scan.files;
-    const scored = await Promise.all(files.map(async (file) => {
-      try {
-        const content = await fs.readFile(file.absolutePath, "utf8");
-        const score = vaultScore(content, file.relativePath, tokens);
-        if (score <= 0) return null;
-        return {
-          path: file.relativePath,
-          title: noteTitle(content, file.relativePath),
-          snippet: buildSnippet(content, tokens),
-          size: file.size,
-          score,
-        };
-      } catch {
-        return null;
-      }
-    }));
-
+    const index = await loadIndex();
+    if (!index) return json({ ok: false, error: "vault_not_configured" });
     const cappedLimit = clampInteger(limit, 8, MAX_VAULT_RESULTS);
-    const results = scored
-      .filter((result): result is NonNullable<typeof result> => Boolean(result))
-      .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path, "fr"))
-      .slice(0, cappedLimit);
-
+    const matches = searchObsidianMemory(index, query, cappedLimit);
     return json({
       ok: true,
+      memory: "obsidian",
       query,
-      scanned: files.length,
-      scannedBytes: scan.scannedBytes,
-      count: results.length,
-      truncatedScan: scan.capped,
-      results,
+      count: matches.length,
+      ...indexMeta(index),
+      results: matches.map(({ record, score }) => ({
+        id: record.id,
+        type: record.type,
+        title: record.title,
+        path: record.path,
+        updatedAt: record.updatedAt,
+        score,
+        snippet: searchSnippet(record, query),
+      })),
     });
   },
 });
 
 export const vault_read = tool({
   description:
-    "Lit une note Markdown précise du vault Obsidian à partir d'un chemin relatif retourné par ops_vault_search.",
+    "Lit une note Markdown précise du vault Obsidian à partir d'un chemin relatif retourné par ops_vault_search. Les chemins absolus, traversées et liens symboliques sont refusés.",
   args: {
-    path: tool.schema.string().min(1).max(1_000).describe("Chemin relatif de la note dans le vault."),
+    path: tool.schema.string().min(1).max(1_000).describe(
+      "Chemin relatif exact de la note dans le vault.",
+    ),
   },
   async execute({ path: relativePath }) {
-    const root = await vaultRoot();
+    const root = await resolveObsidianVaultRoot();
     if (!root) return json({ ok: false, error: "vault_not_configured" });
-
-    const note = await resolveVaultNote(root, relativePath);
+    const note = await resolveSafeObsidianNote(root, relativePath);
     if (!note) return json({ ok: false, error: "invalid_or_missing_path" });
 
     const content = await fs.readFile(note.absolutePath, "utf8");
-    const truncated = content.length > MAX_VAULT_READ_CHARS;
+    const truncated = content.length > OBSIDIAN_MEMORY_LIMITS.maxReadChars;
     return json({
       ok: true,
-      path: posixRelative(root, note.absolutePath),
-      title: noteTitle(content, relativePath),
+      memory: "obsidian",
+      path: note.relativePath,
       size: note.size,
       truncated,
-      content: truncated ? `${content.slice(0, MAX_VAULT_READ_CHARS)}\n\n[contenu tronqué]` : content,
+      content: truncated
+        ? `${content.slice(0, OBSIDIAN_MEMORY_LIMITS.maxReadChars)}\n\n[contenu tronqué]`
+        : content,
     });
   },
 });

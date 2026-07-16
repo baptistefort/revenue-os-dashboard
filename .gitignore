@@ -8,6 +8,7 @@ out/
 # local tooling and visual checks
 .playwright-cli/
 output/
+tmp/
 
 # deployment metadata
 .vercel/
@@ -16,6 +17,7 @@ output/
 .env
 .env.*
 !.env.example
+!.env.production.example
 
 # system files
 .DS_Store

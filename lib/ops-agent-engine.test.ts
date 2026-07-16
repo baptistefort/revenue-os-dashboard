@@ -1,87 +1,121 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  buildFallbackScenario,
-  extractPdfTopic,
-  resolvePdfRequest,
+  buildAgentUnavailableScenario,
+  buildOpenCodeMessage,
+  compactConversationHistory,
+  conversationIdentitySeed,
+  asksForDocumentOutput,
+  needsCompanyResearch,
 } from "@/lib/ops-agent-engine";
 import type { AgentHistoryTurn } from "@/lib/ops-memory";
 
-const marginSources = ["PROJET-241", "TEMPS-086", "ACHAT-109", "FACT-882", "ALERT-201"];
-
-function marginConversation(): AgentHistoryTurn[] {
-  const prompt = "Pourquoi la marge atelier baisse ?";
-  const answer = buildFallbackScenario(prompt);
-  return [
-    { role: "user", content: prompt },
-    // Reproduit l'historique réellement envoyé par l'interface : le corps
-    // affiché, sans dépendre des puces de sources de l'UI.
-    { role: "assistant", content: answer.body.join("\n\n") },
-  ];
-}
-
-test("la baisse de marge est reliée aux cinq preuves attendues", () => {
-  const scenario = buildFallbackScenario("Pourquoi la marge atelier baisse ?");
-  assert.equal(scenario.id, "marge");
-  assert.deepEqual(scenario.sources, marginSources);
-});
-
-test("un PDF explicatif hérite du diagnostic de marge précédent", () => {
-  const history = marginConversation();
-  const request = resolvePdfRequest("fait moi un pdf exaplicatif stp", history);
-  const scenario = buildFallbackScenario("fait moi un pdf exaplicatif stp", history);
-
-  assert.equal(request.needsClarification, false);
-  assert.equal(request.contextId, "PROJET-241");
-  assert.equal(request.title, "Rapport explicatif — baisse de marge atelier");
-  assert.deepEqual(request.sourceIds, marginSources);
-  assert.equal(scenario.id, "pdf-generation");
-  assert.deepEqual(scenario.sources, marginSources);
-  assert.equal(extractPdfTopic("fait moi un pdf exaplicatif stp", history), request.title);
-});
-
-test("un PDF explicatif sans conversation demande le sujet au lieu d'inventer", () => {
-  const scenario = buildFallbackScenario("fais-moi un pdf explicatif stp");
-  assert.equal(scenario.id, "pdf-clarification");
-  assert.equal(extractPdfTopic("fais-moi un pdf explicatif stp"), null);
-});
-
-test("les salutations simples restent sociales et sans sources", () => {
-  for (const prompt of ["salut", "ça va ?", "tu vas bien ?", "salut est-ce que tu vas bien ?", "hello comment tu vas ?"]) {
-    const scenario = buildFallbackScenario(prompt, marginConversation());
-    assert.equal(scenario.id, "greeting", prompt);
-    assert.deepEqual(scenario.sources, [], prompt);
+test("seuls les tours sociaux autonomes évitent la recherche métier", () => {
+  for (const prompt of [
+    "salut",
+    "ça va ?",
+    "merci beaucoup",
+    "je t’ai pas demandé si tu allais bien",
+  ]) {
+    assert.equal(needsCompanyResearch(prompt), false, prompt);
   }
-});
-
-test("une correction après la salutation reste conversationnelle", () => {
-  const greeting = buildFallbackScenario("hello");
-  const history: AgentHistoryTurn[] = [
-    { role: "user", content: "hello" },
-    { role: "assistant", content: [greeting.lead, ...greeting.body].join("\n\n") },
-  ];
 
   for (const prompt of [
-    "je t’ai pas demandé si tu allais bien",
-    "je ne t'ai pas demandé comment tu allais",
+    "Explique VAL-061",
+    "Et pour Nova ?",
+    "Continue",
+    "merci, détaille maintenant la marge",
+    "tu n’as pas compris, explique VAL-061",
   ]) {
-    const scenario = buildFallbackScenario(prompt, history);
-    assert.equal(scenario.id, "conversation-repair", prompt);
-    assert.deepEqual(scenario.sources, [], prompt);
-    assert.match(scenario.lead, /Vous avez raison/);
+    assert.equal(needsCompanyResearch(prompt), true, prompt);
   }
 });
 
-test("une correction métier n'est pas confondue avec la réparation de salutation", () => {
-  const scenario = buildFallbackScenario("je ne t'ai pas demandé le rapport PDF");
-  assert.notEqual(scenario.id, "conversation-repair");
+test("le plan document n'est demandé que pour une production explicite", () => {
+  for (const prompt of [
+    "Génère ce brief en PDF",
+    "Exporte le rapport",
+    "Transforme cette analyse en document",
+    "Fais-en un PDF",
+  ]) {
+    assert.equal(asksForDocumentOutput(prompt), true, prompt);
+  }
+
+  for (const prompt of [
+    "Résume ce rapport",
+    "Que contient ce PDF ?",
+    "Prépare mon brief CODIR",
+    "Analyse le document existant",
+    "Crée les missions du rapport",
+    "Prépare l’email d’accompagnement du rapport",
+  ]) {
+    assert.equal(asksForDocumentOutput(prompt), false, prompt);
+  }
 });
 
-test("les suivis implicites restent dans le dossier Rivoli", () => {
-  const history = marginConversation();
-  const hours = buildFallbackScenario("montre les heures non facturées", history);
-  const purchases = buildFallbackScenario("et les achats ?", history);
+test("le transcript UI est réinjecté comme contexte autoritatif à chaque tour", () => {
+  const history: AgentHistoryTurn[] = [
+    { role: "user", content: "Prépare mon brief CODIR" },
+    {
+      role: "assistant",
+      content: "Le brief porte sur la marge et le cash [FIN-SNAPSHOT-20260715].",
+    },
+    {
+      role: "assistant",
+      content: "Document produit : Brief CODIR.pdf (RAPPORT-42, 4 pages, disponible dans Documents).",
+    },
+  ];
 
-  assert.equal(hours.sources[0], "TEMPS-086");
-  assert.equal(purchases.sources[0], "ACHAT-109");
+  const prompt = buildOpenCodeMessage("Résume ce document", history);
+  assert.match(prompt, /CONTEXTE CONVERSATIONNEL AUTORITATIF/);
+  assert.match(prompt, /Brief CODIR\.pdf/);
+  assert.match(prompt, /RAPPORT-42/);
+  assert.match(prompt, /DEMANDE ACTUELLE DE MARIE\s+Résume ce document/);
+});
+
+test("sans historique, le message OpenCode reste direct", () => {
+  assert.equal(buildOpenCodeMessage("Bonjour", []), "Bonjour");
+});
+
+test("la compaction serveur conserve uniquement les douze derniers tours", () => {
+  const history: AgentHistoryTurn[] = Array.from({ length: 15 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `tour-${index} ${"x".repeat(2_000)}`,
+  }));
+  const compacted = compactConversationHistory(history);
+
+  assert.doesNotMatch(compacted, /tour-0\b/);
+  assert.doesNotMatch(compacted, /tour-2\b/);
+  assert.match(compacted, /tour-3\b/);
+  assert.match(compacted, /tour-14\b/);
+  assert.ok(compacted.split("\n").every((line) => line.length <= 1_800));
+});
+
+test("l'identité de conversation survit au digest long de l'interface", () => {
+  const longInitialQuestion = `Question initiale ${"très longue ".repeat(80)}`;
+  const initial = conversationIdentitySeed(longInitialQuestion, []);
+  const restored = conversationIdentitySeed("Question de suivi", [
+    {
+      role: "assistant",
+      content: `CONTEXTE STRUCTURÉ DES ÉCHANGES ANTÉRIEURS\n1. Marie — ${longInitialQuestion.slice(0, 460)}\n2. OPS — Réponse`,
+    },
+    { role: "user", content: "Question récente" },
+  ]);
+
+  assert.equal(restored, initial);
+});
+
+test("le fallback local est strictement technique et sans réponse métier", () => {
+  const scenario = buildAgentUnavailableScenario("Explique VAL-061");
+  const rendered = JSON.stringify({
+    lead: scenario.lead,
+    body: scenario.body,
+    sources: scenario.sources,
+    followups: scenario.followups,
+  });
+
+  assert.equal(scenario.id, "agent-unavailable");
+  assert.deepEqual(scenario.sources, []);
+  assert.doesNotMatch(rendered, /\b(?:VAL|FACT|PROJET|CRM|MIS)-\d+/);
+  assert.doesNotMatch(rendered, /\b(?:marge|pipeline|créance|Nova|Rivoli)\b/i);
 });

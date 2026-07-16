@@ -293,6 +293,9 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
   const fallbackTranscriptRef = useRef("");
   const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
   const speechGenerationRef = useRef(0);
+  const speechRequestRef = useRef<AbortController | null>(null);
+  const serverAudioRef = useRef<HTMLAudioElement | null>(null);
+  const serverAudioUrlRef = useRef<string | null>(null);
   const lastSpokenSignatureRef = useRef<string | number | null>(null);
 
   const updateState = useCallback(
@@ -306,6 +309,19 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
 
   const stopBrowserSpeech = useCallback(() => {
     speechGenerationRef.current += 1;
+    speechRequestRef.current?.abort();
+    speechRequestRef.current = null;
+    const serverAudio = serverAudioRef.current;
+    serverAudioRef.current = null;
+    if (serverAudio) {
+      serverAudio.onended = null;
+      serverAudio.onerror = null;
+      serverAudio.pause();
+      serverAudio.removeAttribute("src");
+      serverAudio.load();
+    }
+    if (serverAudioUrlRef.current) URL.revokeObjectURL(serverAudioUrlRef.current);
+    serverAudioUrlRef.current = null;
     if (speechWatchdogRef.current) clearTimeout(speechWatchdogRef.current);
     speechWatchdogRef.current = null;
     if (typeof window !== "undefined") window.speechSynthesis?.cancel();
@@ -397,13 +413,40 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
       setTranscript(text);
       setErrorDetail("");
       updateState("thinking");
+      if (backendRef.current === "realtime" && realtimeSessionRef.current) {
+        try {
+          realtimeSessionRef.current.mute(true);
+        } catch {
+          // The transport may disconnect while the transcript is being submitted.
+        }
+      }
 
       try {
         await onSubmit(text, fromVoice);
-        if (stateRef.current === "thinking") updateState("idle");
+        if (stateRef.current === "thinking") {
+          if (backendRef.current === "realtime" && realtimeSessionRef.current) {
+            try {
+              realtimeSessionRef.current.mute(false);
+              updateState("listening");
+            } catch {
+              updateState("idle");
+            }
+          } else {
+            updateState("idle");
+          }
+        }
       } catch {
         setErrorDetail("La demande n’a pas pu être transmise. Réessayez dans un instant.");
-        updateState("idle");
+        if (backendRef.current === "realtime" && realtimeSessionRef.current) {
+          try {
+            realtimeSessionRef.current.mute(false);
+            updateState("listening");
+          } catch {
+            updateState("idle");
+          }
+        } else {
+          updateState("idle");
+        }
       }
     },
     [onSubmit, updateState],
@@ -906,11 +949,6 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
     (rawText: string) => {
       if (typeof window === "undefined" || !rawText.trim()) return;
       setAssistantTranscript(cleanForSpeech(rawText));
-      const speech = window.speechSynthesis;
-      if (!speech) {
-        updateState("unsupported");
-        return;
-      }
 
       realtimeSessionRef.current?.interrupt();
       if (backendRef.current === "realtime") realtimeSessionRef.current?.mute(true);
@@ -923,10 +961,8 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
       stopBrowserSpeech();
       cancelFallbackCapture();
 
-      const chunks = splitForSpeech(rawText);
-      if (!chunks.length) return;
       const generation = speechGenerationRef.current;
-      let index = 0;
+      updateState("speaking");
 
       const finish = () => {
         if (generation !== speechGenerationRef.current || !openRef.current) return;
@@ -941,42 +977,98 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
         }
       };
 
-      const playNext = () => {
-        if (generation !== speechGenerationRef.current || !openRef.current) return;
-        const chunk = chunks[index];
-        if (!chunk) {
-          finish();
+      const playBrowserFallback = () => {
+        const speech = window.speechSynthesis;
+        const chunks = splitForSpeech(rawText);
+        if (!speech || !chunks.length) {
+          updateState("unsupported");
           return;
         }
-        index += 1;
-        const utterance = new SpeechSynthesisUtterance(chunk);
-        const voice = pickFrenchVoice(voicesRef.current.length ? voicesRef.current : speech.getVoices());
-        if (voice) utterance.voice = voice;
-        utterance.lang = voice?.lang ?? "fr-FR";
-        utterance.rate = 0.98;
-        utterance.pitch = 0.96;
-        utterance.volume = 1;
-        utterance.onstart = () => updateState("speaking");
-        utterance.onerror = (event) => {
-          if (event.error === "canceled" || event.error === "interrupted") return;
-          if (speechWatchdogRef.current) clearTimeout(speechWatchdogRef.current);
-          setErrorDetail("La lecture vocale a été interrompue. Vous pouvez reprendre au micro.");
-          finish();
+        let index = 0;
+        const playNext = () => {
+          if (generation !== speechGenerationRef.current || !openRef.current) return;
+          const chunk = chunks[index];
+          if (!chunk) {
+            finish();
+            return;
+          }
+          index += 1;
+          const utterance = new SpeechSynthesisUtterance(chunk);
+          const voice = pickFrenchVoice(voicesRef.current.length ? voicesRef.current : speech.getVoices());
+          if (voice) utterance.voice = voice;
+          utterance.lang = voice?.lang ?? "fr-FR";
+          utterance.rate = 0.98;
+          utterance.pitch = 0.96;
+          utterance.volume = 1;
+          utterance.onstart = () => updateState("speaking");
+          utterance.onerror = (event) => {
+            if (event.error === "canceled" || event.error === "interrupted") return;
+            if (speechWatchdogRef.current) clearTimeout(speechWatchdogRef.current);
+            setErrorDetail("La lecture vocale a été interrompue. Vous pouvez reprendre au micro.");
+            finish();
+          };
+          utterance.onend = () => {
+            if (speechWatchdogRef.current) clearTimeout(speechWatchdogRef.current);
+            speechWatchdogRef.current = null;
+            playNext();
+          };
+          speechWatchdogRef.current = setTimeout(() => {
+            if (generation !== speechGenerationRef.current) return;
+            speech.cancel();
+            playNext();
+          }, Math.max(6_000, chunk.length * 95));
+          speech.speak(utterance);
         };
-        utterance.onend = () => {
-          if (speechWatchdogRef.current) clearTimeout(speechWatchdogRef.current);
-          speechWatchdogRef.current = null;
-          playNext();
-        };
-        speechWatchdogRef.current = setTimeout(() => {
-          if (generation !== speechGenerationRef.current) return;
-          speech.cancel();
-          playNext();
-        }, Math.max(6_000, chunk.length * 95));
-        speech.speak(utterance);
+        playNext();
       };
 
-      playNext();
+      const controller = new AbortController();
+      speechRequestRef.current = controller;
+      void (async () => {
+        try {
+          const response = await fetch("/api/audio/speech", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: cleanForSpeech(rawText) }),
+            signal: controller.signal,
+          });
+          if (!response.ok) throw new Error(`speech_${response.status}`);
+          const blob = await response.blob();
+          if (!blob.size) throw new Error("speech_empty");
+          if (generation !== speechGenerationRef.current || !openRef.current) return;
+
+          const url = URL.createObjectURL(blob);
+          serverAudioUrlRef.current = url;
+          const audio = new Audio(url);
+          serverAudioRef.current = audio;
+          audio.preload = "auto";
+          audio.onplay = () => {
+            if (generation === speechGenerationRef.current) updateState("speaking");
+          };
+          audio.onended = () => {
+            if (serverAudioRef.current === audio) serverAudioRef.current = null;
+            if (serverAudioUrlRef.current === url) {
+              URL.revokeObjectURL(url);
+              serverAudioUrlRef.current = null;
+            }
+            finish();
+          };
+          audio.onerror = () => {
+            if (serverAudioRef.current === audio) serverAudioRef.current = null;
+            if (serverAudioUrlRef.current === url) {
+              URL.revokeObjectURL(url);
+              serverAudioUrlRef.current = null;
+            }
+            if (generation === speechGenerationRef.current) playBrowserFallback();
+          };
+          await audio.play();
+        } catch {
+          if (controller.signal.aborted || generation !== speechGenerationRef.current) return;
+          playBrowserFallback();
+        } finally {
+          if (speechRequestRef.current === controller) speechRequestRef.current = null;
+        }
+      })();
     },
     [autoListenAfterResponse, cancelFallbackCapture, startFallbackListening, stopBrowserSpeech, updateState],
   );

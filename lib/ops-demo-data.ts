@@ -380,6 +380,10 @@ export type OpsDocument = {
   facts: number;
   dataUrl?: string;
   objectUrl?: string;
+  url?: string;
+  downloadUrl?: string;
+  createdAt?: string;
+  sources?: string[];
   size?: string;
   pages?: number;
   generated?: boolean;

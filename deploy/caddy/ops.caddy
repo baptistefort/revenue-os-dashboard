@@ -1,0 +1,19 @@
+# Add this block to the Caddyfile already used by /srv/sags-os.
+# The public hostname must resolve to the VPS before Caddy requests TLS.
+
+ops.72.61.111.77.sslip.io {
+	encode zstd gzip
+
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "microphone=(self), camera=(), geolocation=(), payment=()"
+	}
+
+	reverse_proxy ops-app:3000 {
+		health_uri /api/health
+		health_interval 15s
+		health_timeout 5s
+	}
+}

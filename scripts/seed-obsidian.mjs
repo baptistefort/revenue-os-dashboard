@@ -104,6 +104,11 @@ add("06_Operations/Achats", "ACHAT-109", "finance", "Placage chêne", "Budget 8 
 ].forEach(([id, title, summary, links]) => add("02_Direction/Decisions-et-alertes", id, "decision", title, summary, [org, "PER-001 — Marie Delmas", ...links]));
 
 [
+  ["VAL-061", "Envoyer deux relances clients", "Validation attendue avant l’envoi des relances Atelier Sud et Nova Hôtels. Montant total concerné : 20,2 K€. Maison Cobalt reste en attente jusqu’à lundi.", ["DEC-061 — Relances clients", "FACT-879 — Atelier Sud — 12400 EUR", "EMAIL-901 — Sophie Leclerc — Facture de juin", "FACT-886 — Nova Hôtels — 7800 EUR", "EMAIL-902 — Pierre Lenoir — Duplicata Nova", "FACT-890 — Maison Cobalt — 4100 EUR", "EMAIL-905 — Maison Cobalt — échéance", "RULE-001 — Aucune action externe sans validation", "RULE-002 — Ton des relances"]],
+  ["VAL-063", "Valider l’avenant Rivoli", "Validation attendue pour l’avenant Rivoli de 6,8 K€, destiné à protéger environ 1,9 point de marge après les changements de finition.", ["DEC-063 — Avenant Rivoli 6800 EUR", "PROJET-241 — Chantier Rivoli", "EMAIL-903 — Modification client Rivoli", "CR-1207 — Compte rendu chantier Rivoli", "ALERT-201 — Écart de marge Rivoli", "RULE-001 — Aucune action externe sans validation"]],
+].forEach(([id, title, summary, links]) => add("02_Direction/Validations", id, "validation", title, summary, [org, "PER-001 — Marie Delmas", ...links], { status: "pending", external_action: true }));
+
+[
   ["RULE-001", "Aucune action externe sans validation", "Toute action vers un client, un prospect ou un partenaire exige la validation de Marie."],
   ["RULE-002", "Ton des relances", "Le ton dépend de l’ancienneté, de la relation et du dernier échange client."],
   ["RULE-003", "Remise supérieure à 8 pour cent", "Toute remise commerciale supérieure à 8 % exige une validation de direction."],

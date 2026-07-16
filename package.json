@@ -7,12 +7,13 @@
     "opencode:serve": "node scripts/start-opencode.mjs",
     "build": "next build",
     "start": "next start",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx --test lib/*.test.ts"
   },
   "dependencies": {
     "@openai/agents": "^0.13.4",
-    "@opencode-ai/plugin": "^1.18.2",
-    "@opencode-ai/sdk": "^1.18.2",
+    "@opencode-ai/plugin": "1.18.2",
+    "@opencode-ai/sdk": "1.18.2",
     "d3-force": "^3.0.0",
     "lucide-react": "^0.468.0",
     "next": "16.2.6",
@@ -27,7 +28,8 @@
     "@types/node": "^22.10.2",
     "@types/react": "^19.0.3",
     "@types/react-dom": "^19.0.2",
-    "opencode-ai": "^1.18.2",
+    "opencode-ai": "1.18.2",
+    "tsx": "^4.23.1",
     "typescript": "^5.7.2"
   },
   "overrides": {

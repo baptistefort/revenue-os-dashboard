@@ -26,7 +26,7 @@ import {
   type OpsDocument,
   type PageId,
 } from "@/lib/ops-demo-data";
-import { buildFallbackScenario, resolvePdfRequest } from "@/lib/ops-agent-engine";
+import type { OpsDocumentPlan, StoredOpsDocument } from "@/lib/ops-document";
 
 type OpenAgent = (prompt?: string) => void;
 
@@ -230,54 +230,7 @@ function serializeChatMessage(message: ChatMessage): ConversationTurn | null {
 
 function buildConversationHistory(messages: ChatMessage[]) {
   const turns = messages.map(serializeChatMessage).filter((turn): turn is ConversationTurn => Boolean(turn));
-  if (turns.length <= 12) return turns;
-
-  const recent = turns.slice(-11);
-  const older = turns.slice(0, -11);
-  const digest = older
-    .map((turn, index) => {
-      const speaker = turn.role === "user" ? "Marie" : "OPS";
-      const compact = turn.content.replace(/\s+/g, " ").trim().slice(0, 460);
-      return `${index + 1}. ${speaker} — ${compact}`;
-    })
-    .join("\n")
-    .slice(0, 4_700);
-
-  return [
-    {
-      role: "assistant" as const,
-      content: `CONTEXTE STRUCTURÉ DES ÉCHANGES ANTÉRIEURS\nConserver les décisions, identifiants, documents et sujets ouverts ci-dessous pour interpréter les questions de suivi.\n${digest}`,
-    },
-    ...recent,
-  ];
-}
-
-function buildPdfContext(messages: ChatMessage[], userRequest: string, sourceIds: string[]) {
-  const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant" && message.scenario);
-  const streamedBody = lastAssistant?.text?.trim()
-    ? lastAssistant.text.split(/\n{2,}/).map((paragraph) => paragraph.trim()).filter(Boolean)
-    : undefined;
-  return {
-    userRequest,
-    lead: lastAssistant?.scenario?.lead ?? "",
-    body: streamedBody?.length ? streamedBody : lastAssistant?.scenario?.body ?? [],
-    sources: [...new Set([...(lastAssistant?.scenario?.sources ?? []), ...sourceIds])],
-  };
-}
-
-function blobToDataUrl(blob: Blob) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("PDF illisible"));
-    reader.onerror = () => reject(reader.error ?? new Error("PDF illisible"));
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function dataUrlToObjectUrl(dataUrl: string) {
-  const response = await fetch(dataUrl);
-  if (!response.ok) throw new Error("PDF illisible");
-  return URL.createObjectURL(await response.blob());
+  return turns.slice(-24);
 }
 
 function formatBytes(bytes: number) {
@@ -287,6 +240,69 @@ function formatBytes(bytes: number) {
 
 function createReply(id: string, lead: string, body: string[], sources: string[], followups: string[]): AgentScenario {
   return { id, label: lead, keywords: [], lead, body, sources, followups };
+}
+
+function emptyAgentScenario(label: string): AgentScenario {
+  return {
+    id: "opencode-pending",
+    label,
+    keywords: [],
+    lead: "",
+    body: [],
+    sources: [],
+    followups: [],
+  };
+}
+
+function createConversationId() {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return `conv_${globalThis.crypto.randomUUID()}`;
+  }
+  return `conv_${Date.now()}_${Math.random().toString(36).slice(2, 14)}`;
+}
+
+function storedDocumentToUi(document: StoredOpsDocument): OpsDocument {
+  return {
+    ...document,
+    objectUrl: document.url,
+  };
+}
+
+async function generatePdfDocument(plan: OpsDocumentPlan): Promise<OpsDocument> {
+  const response = await fetch("/api/documents/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(plan),
+  });
+  if (!response.ok) throw new Error("document_generation_failed");
+
+  const blob = await response.blob();
+  const id = response.headers.get("X-Document-Id");
+  if (!id) throw new Error("document_id_missing");
+  const encodedName = response.headers.get("X-Document-Name");
+  const name = encodedName
+    ? decodeURIComponent(encodedName)
+    : `${plan.title.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "").toLocaleLowerCase("fr") || "rapport-ops"}.pdf`;
+  const url = response.headers.get("X-Document-Url") ?? `/api/documents/${id}`;
+
+  return {
+    id,
+    name,
+    type: "Rapport PDF",
+    linked: plan.subtitle || "Direction",
+    owner: "OPS",
+    updated: "À l’instant",
+    status: "Généré",
+    facts: plan.sources.length,
+    size: formatBytes(blob.size),
+    pages: Number(response.headers.get("X-Document-Pages") ?? 1),
+    generated: true,
+    url,
+    objectUrl: url,
+    downloadUrl: `${url}?download=1`,
+    createdAt: new Date().toISOString(),
+    sources: plan.sources,
+  };
 }
 
 function AgentProgress({ kind, startedAt, stage, label, detail, etaMs, updatedAt }: {
@@ -373,7 +389,7 @@ function AgentProgress({ kind, startedAt, stage, label, detail, etaMs, updatedAt
 }
 
 type AgentStreamEvent =
-  | { type: "meta"; scenario: AgentScenario; mode?: string }
+  | { type: "meta"; scenario: AgentScenario; mode?: string; document?: OpsDocumentPlan }
   | { type: "progress"; stage: string; label: string; detail?: string; etaMs?: number }
   | { type: "delta"; delta: string }
   | { type: "speech"; text: string }
@@ -409,7 +425,8 @@ function PdfArtifactCard({ document, openDocuments }: {
   document: OpsDocument;
   openDocuments: (documentId?: string) => void;
 }) {
-  const fileUrl = document.objectUrl ?? document.dataUrl;
+  const fileUrl = document.url ?? document.objectUrl ?? document.dataUrl;
+  const downloadUrl = document.downloadUrl ?? fileUrl;
   if (!fileUrl) return null;
   return (
     <article className="pdf-result-card">
@@ -425,7 +442,7 @@ function PdfArtifactCard({ document, openDocuments }: {
       </div>
       <div className="pdf-result-actions">
         <a className="primary" href={fileUrl} target="_blank" rel="noreferrer"><OpsIcon name="folder" size={14} /> Ouvrir le PDF</a>
-        <a href={fileUrl} download={document.name} aria-label={`Télécharger ${document.name}`}><OpsIcon name="download" size={15} /></a>
+        <a href={downloadUrl} download={document.name} aria-label={`Télécharger ${document.name}`}><OpsIcon name="download" size={15} /></a>
         <button type="button" onClick={() => openDocuments(document.id)} aria-label="Voir dans Documents"><OpsIcon name="arrow" size={15} /></button>
       </div>
       <style jsx>{`
@@ -494,29 +511,14 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   const [value, setValue] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [processing, setProcessing] = useState(false);
-  const [pendingPdf, setPendingPdf] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const voiceModeRef = useRef<VoiceModeHandle>(null);
   const resetOpenCodeSessionRef = useRef(true);
+  const conversationIdRef = useRef(createConversationId());
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
-
-  const registerVoiceDocument = useCallback((document: OpsDocument) => {
-    onDocumentGenerated(document);
-    const readyScenario = createReply(
-      "voice-pdf-ready",
-      `${document.name.replace(/\.pdf$/i, "")} est prêt.`,
-      ["Le PDF a été ajouté à Documents et reste disponible dans cette conversation."],
-      [document.id, "FIN-SNAPSHOT-20260715", "CRM-SNAPSHOT-20260715"],
-      ["Résume le document", "Prépare l’email d’accompagnement", "Crée les missions associées"],
-    );
-    setMessages((current) => [
-      ...current,
-      { id: Date.now(), role: "assistant", scenario: readyScenario, document },
-    ]);
-  }, [onDocumentGenerated]);
 
   const speak = useCallback((text: string) => {
     if (voiceOpen && voiceModeRef.current) {
@@ -540,137 +542,12 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
     setProcessing(true);
     const userId = Date.now();
     const priorHistory = buildConversationHistory(messagesRef.current);
-    const fallbackScenario = buildFallbackScenario(prompt, priorHistory);
-    const directPdfRequest = resolvePdfRequest(prompt, priorHistory);
-    const pdfRequest = pendingPdf && !directPdfRequest.requested
-      ? resolvePdfRequest(`Produis un PDF : ${prompt}`, priorHistory)
-      : directPdfRequest;
-    const shouldResolvePdf = pdfRequest.requested;
-    const pdfTitle = pdfRequest.title;
-    const pdfTopic = pdfRequest.topic;
-    const pdfSourceIds = [...new Set([
-      ...pdfRequest.sourceIds,
-      ...(pdfRequest.contextId ? [pdfRequest.contextId] : []),
-    ])];
-
-    if (shouldResolvePdf && pdfRequest.needsClarification) {
-      const clarification = createReply(
-        "pdf-clarification",
-        "D’accord. Quel document souhaitez-vous créer ?",
-        ["Vous pouvez me demander, par exemple, le rapport de direction 2026, un brief CODIR, une analyse de marge ou une stratégie à 90 jours."],
-        [],
-        ["Le rapport de direction 2026", "Un brief CODIR", "La stratégie à 90 jours"],
-      );
-      setMessages((current) => [...current, { id: userId, role: "user", prompt }, { id: userId + 1, role: "assistant", scenario: clarification }]);
-      setPendingPdf(true);
-      setProcessing(false);
-      if (fromVoice) speak([clarification.lead, ...clarification.body].join(" "));
-      return;
-    }
-
-    if (shouldResolvePdf && pdfTitle && pdfTopic) {
-      const reportContext = buildPdfContext(messagesRef.current, prompt, pdfSourceIds);
-      const reportSources = pdfSourceIds.length
-        ? pdfSourceIds
-        : ["FIN-SNAPSHOT-20260715", "CRM-SNAPSHOT-20260715", "STRAT-2026-Q3"];
-      const buildingScenario = createReply(
-        "pdf-building",
-        `Je prépare « ${pdfTitle} » à partir de la mémoire de l’entreprise.`,
-        ["Je rapproche les chiffres, les décisions, le CRM, les projets et l’acquisition, puis je relie chaque conclusion à ses sources."],
-        reportSources,
-        [],
-      );
-      setMessages((current) => [...current, { id: userId, role: "user", prompt }, {
-        id: userId + 1,
-        role: "assistant",
-        scenario: buildingScenario,
-        loading: true,
-        statusText: "Construction du rapport et mise en page",
-        progressKind: "pdf",
-        progressStartedAt: Date.now(),
-      }]);
-
-      try {
-        const minimumDocumentRun = new Promise((resolve) => window.setTimeout(resolve, 2_400));
-        const [response] = await Promise.all([
-          fetch("/api/documents/generate", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              title: pdfTitle,
-              topic: pdfTopic,
-              sourceIds: reportSources,
-              context: reportContext,
-            }),
-          }),
-          minimumDocumentRun,
-        ]);
-        if (!response.ok) throw new Error("La génération du PDF a échoué");
-        const blob = await response.blob();
-        const dataUrl = await blobToDataUrl(blob);
-        const objectUrl = URL.createObjectURL(blob);
-        const document: OpsDocument = {
-          id: response.headers.get("X-Document-Id") ?? `RAPPORT-${Date.now()}`,
-          name: `${pdfTitle}.pdf`,
-          type: "Rapport PDF",
-          linked: "Direction",
-          owner: "OPS",
-          updated: "À l’instant",
-          status: "Généré",
-          facts: Number(response.headers.get("X-Document-Sources") ?? Math.max(1, reportSources.length)),
-          dataUrl,
-          objectUrl,
-          size: formatBytes(blob.size),
-          pages: Number(response.headers.get("X-Document-Pages") ?? 3),
-          generated: true,
-        };
-        const readyScenario = createReply(
-          "pdf-ready",
-          `${pdfTitle} est prêt.`,
-          [`Je l’ai ajouté à Documents et relié aux ${document.facts} sources utilisées. Vous pouvez l’ouvrir ou le télécharger directement ici.`],
-          reportSources,
-          ["Résume les trois décisions", "Prépare l’email d’accompagnement", "Crée les missions du rapport"],
-        );
-        onDocumentGenerated(document);
-        setMessages((current) => current.map((message) => message.id === userId + 1 ? {
-          ...message,
-          scenario: readyScenario,
-          document,
-          loading: false,
-          progressKind: undefined,
-          progressStartedAt: undefined,
-          progressStage: undefined,
-          progressLabel: undefined,
-          progressDetail: undefined,
-          progressEtaMs: undefined,
-          progressUpdatedAt: undefined,
-        } : message));
-        setPendingPdf(false);
-        if (fromVoice) speak(`${readyScenario.lead} ${readyScenario.body.join(" ")}`);
-      } catch {
-        const errorScenario = createReply("pdf-error", "Je n’ai pas pu finaliser le PDF.", ["Aucune donnée n’a été perdue. Vous pouvez relancer la génération ; le brouillon reste prêt."], [], ["Relance la génération du PDF"]);
-        setMessages((current) => current.map((message) => message.id === userId + 1 ? {
-          ...message,
-          scenario: errorScenario,
-          loading: false,
-          progressKind: undefined,
-          progressStartedAt: undefined,
-          progressStage: undefined,
-          progressLabel: undefined,
-          progressDetail: undefined,
-          progressEtaMs: undefined,
-          progressUpdatedAt: undefined,
-        } : message));
-      } finally {
-        setProcessing(false);
-      }
-      return;
-    }
+    const pendingScenario = emptyAgentScenario(prompt);
 
     setMessages((current) => [...current, { id: userId, role: "user", prompt }, {
       id: userId + 1,
       role: "assistant",
-      scenario: fallbackScenario,
+      scenario: pendingScenario,
       loading: true,
       statusText: "Analyse de la mémoire de l’entreprise",
       progressKind: "analysis",
@@ -685,15 +562,20 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
           message: prompt,
           history: priorHistory,
           resetSession: resetOpenCodeSessionRef.current,
+          conversationId: conversationIdRef.current,
         }),
       });
-      if (!response.ok || !response.body) throw new Error("agent unavailable");
-      resetOpenCodeSessionRef.current = false;
+      if (!response.ok) throw new Error(`agent_${response.status}`);
+      if (!response.body) throw new Error("agent_unavailable");
+      if (response.headers.get("X-OPS-Agent") === "opencode") {
+        resetOpenCodeSessionRef.current = false;
+      }
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let text = "";
       let speechText = "";
-      let serverScenario = fallbackScenario;
+      let serverScenario = pendingScenario;
+      let documentPlan: OpsDocumentPlan | undefined;
       let lineBuffer = "";
       const structured = response.headers.get("content-type")?.includes("application/x-ndjson") ?? false;
 
@@ -715,6 +597,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
             : message));
         } else if (event.type === "meta") {
           serverScenario = event.scenario;
+          documentPlan = event.document;
           setMessages((current) => current.map((message) => message.id === userId + 1
             ? { ...message, scenario: serverScenario, loading: !text.trim(), text }
             : message));
@@ -783,11 +666,75 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         progressEtaMs: undefined,
         progressUpdatedAt: undefined,
       } : message));
-      if (fromVoice && text.trim()) speak(speechText || [serverScenario.lead, text].filter(Boolean).join("\n\n"));
+
+      if (documentPlan) {
+        const progressStartedAt = Date.now();
+        setMessages((current) => current.map((message) => message.id === userId + 1 ? {
+          ...message,
+          loading: true,
+          progressKind: "pdf",
+          progressStartedAt,
+          progressStage: "document",
+          progressLabel: "Création du document",
+          progressDetail: "Mise en page, génération et archivage dans Documents",
+          progressEtaMs: 2_500,
+          progressUpdatedAt: progressStartedAt,
+        } : message));
+        try {
+          const document = await generatePdfDocument(documentPlan);
+          onDocumentGenerated(document);
+          setMessages((current) => current.map((message) => message.id === userId + 1 ? {
+            ...message,
+            scenario: serverScenario,
+            text,
+            document,
+            loading: false,
+            progressKind: undefined,
+            progressStartedAt: undefined,
+            progressStage: undefined,
+            progressLabel: undefined,
+            progressDetail: undefined,
+            progressEtaMs: undefined,
+            progressUpdatedAt: undefined,
+          } : message));
+        } catch {
+          const documentFailure = "La réponse est conservée, mais le PDF n’a pas pu être généré ou archivé. Vous pouvez relancer uniquement la création du document.";
+          text = `${text}${text ? "\n\n" : ""}${documentFailure}`;
+          serverScenario = {
+            ...serverScenario,
+            followups: ["Réessayer la création du PDF", ...serverScenario.followups].slice(0, 4),
+          };
+          setMessages((current) => current.map((message) => message.id === userId + 1 ? {
+            ...message,
+            scenario: serverScenario,
+            text,
+            loading: false,
+            progressKind: undefined,
+            progressStartedAt: undefined,
+            progressStage: undefined,
+            progressLabel: undefined,
+            progressDetail: undefined,
+            progressEtaMs: undefined,
+            progressUpdatedAt: undefined,
+          } : message));
+        }
+      }
+
+      if (fromVoice && text.trim()) {
+        speak(speechText || [serverScenario.lead, text].filter(Boolean).join("\n\n"));
+      }
     } catch {
-      await new Promise((resolve) => window.setTimeout(resolve, 520));
+      const technicalScenario = createReply(
+        "agent-unavailable",
+        "OPS n’a pas pu terminer cette demande.",
+        ["Le moteur privé ou la mémoire est momentanément indisponible. Aucun résultat métier de remplacement n’a été inventé."],
+        [],
+        ["Réessayer la demande"],
+      );
       setMessages((current) => current.map((message) => message.id === userId + 1 ? {
         ...message,
+        scenario: technicalScenario,
+        text: "",
         loading: false,
         progressKind: undefined,
         progressStartedAt: undefined,
@@ -797,11 +744,11 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         progressEtaMs: undefined,
         progressUpdatedAt: undefined,
       } : message));
-      if (fromVoice) speak(`${fallbackScenario.lead} ${fallbackScenario.body.join(" ")}`);
+      if (fromVoice) speak(`${technicalScenario.lead} ${technicalScenario.body.join(" ")}`);
     } finally {
       setProcessing(false);
     }
-  }, [onDocumentGenerated, pendingPdf, processing, speak, value]);
+  }, [onDocumentGenerated, processing, speak, value]);
 
   useEffect(() => {
     if (!initialPrompt) return;
@@ -838,7 +785,6 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
           open={voiceOpen}
           onClose={() => setVoiceOpen(false)}
           onSubmit={submit}
-          onDocumentGenerated={registerVoiceDocument}
           openDocuments={openDocuments}
           busy={processing}
         />
@@ -849,7 +795,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   return (
     <>
       <div className="agent-thread-page">
-        <div className="thread-toolbar"><button onClick={() => { setMessages([]); setPendingPdf(false); resetOpenCodeSessionRef.current = true; }}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button><OpsIcon name="dots" size={18} /></button></div>
+        <div className="thread-toolbar"><button onClick={() => { setMessages([]); conversationIdRef.current = createConversationId(); resetOpenCodeSessionRef.current = true; }}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button><OpsIcon name="dots" size={18} /></button></div>
         <div className="thread-scroll" ref={scrollRef}>
           <div className="thread-content">
             {messages.map((message) => message.role === "user" ? (
@@ -884,7 +830,6 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         open={voiceOpen}
         onClose={() => setVoiceOpen(false)}
         onSubmit={submit}
-        onDocumentGenerated={registerVoiceDocument}
         openDocuments={openDocuments}
         busy={processing}
       />
@@ -942,7 +887,7 @@ function DocumentsPage({ openAgent, generatedDocuments, preferredDocumentId }: {
       <PageHeading page="documents" action={<button className="primary-button"><OpsIcon name="plus" size={16} /> Importer</button>} />
       <div className="documents-layout">
         <section className="panel documents-panel"><div className="panel-title"><div><span>{286 + generatedDocuments.length} documents</span><small>{17 + generatedDocuments.length} ajoutés cette semaine</small></div><div className="table-actions"><button><OpsIcon name="search" size={15} /> Rechercher</button><button><OpsIcon name="filter" size={15} /> Filtrer</button></div></div><div className="entity-table documents-table"><div className="table-head"><span>Document</span><span>Type</span><span>Lié à</span><span>Responsable</span><span>Mise à jour</span><span>État OPS</span></div>{allDocuments.map((document) => <button className={`table-row ${selected.id === document.id ? "selected" : ""}`} onClick={() => setSelectedId(document.id)} key={document.id}><span><i className="doc-type"><OpsIcon name={document.generated ? "download" : "document"} size={16} /></i><span><strong>{document.name}</strong><small>{document.id}</small></span></span><span>{document.type}</span><span>{document.linked}</span><span>{document.owner}</span><span>{document.updated}</span><span className={`doc-status status-${document.status.toLocaleLowerCase("fr").replace("à ", "").replaceAll(" ", "-")}`}>{document.status}</span></button>)}</div></section>
-        <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.objectUrl || selected.dataUrl ? <object className="pdf-preview" data={selected.objectUrl ?? selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.objectUrl ?? selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} faits exploitables</strong><p>Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné.</p>{selected.objectUrl || selected.dataUrl ? <a className="document-download" href={selected.objectUrl ?? selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse ${selected.name}`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside>
+        <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.url || selected.objectUrl || selected.dataUrl ? <object className="pdf-preview" data={selected.url ?? selected.objectUrl ?? selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.url ?? selected.objectUrl ?? selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} faits exploitables</strong><p>Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné.</p>{selected.url || selected.objectUrl || selected.dataUrl ? <a className="document-download" href={selected.downloadUrl ?? selected.url ?? selected.objectUrl ?? selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse ${selected.name}`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside>
       </div>
     </div>
   );
@@ -999,12 +944,7 @@ export function OpsApp() {
 
   const addGeneratedDocument = useCallback((document: OpsDocument) => {
     setGeneratedDocuments((current) => {
-      const next = [document, ...current.filter((item) => item.id !== document.id)];
-      try {
-        const persisted = next.slice(0, 6).map(({ objectUrl: _objectUrl, ...item }) => item);
-        window.localStorage.setItem("ops-generated-documents-v1", JSON.stringify(persisted));
-      } catch { /* Le chat reste fonctionnel même si le stockage est saturé. */ }
-      return next;
+      return [document, ...current.filter((item) => item.id !== document.id)];
     });
     setPreferredDocumentId(document.id);
   }, []);
@@ -1015,20 +955,20 @@ export function OpsApp() {
   }, []);
 
   useEffect(() => {
-    try {
-      const stored = window.localStorage.getItem("ops-generated-documents-v1");
-      if (stored) {
-        const documentsFromStorage = JSON.parse(stored) as OpsDocument[];
-        void Promise.all(documentsFromStorage.map(async (document) => {
-          if (!document.dataUrl) return document;
-          try {
-            return { ...document, objectUrl: await dataUrlToObjectUrl(document.dataUrl) };
-          } catch {
-            return document;
-          }
-        })).then(setGeneratedDocuments);
-      }
-    } catch { /* La démonstration repart simplement sans documents générés. */ }
+    const controller = new AbortController();
+    void fetch("/api/documents", { cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) return [];
+        const payload = await response.json() as { documents?: StoredOpsDocument[] };
+        return (payload.documents ?? []).map(storedDocumentToUi);
+      })
+      .then((items) => {
+        if (!controller.signal.aborted) setGeneratedDocuments(items);
+      })
+      .catch(() => {
+        // L’agent reste disponible même si l’index des documents est momentanément indisponible.
+      });
+    return () => controller.abort();
   }, []);
 
   useEffect(() => {
@@ -1045,7 +985,7 @@ export function OpsApp() {
   const content = useMemo(() => {
     switch (page) {
       case "today": return <TodayPage setPage={setPage} openAgent={openAgent} />;
-      case "agent": return <AgentPage initialPrompt={pendingPrompt} consumePrompt={consumePendingPrompt} onDocumentGenerated={addGeneratedDocument} openDocuments={openDocuments} />;
+      case "agent": return null;
       case "cycle": return <CyclePage openAgent={openAgent} />;
       case "emails": return <EmailsPage openAgent={openAgent} />;
       case "documents": return <DocumentsPage openAgent={openAgent} generatedDocuments={generatedDocuments} preferredDocumentId={preferredDocumentId} />;
@@ -1055,14 +995,24 @@ export function OpsApp() {
       case "numbers": return <NumbersPage openAgent={openAgent} />;
       case "brain": return <BrainPage openAgent={openAgent} />;
     }
-  }, [addGeneratedDocument, consumePendingPrompt, generatedDocuments, openAgent, openDocuments, page, pendingPrompt, preferredDocumentId]);
+  }, [generatedDocuments, openAgent, page, preferredDocumentId]);
 
   return (
     <div className={`ops-app ${collapsed ? "sidebar-is-collapsed" : ""}`}>
       <Sidebar page={page} setPage={setPage} collapsed={collapsed} setCollapsed={setCollapsed} />
       <div className="ops-main">
         <Topbar page={page} openAgent={openAgent} />
-        <main className="ops-content">{content}</main>
+        <main className="ops-content">
+          <div style={{ display: page === "agent" ? "contents" : "none" }}>
+            <AgentPage
+              initialPrompt={pendingPrompt}
+              consumePrompt={consumePendingPrompt}
+              onDocumentGenerated={addGeneratedDocument}
+              openDocuments={openDocuments}
+            />
+          </div>
+          {content}
+        </main>
       </div>
       <CommandMenu open={commandOpen} setOpen={setCommandOpen} setPage={setPage} openAgent={openAgent} />
       <div className="demo-watermark">Données de démonstration</div>
