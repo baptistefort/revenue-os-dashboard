@@ -274,6 +274,12 @@ function blobToDataUrl(blob: Blob) {
   });
 }
 
+async function dataUrlToObjectUrl(dataUrl: string) {
+  const response = await fetch(dataUrl);
+  if (!response.ok) throw new Error("PDF illisible");
+  return URL.createObjectURL(await response.blob());
+}
+
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} o`;
   return `${Math.max(1, Math.round(bytes / 1024))} Ko`;
@@ -370,6 +376,7 @@ type AgentStreamEvent =
   | { type: "meta"; scenario: AgentScenario; mode?: string }
   | { type: "progress"; stage: string; label: string; detail?: string; etaMs?: number }
   | { type: "delta"; delta: string }
+  | { type: "speech"; text: string }
   | { type: "error"; message: string; retryable?: boolean }
   | { type: "done" };
 
@@ -402,7 +409,8 @@ function PdfArtifactCard({ document, openDocuments }: {
   document: OpsDocument;
   openDocuments: (documentId?: string) => void;
 }) {
-  if (!document.dataUrl) return null;
+  const fileUrl = document.objectUrl ?? document.dataUrl;
+  if (!fileUrl) return null;
   return (
     <article className="pdf-result-card">
       <div className="pdf-result-preview" aria-hidden="true">
@@ -416,8 +424,8 @@ function PdfArtifactCard({ document, openDocuments }: {
         <small>{document.id} · {document.pages ?? 3} pages · {document.size ?? "—"} · {document.facts} éléments reliés</small>
       </div>
       <div className="pdf-result-actions">
-        <a className="primary" href={document.dataUrl} target="_blank" rel="noreferrer"><OpsIcon name="folder" size={14} /> Ouvrir le PDF</a>
-        <a href={document.dataUrl} download={document.name} aria-label={`Télécharger ${document.name}`}><OpsIcon name="download" size={15} /></a>
+        <a className="primary" href={fileUrl} target="_blank" rel="noreferrer"><OpsIcon name="folder" size={14} /> Ouvrir le PDF</a>
+        <a href={fileUrl} download={document.name} aria-label={`Télécharger ${document.name}`}><OpsIcon name="download" size={15} /></a>
         <button type="button" onClick={() => openDocuments(document.id)} aria-label="Voir dans Documents"><OpsIcon name="arrow" size={15} /></button>
       </div>
       <style jsx>{`
@@ -491,6 +499,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   const scrollRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const voiceModeRef = useRef<VoiceModeHandle>(null);
+  const resetOpenCodeSessionRef = useRef(true);
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
 
@@ -599,6 +608,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         if (!response.ok) throw new Error("La génération du PDF a échoué");
         const blob = await response.blob();
         const dataUrl = await blobToDataUrl(blob);
+        const objectUrl = URL.createObjectURL(blob);
         const document: OpsDocument = {
           id: response.headers.get("X-Document-Id") ?? `RAPPORT-${Date.now()}`,
           name: `${pdfTitle}.pdf`,
@@ -609,6 +619,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
           status: "Généré",
           facts: Number(response.headers.get("X-Document-Sources") ?? Math.max(1, reportSources.length)),
           dataUrl,
+          objectUrl,
           size: formatBytes(blob.size),
           pages: Number(response.headers.get("X-Document-Pages") ?? 3),
           generated: true,
@@ -670,12 +681,18 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
       const response = await fetch("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: prompt, history: priorHistory }),
+        body: JSON.stringify({
+          message: prompt,
+          history: priorHistory,
+          resetSession: resetOpenCodeSessionRef.current,
+        }),
       });
       if (!response.ok || !response.body) throw new Error("agent unavailable");
+      resetOpenCodeSessionRef.current = false;
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let text = "";
+      let speechText = "";
       let serverScenario = fallbackScenario;
       let lineBuffer = "";
       const structured = response.headers.get("content-type")?.includes("application/x-ndjson") ?? false;
@@ -706,6 +723,8 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
           setMessages((current) => current.map((message) => message.id === userId + 1
             ? { ...message, scenario: serverScenario, loading: false, text }
             : message));
+        } else if (event.type === "speech") {
+          speechText = event.text.trim();
         } else if (event.type === "error") {
           text = `${text}${text ? "\n\n" : ""}${event.message}`;
           setMessages((current) => current.map((message) => message.id === userId + 1
@@ -764,7 +783,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         progressEtaMs: undefined,
         progressUpdatedAt: undefined,
       } : message));
-      if (fromVoice && text.trim()) speak([serverScenario.lead, text].filter(Boolean).join("\n\n"));
+      if (fromVoice && text.trim()) speak(speechText || [serverScenario.lead, text].filter(Boolean).join("\n\n"));
     } catch {
       await new Promise((resolve) => window.setTimeout(resolve, 520));
       setMessages((current) => current.map((message) => message.id === userId + 1 ? {
@@ -830,7 +849,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   return (
     <>
       <div className="agent-thread-page">
-        <div className="thread-toolbar"><button onClick={() => { setMessages([]); setPendingPdf(false); }}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button><OpsIcon name="dots" size={18} /></button></div>
+        <div className="thread-toolbar"><button onClick={() => { setMessages([]); setPendingPdf(false); resetOpenCodeSessionRef.current = true; }}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button><OpsIcon name="dots" size={18} /></button></div>
         <div className="thread-scroll" ref={scrollRef}>
           <div className="thread-content">
             {messages.map((message) => message.role === "user" ? (
@@ -923,7 +942,7 @@ function DocumentsPage({ openAgent, generatedDocuments, preferredDocumentId }: {
       <PageHeading page="documents" action={<button className="primary-button"><OpsIcon name="plus" size={16} /> Importer</button>} />
       <div className="documents-layout">
         <section className="panel documents-panel"><div className="panel-title"><div><span>{286 + generatedDocuments.length} documents</span><small>{17 + generatedDocuments.length} ajoutés cette semaine</small></div><div className="table-actions"><button><OpsIcon name="search" size={15} /> Rechercher</button><button><OpsIcon name="filter" size={15} /> Filtrer</button></div></div><div className="entity-table documents-table"><div className="table-head"><span>Document</span><span>Type</span><span>Lié à</span><span>Responsable</span><span>Mise à jour</span><span>État OPS</span></div>{allDocuments.map((document) => <button className={`table-row ${selected.id === document.id ? "selected" : ""}`} onClick={() => setSelectedId(document.id)} key={document.id}><span><i className="doc-type"><OpsIcon name={document.generated ? "download" : "document"} size={16} /></i><span><strong>{document.name}</strong><small>{document.id}</small></span></span><span>{document.type}</span><span>{document.linked}</span><span>{document.owner}</span><span>{document.updated}</span><span className={`doc-status status-${document.status.toLocaleLowerCase("fr").replace("à ", "").replaceAll(" ", "-")}`}>{document.status}</span></button>)}</div></section>
-        <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.dataUrl ? <object className="pdf-preview" data={selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} faits exploitables</strong><p>Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné.</p>{selected.dataUrl ? <a className="document-download" href={selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse ${selected.name}`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside>
+        <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.objectUrl || selected.dataUrl ? <object className="pdf-preview" data={selected.objectUrl ?? selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.objectUrl ?? selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} faits exploitables</strong><p>Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné.</p>{selected.objectUrl || selected.dataUrl ? <a className="document-download" href={selected.objectUrl ?? selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse ${selected.name}`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside>
       </div>
     </div>
   );
@@ -981,7 +1000,10 @@ export function OpsApp() {
   const addGeneratedDocument = useCallback((document: OpsDocument) => {
     setGeneratedDocuments((current) => {
       const next = [document, ...current.filter((item) => item.id !== document.id)];
-      try { window.localStorage.setItem("ops-generated-documents-v1", JSON.stringify(next.slice(0, 6))); } catch { /* Le chat reste fonctionnel même si le stockage est saturé. */ }
+      try {
+        const persisted = next.slice(0, 6).map(({ objectUrl: _objectUrl, ...item }) => item);
+        window.localStorage.setItem("ops-generated-documents-v1", JSON.stringify(persisted));
+      } catch { /* Le chat reste fonctionnel même si le stockage est saturé. */ }
       return next;
     });
     setPreferredDocumentId(document.id);
@@ -995,7 +1017,17 @@ export function OpsApp() {
   useEffect(() => {
     try {
       const stored = window.localStorage.getItem("ops-generated-documents-v1");
-      if (stored) setGeneratedDocuments(JSON.parse(stored) as OpsDocument[]);
+      if (stored) {
+        const documentsFromStorage = JSON.parse(stored) as OpsDocument[];
+        void Promise.all(documentsFromStorage.map(async (document) => {
+          if (!document.dataUrl) return document;
+          try {
+            return { ...document, objectUrl: await dataUrlToObjectUrl(document.dataUrl) };
+          } catch {
+            return document;
+          }
+        })).then(setGeneratedDocuments);
+      }
     } catch { /* La démonstration repart simplement sans documents générés. */ }
   }, []);
 

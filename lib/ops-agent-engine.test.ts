@@ -54,6 +54,29 @@ test("les salutations simples restent sociales et sans sources", () => {
   }
 });
 
+test("une correction après la salutation reste conversationnelle", () => {
+  const greeting = buildFallbackScenario("hello");
+  const history: AgentHistoryTurn[] = [
+    { role: "user", content: "hello" },
+    { role: "assistant", content: [greeting.lead, ...greeting.body].join("\n\n") },
+  ];
+
+  for (const prompt of [
+    "je t’ai pas demandé si tu allais bien",
+    "je ne t'ai pas demandé comment tu allais",
+  ]) {
+    const scenario = buildFallbackScenario(prompt, history);
+    assert.equal(scenario.id, "conversation-repair", prompt);
+    assert.deepEqual(scenario.sources, [], prompt);
+    assert.match(scenario.lead, /Vous avez raison/);
+  }
+});
+
+test("une correction métier n'est pas confondue avec la réparation de salutation", () => {
+  const scenario = buildFallbackScenario("je ne t'ai pas demandé le rapport PDF");
+  assert.notEqual(scenario.id, "conversation-repair");
+});
+
 test("les suivis implicites restent dans le dossier Rivoli", () => {
   const history = marginConversation();
   const hours = buildFallbackScenario("montre les heures non facturées", history);

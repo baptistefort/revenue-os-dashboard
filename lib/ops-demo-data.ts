@@ -379,6 +379,7 @@ export type OpsDocument = {
   status: string;
   facts: number;
   dataUrl?: string;
+  objectUrl?: string;
   size?: string;
   pages?: number;
   generated?: boolean;

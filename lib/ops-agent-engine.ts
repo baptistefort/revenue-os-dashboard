@@ -30,6 +30,17 @@ function isSimpleGreeting(normalized: string) {
     || /^(bonjour|bonsoir|salut|hello|coucou|hey)[!,.? ]*$/.test(normalized);
 }
 
+function isGreetingCorrection(normalized: string, history: AgentHistoryTurn[]) {
+  const objectsToWellbeingQuestion = /\bpas demande\b.*\b(?:si|comment)\b.*\b(?:tu|vous)\b.*\b(?:allais|vas|allez|va|bien)\b/.test(normalized)
+    || /\b(?:ne|n.)?me demande pas\b.*\b(?:si|comment)\b.*\b(?:je vais|ca va)\b/.test(normalized);
+  if (!objectsToWellbeingQuestion) return false;
+
+  const lastAssistant = [...history].reverse().find((turn) => turn.role === "assistant");
+  if (!lastAssistant) return true;
+  const assistantText = normalizeMemoryQuery(lastAssistant.content);
+  return /\b(?:et vous|et toi|ca va bien|tu vas bien|vous allez bien)\b/.test(assistantText);
+}
+
 function isImplicitFollowup(normalized: string) {
   return /^(?:et\b|alors\b|donc\b|qu.en est.il\b|(?:montre|explique|detaille|resume|compare|ouvre|continue|approfondis|fais)\b)/.test(normalized)
     || /\b(?:cela|ca|ce point|cette analyse|le precedent|la precedente)\b/.test(normalized);
@@ -187,6 +198,17 @@ export function buildFallbackScenario(prompt: string, history: AgentHistoryTurn[
       [],
       [],
       ["Que dois-je valider aujourd’hui ?", "Analyse les priorités du jour", "Prépare mon brief CODIR"],
+    );
+  }
+
+  if (isGreetingCorrection(normalized, history)) {
+    return reply(
+      "conversation-repair",
+      prompt,
+      "Vous avez raison — vous m’avez simplement dit bonjour.",
+      ["Je n’avais pas à vous retourner la question. Je vous écoute."],
+      [],
+      ["Que souhaitez-vous examiner ?", "Ouvrir les validations", "Faire le point sur l’entreprise"],
     );
   }
 

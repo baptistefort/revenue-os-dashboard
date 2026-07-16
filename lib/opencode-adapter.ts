@@ -1,0 +1,879 @@
+import "server-only";
+import { Buffer } from "node:buffer";
+import {
+  createOpencodeClient,
+  type OpencodeClient,
+  type Part,
+  type PermissionRuleset,
+  type Session,
+} from "@opencode-ai/sdk/v2";
+import { z } from "zod";
+
+const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
+const DEFAULT_AGENT = "ops";
+const DEFAULT_TIMEOUT_MS = 90_000;
+const MAX_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_STRUCTURED_OUTPUT_RETRIES = 0;
+const MAX_STRUCTURED_OUTPUT_RETRIES = 5;
+const SESSION_ABORT_TIMEOUT_MS = 5_000;
+
+/**
+ * These names must match the custom tools installed in `.opencode/tools`.
+ * Document generation intentionally remains in the application route.
+ */
+export const DEFAULT_OPS_TOOLS = [
+  "ops_memory_search",
+  "ops_memory_get",
+  "ops_memory_related",
+  "ops_vault_search",
+  "ops_vault_read",
+] as const;
+
+/**
+ * Kept explicit for auditability even though the prompt also carries a
+ * catch-all `"*": false` tool rule.
+ */
+export const OPENCODE_BUILTIN_TOOLS = [
+  "bash",
+  "edit",
+  "write",
+  "patch",
+  "apply_patch",
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "lsp",
+  "task",
+  "skill",
+  "question",
+  "webfetch",
+  "websearch",
+  "todowrite",
+  "todoread",
+] as const;
+
+export type OpenCodeModel = {
+  providerID: string;
+  modelID: string;
+  variant?: string;
+};
+
+export type OpenCodeAdapterOptions = {
+  baseUrl?: string;
+  directory?: string;
+  workspace?: string;
+  username?: string;
+  password?: string;
+  agent?: string;
+  model?: OpenCodeModel;
+  system?: string;
+  allowedTools?: readonly string[];
+  timeoutMs?: number;
+  structuredOutputRetries?: number;
+};
+
+export type OpenCodeSessionOptions = {
+  sessionId?: string;
+  title?: string;
+  metadata?: Record<string, unknown>;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
+export type OpenCodeSessionHandle = {
+  session: Session;
+  created: boolean;
+};
+
+export type OpenCodeStructuredPrompt<TSchema extends z.ZodType> = {
+  message: string;
+  schema: TSchema;
+  researchWithTools?: boolean;
+  sessionId?: string;
+  sessionTitle?: string;
+  sessionMetadata?: Record<string, unknown>;
+  agent?: string;
+  model?: OpenCodeModel;
+  system?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
+export type OpenCodeStructuredResult<TSchema extends z.ZodType> = {
+  sessionId: string;
+  sessionCreated: boolean;
+  assistantMessageId: string;
+  text: string;
+  data: z.output<TSchema>;
+};
+
+type ResolvedOpenCodeAdapterOptions = {
+  baseUrl: string;
+  directory: string;
+  workspace?: string;
+  username: string;
+  password?: string;
+  agent: string;
+  model?: OpenCodeModel;
+  system?: string;
+  allowedTools: readonly string[];
+  timeoutMs: number;
+  structuredOutputRetries: number;
+};
+
+type AbortScope = {
+  signal: AbortSignal;
+  timedOut: () => boolean;
+  parentAborted: () => boolean;
+  cleanup: () => void;
+};
+
+type ParsedJson = {
+  ok: true;
+  value: unknown;
+} | {
+  ok: false;
+};
+
+export type OpenCodeAdapterErrorCode =
+  | "opencode_configuration_error"
+  | "opencode_request_failed"
+  | "opencode_session_not_found"
+  | "opencode_assistant_error"
+  | "opencode_invalid_structured_output"
+  | "opencode_timeout"
+  | "opencode_aborted";
+
+export class OpenCodeAdapterError extends Error {
+  readonly code: OpenCodeAdapterErrorCode;
+  readonly status?: number;
+  override readonly cause?: unknown;
+
+  constructor(
+    code: OpenCodeAdapterErrorCode,
+    message: string,
+    options: { cause?: unknown; status?: number } = {},
+  ) {
+    super(message);
+    this.name = "OpenCodeAdapterError";
+    this.code = code;
+    this.status = options.status;
+    if (options.cause !== undefined) {
+      Object.defineProperty(this, "cause", {
+        configurable: true,
+        enumerable: false,
+        value: options.cause,
+      });
+    }
+  }
+}
+
+export class OpenCodeStructuredOutputError extends OpenCodeAdapterError {
+  readonly issues: readonly unknown[];
+  readonly outputPreview?: string;
+
+  constructor(message: string, issues: readonly unknown[] = [], outputPreview?: string) {
+    super("opencode_invalid_structured_output", message);
+    this.name = "OpenCodeStructuredOutputError";
+    this.issues = issues;
+    this.outputPreview = outputPreview;
+  }
+}
+
+function cleanOptionalString(value: string | undefined) {
+  const cleaned = value?.trim();
+  return cleaned ? cleaned : undefined;
+}
+
+function parseInteger(
+  value: number | string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+  label: string,
+) {
+  const parsed = typeof value === "number" ? value : value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new OpenCodeAdapterError(
+      "opencode_configuration_error",
+      `${label} doit être un entier compris entre ${minimum} et ${maximum}.`,
+    );
+  }
+  return parsed;
+}
+
+function parseAllowedTools(value: readonly string[] | string | undefined) {
+  const candidates = typeof value === "string"
+    ? value.split(",")
+    : value ?? DEFAULT_OPS_TOOLS;
+  const tools = [...new Set(candidates.map((tool) => tool.trim()).filter(Boolean))];
+
+  if (!tools.length) {
+    throw new OpenCodeAdapterError(
+      "opencode_configuration_error",
+      "Au moins un outil OPS doit être autorisé.",
+    );
+  }
+
+  const invalid = tools.find((tool) => !/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(tool));
+  if (invalid) {
+    throw new OpenCodeAdapterError(
+      "opencode_configuration_error",
+      `Nom d’outil OpenCode invalide : ${invalid}. Les jokers ne sont pas autorisés dans l’allowlist.`,
+    );
+  }
+
+  return Object.freeze(tools);
+}
+
+function parseModel(
+  model: OpenCodeModel | undefined,
+  providerFromEnvironment: string | undefined,
+  modelFromEnvironment: string | undefined,
+  variantFromEnvironment: string | undefined,
+) {
+  if (model) {
+    const providerID = cleanOptionalString(model.providerID);
+    const modelID = cleanOptionalString(model.modelID);
+    if (!providerID || !modelID) {
+      throw new OpenCodeAdapterError(
+        "opencode_configuration_error",
+        "Le providerID et le modelID OpenCode sont obligatoires lorsqu’un modèle est configuré.",
+      );
+    }
+    return { providerID, modelID, variant: cleanOptionalString(model.variant) };
+  }
+
+  const providerID = cleanOptionalString(providerFromEnvironment);
+  const modelID = cleanOptionalString(modelFromEnvironment);
+  if (Boolean(providerID) !== Boolean(modelID)) {
+    throw new OpenCodeAdapterError(
+      "opencode_configuration_error",
+      "OPENCODE_PROVIDER et OPENCODE_MODEL doivent être définis ensemble.",
+    );
+  }
+  if (!providerID || !modelID) return undefined;
+  return { providerID, modelID, variant: cleanOptionalString(variantFromEnvironment) };
+}
+
+function resolveOptions(options: OpenCodeAdapterOptions): ResolvedOpenCodeAdapterOptions {
+  const baseUrl = cleanOptionalString(options.baseUrl ?? process.env.OPENCODE_BASE_URL) ?? DEFAULT_BASE_URL;
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(baseUrl);
+  } catch (cause) {
+    throw new OpenCodeAdapterError(
+      "opencode_configuration_error",
+      "OPENCODE_BASE_URL doit être une URL absolue valide.",
+      { cause },
+    );
+  }
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    throw new OpenCodeAdapterError(
+      "opencode_configuration_error",
+      "OPENCODE_BASE_URL doit utiliser HTTP ou HTTPS.",
+    );
+  }
+
+  const directory = cleanOptionalString(options.directory ?? process.env.OPENCODE_DIRECTORY) ?? process.cwd();
+  const timeoutMs = parseInteger(
+    options.timeoutMs ?? process.env.OPENCODE_TIMEOUT_MS,
+    DEFAULT_TIMEOUT_MS,
+    100,
+    MAX_TIMEOUT_MS,
+    "Le délai OpenCode",
+  );
+  const structuredOutputRetries = parseInteger(
+    options.structuredOutputRetries ?? process.env.OPENCODE_STRUCTURED_OUTPUT_RETRIES,
+    DEFAULT_STRUCTURED_OUTPUT_RETRIES,
+    0,
+    MAX_STRUCTURED_OUTPUT_RETRIES,
+    "Le nombre de tentatives de sortie structurée",
+  );
+
+  return {
+    baseUrl: parsedUrl.toString().replace(/\/$/, ""),
+    directory,
+    workspace: cleanOptionalString(options.workspace ?? process.env.OPENCODE_WORKSPACE),
+    username: cleanOptionalString(options.username ?? process.env.OPENCODE_SERVER_USERNAME) ?? "opencode",
+    password: cleanOptionalString(options.password ?? process.env.OPENCODE_SERVER_PASSWORD),
+    agent: cleanOptionalString(options.agent ?? process.env.OPENCODE_AGENT) ?? DEFAULT_AGENT,
+    model: parseModel(
+      options.model,
+      process.env.OPENCODE_PROVIDER_ID ?? process.env.OPENCODE_PROVIDER,
+      process.env.OPENCODE_MODEL_ID ?? process.env.OPENCODE_MODEL,
+      process.env.OPENCODE_MODEL_VARIANT,
+    ),
+    system: cleanOptionalString(options.system),
+    allowedTools: parseAllowedTools(options.allowedTools ?? process.env.OPENCODE_OPS_TOOLS),
+    timeoutMs,
+    structuredOutputRetries,
+  };
+}
+
+function createClient(options: ResolvedOpenCodeAdapterOptions) {
+  const headers = options.password
+    ? { Authorization: `Basic ${Buffer.from(`${options.username}:${options.password}`).toString("base64")}` }
+    : undefined;
+
+  return createOpencodeClient({
+    baseUrl: options.baseUrl,
+    directory: options.directory,
+    experimental_workspaceID: options.workspace,
+    headers,
+  });
+}
+
+function createAbortScope(parent: AbortSignal | undefined, timeoutMs: number): AbortScope {
+  const controller = new AbortController();
+  let didTimeOut = false;
+  const abortFromParent = () => controller.abort(parent?.reason);
+
+  if (parent?.aborted) {
+    abortFromParent();
+  } else {
+    parent?.addEventListener("abort", abortFromParent, { once: true });
+  }
+
+  const timeout = setTimeout(() => {
+    didTimeOut = true;
+    controller.abort(new Error(`OpenCode timeout after ${timeoutMs} ms`));
+  }, timeoutMs);
+
+  return {
+    signal: controller.signal,
+    timedOut: () => didTimeOut,
+    parentAborted: () => Boolean(parent?.aborted),
+    cleanup: () => {
+      clearTimeout(timeout);
+      parent?.removeEventListener("abort", abortFromParent);
+    },
+  };
+}
+
+function sessionPermissions(allowedTools: readonly string[]): PermissionRuleset {
+  return [
+    { permission: "*", pattern: "*", action: "deny" },
+    ...allowedTools.map((permission) => ({ permission, pattern: "*", action: "allow" as const })),
+  ];
+}
+
+function permissionRulesMatch(actual: PermissionRuleset | undefined, expected: PermissionRuleset) {
+  if (!actual || actual.length !== expected.length) return false;
+  return actual.every((rule, index) => {
+    const expectedRule = expected[index];
+    return rule.permission === expectedRule.permission
+      && rule.pattern === expectedRule.pattern
+      && rule.action === expectedRule.action;
+  });
+}
+
+function promptToolRules(allowedTools: readonly string[]) {
+  return Object.fromEntries([
+    ["*", false],
+    ...OPENCODE_BUILTIN_TOOLS.map((tool) => [tool, false] as const),
+    ...allowedTools.map((tool) => [tool, true] as const),
+  ]);
+}
+
+function statusFromError(error: unknown) {
+  if (!error || typeof error !== "object") return undefined;
+  const record = error as Record<string, unknown>;
+  if (typeof record.status === "number") return record.status;
+  if (record.response instanceof Response) return record.response.status;
+  if (record.cause && typeof record.cause === "object") {
+    const cause = record.cause as Record<string, unknown>;
+    if (typeof cause.status === "number") return cause.status;
+    if (cause.response instanceof Response) return cause.response.status;
+  }
+  return undefined;
+}
+
+function errorMessage(error: unknown) {
+  if (error instanceof Error && error.message) return error.message;
+  if (!error || typeof error !== "object") return "";
+  const record = error as Record<string, unknown>;
+  if (typeof record.message === "string") return record.message;
+  if (record.data && typeof record.data === "object") {
+    const data = record.data as Record<string, unknown>;
+    if (typeof data.message === "string") return data.message;
+  }
+  return "";
+}
+
+function normalizeRequestError(operation: string, error: unknown, scope: AbortScope) {
+  if (scope.timedOut()) {
+    return new OpenCodeAdapterError(
+      "opencode_timeout",
+      `OpenCode n’a pas terminé ${operation} dans le délai imparti.`,
+      { cause: error },
+    );
+  }
+  if (scope.parentAborted()) {
+    return new OpenCodeAdapterError(
+      "opencode_aborted",
+      `La requête OpenCode a été annulée pendant ${operation}.`,
+      { cause: error },
+    );
+  }
+  if (error instanceof OpenCodeAdapterError) return error;
+
+  const status = statusFromError(error);
+  const notFound = status === 404;
+  const detail = errorMessage(error);
+  return new OpenCodeAdapterError(
+    notFound ? "opencode_session_not_found" : "opencode_request_failed",
+    notFound
+      ? "La session OpenCode demandée n’existe pas ou n’est plus accessible."
+      : `La requête OpenCode a échoué pendant ${operation}${detail ? ` : ${detail}` : "."}`,
+    { cause: error, status },
+  );
+}
+
+function assistantErrorMessage(error: unknown) {
+  if (!error || typeof error !== "object") return "Erreur assistant inconnue.";
+  const record = error as Record<string, unknown>;
+  const name = typeof record.name === "string" ? record.name : "AssistantError";
+  const detail = errorMessage(error);
+  return detail ? `${name} : ${detail}` : name;
+}
+
+function extractText(parts: readonly Part[]) {
+  return parts
+    .filter((part) => part.type === "text" && !part.ignored && part.text.trim().length > 0)
+    .map((part) => part.type === "text" ? part.text.trim() : "")
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function tryParseJson(value: string): ParsedJson {
+  try {
+    return { ok: true, value: JSON.parse(value) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function extractBalancedJson(value: string): ParsedJson {
+  for (let start = 0; start < value.length; start += 1) {
+    const opening = value[start];
+    if (opening !== "{" && opening !== "[") continue;
+
+    const stack: string[] = [];
+    let inString = false;
+    let escaped = false;
+
+    for (let index = start; index < value.length; index += 1) {
+      const character = value[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (character === "\\") {
+          escaped = true;
+        } else if (character === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (character === "\"") {
+        inString = true;
+        continue;
+      }
+      if (character === "{" || character === "[") {
+        stack.push(character);
+        continue;
+      }
+      if (character !== "}" && character !== "]") continue;
+
+      const expectedOpening = character === "}" ? "{" : "[";
+      if (stack.pop() !== expectedOpening) break;
+      if (stack.length > 0) continue;
+
+      const parsed = tryParseJson(value.slice(start, index + 1));
+      if (parsed.ok) return parsed;
+      break;
+    }
+  }
+  return { ok: false };
+}
+
+function jsonCandidatesFromText(text: string) {
+  const candidates: unknown[] = [];
+  const trimmed = text.trim();
+  if (!trimmed) return candidates;
+
+  const direct = tryParseJson(trimmed);
+  if (direct.ok) candidates.push(direct.value);
+
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) {
+    const parsedFence = tryParseJson(fenced[1].trim());
+    if (parsedFence.ok) candidates.push(parsedFence.value);
+  }
+
+  const balanced = extractBalancedJson(trimmed);
+  if (balanced.ok) candidates.push(balanced.value);
+  return candidates;
+}
+
+function outputPreview(text: string) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact ? compact.slice(0, 500) : undefined;
+}
+
+function validateStructuredOutput<TSchema extends z.ZodType>(
+  schema: TSchema,
+  structured: unknown,
+  text: string,
+): z.output<TSchema> {
+  const candidates: unknown[] = [];
+  if (structured !== undefined) {
+    candidates.push(structured);
+    if (typeof structured === "string") {
+      const parsedStructured = tryParseJson(structured.trim());
+      if (parsedStructured.ok) candidates.push(parsedStructured.value);
+    }
+  }
+  candidates.push(...jsonCandidatesFromText(text));
+
+  let issues: readonly unknown[] = [];
+  for (const candidate of candidates) {
+    const result = schema.safeParse(candidate);
+    if (result.success) return result.data;
+    issues = result.error.issues;
+  }
+
+  throw new OpenCodeStructuredOutputError(
+    candidates.length
+      ? "OpenCode a répondu, mais le JSON ne respecte pas le schéma OPS."
+      : "OpenCode n’a renvoyé aucune sortie JSON exploitable.",
+    issues,
+    outputPreview(text),
+  );
+}
+
+export class OpenCodeAdapter {
+  private readonly client: OpencodeClient;
+  private readonly options: ResolvedOpenCodeAdapterOptions;
+  private readonly permissions: PermissionRuleset;
+  private readonly tools: Record<string, boolean>;
+  private readonly finalizationTools: Record<string, boolean>;
+
+  constructor(options: OpenCodeAdapterOptions = {}) {
+    this.options = resolveOptions(options);
+    this.client = createClient(this.options);
+    this.permissions = sessionPermissions(this.options.allowedTools);
+    this.tools = promptToolRules(this.options.allowedTools);
+    this.finalizationTools = Object.fromEntries(
+      Object.keys(this.tools).map((tool) => [tool, false]),
+    );
+  }
+
+  private location() {
+    return {
+      directory: this.options.directory,
+      workspace: this.options.workspace,
+    };
+  }
+
+  private async createSessionWithSignal(
+    options: Pick<OpenCodeSessionOptions, "title" | "metadata">,
+    signal: AbortSignal,
+  ) {
+    const response = await this.client.session.create<true>({
+      ...this.location(),
+      title: cleanOptionalString(options.title) ?? "Conversation OPS",
+      agent: this.options.agent,
+      model: this.options.model
+        ? {
+            id: this.options.model.modelID,
+            providerID: this.options.model.providerID,
+            variant: this.options.model.variant,
+          }
+        : undefined,
+      metadata: options.metadata,
+      permission: this.permissions,
+    }, { signal, throwOnError: true });
+    return response.data;
+  }
+
+  private async getSessionWithSignal(sessionId: string, signal: AbortSignal) {
+    const response = await this.client.session.get<true>({
+      sessionID: sessionId,
+      ...this.location(),
+    }, { signal, throwOnError: true });
+    return response.data;
+  }
+
+  private async enforceSessionPermissions(session: Session, signal: AbortSignal) {
+    if (permissionRulesMatch(session.permission, this.permissions)) return session;
+    const response = await this.client.session.update<true>({
+      sessionID: session.id,
+      ...this.location(),
+      permission: this.permissions,
+    }, { signal, throwOnError: true });
+    return response.data;
+  }
+
+  private async ensureSessionWithSignal(options: OpenCodeSessionOptions, signal: AbortSignal): Promise<OpenCodeSessionHandle> {
+    const sessionId = cleanOptionalString(options.sessionId);
+    if (!sessionId) {
+      return {
+        session: await this.createSessionWithSignal(options, signal),
+        created: true,
+      };
+    }
+
+    const session = await this.getSessionWithSignal(sessionId, signal);
+    return {
+      session: await this.enforceSessionPermissions(session, signal),
+      created: false,
+    };
+  }
+
+  async createSession(options: Omit<OpenCodeSessionOptions, "sessionId"> = {}) {
+    const timeoutMs = parseInteger(
+      options.timeoutMs,
+      this.options.timeoutMs,
+      100,
+      MAX_TIMEOUT_MS,
+      "Le délai OpenCode",
+    );
+    const scope = createAbortScope(options.signal, timeoutMs);
+    try {
+      return await this.createSessionWithSignal(options, scope.signal);
+    } catch (error) {
+      throw normalizeRequestError("la création de la session", error, scope);
+    } finally {
+      scope.cleanup();
+    }
+  }
+
+  async getSession(sessionId: string, options: Pick<OpenCodeSessionOptions, "signal" | "timeoutMs"> = {}) {
+    const cleanedSessionId = cleanOptionalString(sessionId);
+    if (!cleanedSessionId) {
+      throw new OpenCodeAdapterError(
+        "opencode_configuration_error",
+        "Un sessionId OpenCode non vide est obligatoire.",
+      );
+    }
+    const timeoutMs = parseInteger(
+      options.timeoutMs,
+      this.options.timeoutMs,
+      100,
+      MAX_TIMEOUT_MS,
+      "Le délai OpenCode",
+    );
+    const scope = createAbortScope(options.signal, timeoutMs);
+    try {
+      return await this.getSessionWithSignal(cleanedSessionId, scope.signal);
+    } catch (error) {
+      throw normalizeRequestError("la lecture de la session", error, scope);
+    } finally {
+      scope.cleanup();
+    }
+  }
+
+  /**
+   * Reuses an existing durable OpenCode session when `sessionId` is supplied.
+   * The caller is responsible for persisting the returned session ID.
+   */
+  async ensureSession(options: OpenCodeSessionOptions = {}): Promise<OpenCodeSessionHandle> {
+    const timeoutMs = parseInteger(
+      options.timeoutMs,
+      this.options.timeoutMs,
+      100,
+      MAX_TIMEOUT_MS,
+      "Le délai OpenCode",
+    );
+    const scope = createAbortScope(options.signal, timeoutMs);
+    try {
+      return await this.ensureSessionWithSignal(options, scope.signal);
+    } catch (error) {
+      throw normalizeRequestError("la reprise de la session", error, scope);
+    } finally {
+      scope.cleanup();
+    }
+  }
+
+  async abortSession(
+    sessionId: string,
+    options: Pick<OpenCodeSessionOptions, "signal" | "timeoutMs"> = {},
+  ) {
+    const cleanedSessionId = cleanOptionalString(sessionId);
+    if (!cleanedSessionId) return false;
+    const timeoutMs = parseInteger(
+      options.timeoutMs,
+      this.options.timeoutMs,
+      100,
+      MAX_TIMEOUT_MS,
+      "Le délai OpenCode",
+    );
+    const scope = createAbortScope(options.signal, timeoutMs);
+    try {
+      const response = await this.client.session.abort<true>({
+        sessionID: cleanedSessionId,
+        ...this.location(),
+      }, { signal: scope.signal, throwOnError: true });
+      return response.data;
+    } catch (error) {
+      throw normalizeRequestError("l’arrêt de la session", error, scope);
+    } finally {
+      scope.cleanup();
+    }
+  }
+
+  private async bestEffortAbort(sessionId: string) {
+    const scope = createAbortScope(undefined, SESSION_ABORT_TIMEOUT_MS);
+    try {
+      await this.client.session.abort<true>({
+        sessionID: sessionId,
+        ...this.location(),
+      }, { signal: scope.signal, throwOnError: true });
+    } catch {
+      // The original timeout/abort remains the useful error for the caller.
+    } finally {
+      scope.cleanup();
+    }
+  }
+
+  async runStructured<TSchema extends z.ZodType>(
+    prompt: OpenCodeStructuredPrompt<TSchema>,
+  ): Promise<OpenCodeStructuredResult<TSchema>> {
+    const message = prompt.message.trim();
+    if (!message) {
+      throw new OpenCodeAdapterError(
+        "opencode_configuration_error",
+        "Le message OpenCode ne peut pas être vide.",
+      );
+    }
+
+    const timeoutMs = parseInteger(
+      prompt.timeoutMs,
+      this.options.timeoutMs,
+      100,
+      MAX_TIMEOUT_MS,
+      "Le délai OpenCode",
+    );
+    const scope = createAbortScope(prompt.signal, timeoutMs);
+    let activeSessionId = cleanOptionalString(prompt.sessionId);
+
+    try {
+      const handle = await this.ensureSessionWithSignal({
+        sessionId: activeSessionId,
+        title: prompt.sessionTitle,
+        metadata: prompt.sessionMetadata,
+      }, scope.signal);
+      activeSessionId = handle.session.id;
+
+      const model = prompt.model ?? this.options.model;
+      const agent = cleanOptionalString(prompt.agent) ?? this.options.agent;
+      const system = cleanOptionalString(prompt.system) ?? this.options.system;
+
+      if (prompt.researchWithTools !== false) {
+        const research = await this.client.session.prompt<true>({
+          sessionID: handle.session.id,
+          ...this.location(),
+          agent,
+          model: model ? { providerID: model.providerID, modelID: model.modelID } : undefined,
+          variant: model?.variant,
+          tools: this.tools,
+          format: { type: "text" },
+          system,
+          parts: [{
+            type: "text",
+            text: `${message}
+
+PHASE DE RECHERCHE UNIQUEMENT
+- Établis une seule fois les faits nécessaires avec les outils OPS.
+- Un résultat de recherche ou de relations contient déjà les faits complets : ne relis pas chaque identifiant séparément.
+- Ne lance jamais deux fois la même requête ou le même identifiant.
+- Maximum deux tours de recherche. Dès que les preuves suffisent, arrête les outils.
+- Termine cette phase par une note factuelle concise destinée à préparer la réponse finale.`,
+          }],
+        }, { signal: scope.signal, throwOnError: true });
+
+        if (research.data.info.error) {
+          throw new OpenCodeAdapterError(
+            "opencode_assistant_error",
+            `L’assistant OpenCode a interrompu la recherche : ${assistantErrorMessage(research.data.info.error)}`,
+            { cause: research.data.info.error },
+          );
+        }
+      }
+
+      const response = await this.client.session.prompt<true>({
+        sessionID: handle.session.id,
+        ...this.location(),
+        agent,
+        model: model ? { providerID: model.providerID, modelID: model.modelID } : undefined,
+        variant: model?.variant,
+        tools: this.finalizationTools,
+        format: {
+          type: "json_schema",
+          schema: z.toJSONSchema(prompt.schema, { target: "draft-07", io: "output" }),
+          retryCount: this.options.structuredOutputRetries,
+        },
+        system,
+        parts: [{
+          type: "text",
+          text: prompt.researchWithTools === false
+            ? message
+            : `Produis maintenant la réponse finale à la demande précédente.
+Toutes les preuves utiles sont déjà dans la conversation : n'effectue plus aucune recherche.
+Respecte exactement le schéma de sortie demandé et appelle la sortie structurée une seule fois.`,
+        }],
+      }, { signal: scope.signal, throwOnError: true });
+
+      const assistant = response.data.info;
+      const text = extractText(response.data.parts);
+      let data!: z.output<TSchema>;
+      let hasValidData = false;
+      let validationError: unknown;
+      try {
+        data = validateStructuredOutput(prompt.schema, assistant.structured, text);
+        hasValidData = true;
+      } catch (error) {
+        validationError = error;
+      }
+
+      if (!hasValidData && assistant.error) {
+        throw new OpenCodeAdapterError(
+          "opencode_assistant_error",
+          `L’assistant OpenCode a interrompu sa réponse : ${assistantErrorMessage(assistant.error)}`,
+          { cause: assistant.error },
+        );
+      }
+
+      if (!hasValidData) throw validationError;
+      return {
+        sessionId: handle.session.id,
+        sessionCreated: handle.created,
+        assistantMessageId: assistant.id,
+        text: text || JSON.stringify(data),
+        data,
+      };
+    } catch (error) {
+      if ((scope.timedOut() || scope.parentAborted()) && activeSessionId) {
+        await this.bestEffortAbort(activeSessionId);
+      }
+      throw normalizeRequestError("la génération structurée", error, scope);
+    } finally {
+      scope.cleanup();
+    }
+  }
+}
+
+export function createOpenCodeAdapter(options: OpenCodeAdapterOptions = {}) {
+  return new OpenCodeAdapter(options);
+}
+
+export async function runOpenCodeStructured<TSchema extends z.ZodType>(
+  prompt: OpenCodeStructuredPrompt<TSchema>,
+  options: OpenCodeAdapterOptions = {},
+) {
+  return createOpenCodeAdapter(options).runStructured(prompt);
+}
