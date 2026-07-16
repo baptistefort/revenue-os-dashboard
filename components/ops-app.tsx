@@ -27,6 +27,10 @@ import {
   type PageId,
 } from "@/lib/ops-demo-data";
 import type { OpsDocumentPlan, StoredOpsDocument } from "@/lib/ops-document";
+import {
+  playStreamingAudioResponse,
+  type StreamingAudioPlayback,
+} from "@/lib/streaming-audio";
 
 type OpenAgent = (prompt?: string) => void;
 
@@ -392,6 +396,7 @@ type AgentStreamEvent =
   | { type: "meta"; scenario: AgentScenario; mode?: string; document?: OpsDocumentPlan }
   | { type: "progress"; stage: string; label: string; detail?: string; etaMs?: number }
   | { type: "delta"; delta: string }
+  | { type: "replace"; text: string }
   | { type: "speech"; text: string }
   | { type: "error"; message: string; retryable?: boolean }
   | { type: "done" };
@@ -515,6 +520,9 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   const scrollRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const voiceModeRef = useRef<VoiceModeHandle>(null);
+  const inlineSpeechPlaybackRef = useRef<StreamingAudioPlayback | null>(null);
+  const inlineSpeechRequestRef = useRef<AbortController | null>(null);
+  const inlineSpeechGenerationRef = useRef(0);
   const resetOpenCodeSessionRef = useRef(true);
   const conversationIdRef = useRef(createConversationId());
 
@@ -525,15 +533,85 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
       voiceModeRef.current.speak(text);
       return;
     }
-    if (!("speechSynthesis" in window)) return;
+
+    inlineSpeechGenerationRef.current += 1;
+    const generation = inlineSpeechGenerationRef.current;
+    inlineSpeechRequestRef.current?.abort();
+    inlineSpeechRequestRef.current = null;
+    inlineSpeechPlaybackRef.current?.stop();
+    inlineSpeechPlaybackRef.current = null;
     window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text.replace(/\b[A-Z]{2,}-[A-Z0-9-]+\b/g, ""));
-    utterance.lang = "fr-FR";
-    utterance.rate = 0.98;
-    const voice = window.speechSynthesis.getVoices().find((candidate) => candidate.lang.toLocaleLowerCase().startsWith("fr"));
-    if (voice) utterance.voice = voice;
-    window.speechSynthesis.speak(utterance);
+
+    const cleaned = text.replace(/\b[A-Z]{2,}-[A-Z0-9-]+\b/g, "").trim();
+    if (!cleaned) return;
+
+    const playBrowserFallback = () => {
+      if (generation !== inlineSpeechGenerationRef.current) return;
+      if (!("speechSynthesis" in window)) return;
+      const utterance = new SpeechSynthesisUtterance(cleaned);
+      utterance.lang = "fr-FR";
+      utterance.rate = 0.98;
+      const voice = window.speechSynthesis
+        .getVoices()
+        .find((candidate) => candidate.lang.toLocaleLowerCase().startsWith("fr"));
+      if (voice) utterance.voice = voice;
+      window.speechSynthesis.speak(utterance);
+    };
+
+    const controller = new AbortController();
+    inlineSpeechRequestRef.current = controller;
+    void (async () => {
+      try {
+        const response = await fetch("/api/audio/speech", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: cleaned }),
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`speech_${response.status}`);
+        const playback = await playStreamingAudioResponse(response, {
+          signal: controller.signal,
+          onEnded: (endedPlayback) => {
+            if (inlineSpeechPlaybackRef.current === endedPlayback) {
+              inlineSpeechPlaybackRef.current = null;
+            }
+            if (inlineSpeechRequestRef.current === controller) {
+              inlineSpeechRequestRef.current = null;
+            }
+          },
+          onError: (_error, failedPlayback) => {
+            if (inlineSpeechPlaybackRef.current === failedPlayback) {
+              inlineSpeechPlaybackRef.current = null;
+            }
+            if (inlineSpeechRequestRef.current === controller) {
+              inlineSpeechRequestRef.current = null;
+            }
+            if (!controller.signal.aborted) playBrowserFallback();
+          },
+        });
+        if (
+          controller.signal.aborted ||
+          generation !== inlineSpeechGenerationRef.current
+        ) {
+          playback.stop();
+          return;
+        }
+        inlineSpeechPlaybackRef.current = playback;
+      } catch {
+        if (inlineSpeechRequestRef.current === controller) {
+          inlineSpeechRequestRef.current = null;
+        }
+        if (!controller.signal.aborted) playBrowserFallback();
+      }
+    })();
   }, [voiceOpen]);
+
+  useEffect(() => () => {
+    inlineSpeechGenerationRef.current += 1;
+    inlineSpeechRequestRef.current?.abort();
+    inlineSpeechPlaybackRef.current?.stop();
+    window.speechSynthesis?.cancel();
+  }, []);
 
   const submit = useCallback(async (override?: string, fromVoice = false) => {
     const prompt = (override ?? value).trim();
@@ -603,6 +681,11 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
             : message));
         } else if (event.type === "delta") {
           text += event.delta;
+          setMessages((current) => current.map((message) => message.id === userId + 1
+            ? { ...message, scenario: serverScenario, loading: false, text }
+            : message));
+        } else if (event.type === "replace") {
+          text = event.text;
           setMessages((current) => current.map((message) => message.id === userId + 1
             ? { ...message, scenario: serverScenario, loading: false, text }
             : message));

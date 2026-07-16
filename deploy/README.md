@@ -20,6 +20,8 @@ chmod 600 .env.production
 Renseigner au minimum :
 
 - `OPENAI_API_KEY` ;
+- `FISH_AUDIO_API_KEY` pour la voix de sortie OPS ;
+- `FISH_AUDIO_REFERENCE_ID` pour le modèle vocal Fish Audio choisi ;
 - `OPENCODE_SERVER_PASSWORD` avec un secret long et aléatoire ;
 - `OPENCODE_SESSION_SECRET` avec un autre secret d’au moins 64 octets.
 

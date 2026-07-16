@@ -17,6 +17,10 @@ import {
 } from "@openai/agents/realtime";
 import { OpsIcon } from "@/components/ops-icons";
 import type { OpsDocument } from "@/lib/ops-demo-data";
+import {
+  playStreamingAudioResponse,
+  type StreamingAudioPlayback,
+} from "@/lib/streaming-audio";
 
 export type VoiceModeState =
   | "idle"
@@ -294,8 +298,7 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
   const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
   const speechGenerationRef = useRef(0);
   const speechRequestRef = useRef<AbortController | null>(null);
-  const serverAudioRef = useRef<HTMLAudioElement | null>(null);
-  const serverAudioUrlRef = useRef<string | null>(null);
+  const serverAudioPlaybackRef = useRef<StreamingAudioPlayback | null>(null);
   const lastSpokenSignatureRef = useRef<string | number | null>(null);
 
   const updateState = useCallback(
@@ -311,17 +314,8 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
     speechGenerationRef.current += 1;
     speechRequestRef.current?.abort();
     speechRequestRef.current = null;
-    const serverAudio = serverAudioRef.current;
-    serverAudioRef.current = null;
-    if (serverAudio) {
-      serverAudio.onended = null;
-      serverAudio.onerror = null;
-      serverAudio.pause();
-      serverAudio.removeAttribute("src");
-      serverAudio.load();
-    }
-    if (serverAudioUrlRef.current) URL.revokeObjectURL(serverAudioUrlRef.current);
-    serverAudioUrlRef.current = null;
+    serverAudioPlaybackRef.current?.stop();
+    serverAudioPlaybackRef.current = null;
     if (speechWatchdogRef.current) clearTimeout(speechWatchdogRef.current);
     speechWatchdogRef.current = null;
     if (typeof window !== "undefined") window.speechSynthesis?.cancel();
@@ -1033,40 +1027,53 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
             signal: controller.signal,
           });
           if (!response.ok) throw new Error(`speech_${response.status}`);
-          const blob = await response.blob();
-          if (!blob.size) throw new Error("speech_empty");
-          if (generation !== speechGenerationRef.current || !openRef.current) return;
-
-          const url = URL.createObjectURL(blob);
-          serverAudioUrlRef.current = url;
-          const audio = new Audio(url);
-          serverAudioRef.current = audio;
-          audio.preload = "auto";
-          audio.onplay = () => {
+          const playback = await playStreamingAudioResponse(response, {
+            signal: controller.signal,
+            onPlay: () => {
+              if (generation === speechGenerationRef.current) updateState("speaking");
+            },
+            onEnded: (endedPlayback) => {
+              if (serverAudioPlaybackRef.current === endedPlayback) {
+                serverAudioPlaybackRef.current = null;
+              }
+              if (speechRequestRef.current === controller) {
+                speechRequestRef.current = null;
+              }
+              finish();
+            },
+            onError: (_error, failedPlayback) => {
+              if (serverAudioPlaybackRef.current === failedPlayback) {
+                serverAudioPlaybackRef.current = null;
+              }
+              if (speechRequestRef.current === controller) {
+                speechRequestRef.current = null;
+              }
+              if (
+                !controller.signal.aborted &&
+                generation === speechGenerationRef.current
+              ) {
+                playBrowserFallback();
+              }
+            },
+          });
+          if (
+            controller.signal.aborted ||
+            generation !== speechGenerationRef.current ||
+            !openRef.current
+          ) {
+            playback.stop();
+            return;
+          }
+          serverAudioPlaybackRef.current = playback;
+          if (playback.audio.paused === false) {
             if (generation === speechGenerationRef.current) updateState("speaking");
-          };
-          audio.onended = () => {
-            if (serverAudioRef.current === audio) serverAudioRef.current = null;
-            if (serverAudioUrlRef.current === url) {
-              URL.revokeObjectURL(url);
-              serverAudioUrlRef.current = null;
-            }
-            finish();
-          };
-          audio.onerror = () => {
-            if (serverAudioRef.current === audio) serverAudioRef.current = null;
-            if (serverAudioUrlRef.current === url) {
-              URL.revokeObjectURL(url);
-              serverAudioUrlRef.current = null;
-            }
-            if (generation === speechGenerationRef.current) playBrowserFallback();
-          };
-          await audio.play();
+          }
         } catch {
+          if (speechRequestRef.current === controller) {
+            speechRequestRef.current = null;
+          }
           if (controller.signal.aborted || generation !== speechGenerationRef.current) return;
           playBrowserFallback();
-        } finally {
-          if (speechRequestRef.current === controller) speechRequestRef.current = null;
         }
       })();
     },

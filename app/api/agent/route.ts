@@ -455,17 +455,22 @@ async function openCodeResponse(
       }
 
       try {
+        let streamedAnswer = "";
         const result = await adapter.runStructured({
           message: buildOpenCodeMessage(message, history),
           schema: documentRequested
             ? openCodeDocumentOutputSchema
             : openCodeOutputSchema,
           researchWithTools: researchRequired,
-          sessionId: session.session.id,
+          sessionHandle: session,
           sessionTitle: "Conversation OPS — Marie Delmas",
           system: OPEN_CODE_SYSTEM,
           signal: request.signal,
           timeoutMs: documentRequested ? 90_000 : undefined,
+          onAnswerDelta: (delta) => {
+            streamedAnswer += delta;
+            enqueue({ type: "delta", delta });
+          },
         });
         const scenario = await openCodeScenario(result.data);
         enqueue({
@@ -481,7 +486,12 @@ async function openCodeResponse(
         } else {
           enqueue({ type: "meta", scenario, mode: "opencode" });
         }
-        enqueue({ type: "delta", delta: result.data.answer });
+        if (result.data.answer.startsWith(streamedAnswer)) {
+          const remaining = result.data.answer.slice(streamedAnswer.length);
+          if (remaining) enqueue({ type: "delta", delta: remaining });
+        } else {
+          enqueue({ type: "replace", text: result.data.answer });
+        }
         enqueue({ type: "speech", text: result.data.speech });
         enqueue({ type: "done" });
       } catch (error) {

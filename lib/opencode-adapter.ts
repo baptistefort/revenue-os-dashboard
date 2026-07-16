@@ -12,6 +12,7 @@ import {
   OpenCodeOutputValidationError,
   validateOpenCodeStructuredOutput,
 } from "@/lib/opencode-output";
+import { StreamingJsonStringField } from "@/lib/streaming-json";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
 const DEFAULT_AGENT = "ops";
@@ -94,6 +95,7 @@ export type OpenCodeStructuredPrompt<TSchema extends z.ZodType> = {
   message: string;
   schema: TSchema;
   researchWithTools?: boolean;
+  sessionHandle?: OpenCodeSessionHandle;
   sessionId?: string;
   sessionTitle?: string;
   sessionMetadata?: Record<string, unknown>;
@@ -102,6 +104,7 @@ export type OpenCodeStructuredPrompt<TSchema extends z.ZodType> = {
   system?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  onAnswerDelta?: (delta: string) => void;
 };
 
 export type OpenCodeStructuredResult<TSchema extends z.ZodType> = {
@@ -630,6 +633,55 @@ export class OpenCodeAdapter {
     }
   }
 
+  private async subscribeToAnswerDeltas(
+    sessionId: string,
+    signal: AbortSignal,
+    onAnswerDelta: ((delta: string) => void) | undefined,
+  ) {
+    if (!onAnswerDelta) return null;
+
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal.reason);
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+
+    try {
+      const subscription = await this.client.event.subscribe(
+        this.location(),
+        { signal: controller.signal },
+      );
+      const parser = new StreamingJsonStringField("answer");
+      const finished = (async () => {
+        try {
+          for await (const event of subscription.stream) {
+            if (
+              event.type !== "message.part.delta"
+              || event.properties.sessionID !== sessionId
+              || event.properties.field !== "text"
+            ) {
+              continue;
+            }
+            const delta = parser.push(event.properties.delta);
+            if (delta) onAnswerDelta(delta);
+          }
+        } catch (error) {
+          if (!controller.signal.aborted) throw error;
+        }
+      })();
+
+      return {
+        stop: async () => {
+          controller.abort();
+          signal.removeEventListener("abort", abort);
+          await finished.catch(() => undefined);
+        },
+      };
+    } catch {
+      signal.removeEventListener("abort", abort);
+      return null;
+    }
+  }
+
   async runStructured<TSchema extends z.ZodType>(
     prompt: OpenCodeStructuredPrompt<TSchema>,
   ): Promise<OpenCodeStructuredResult<TSchema>> {
@@ -652,7 +704,7 @@ export class OpenCodeAdapter {
     let activeSessionId = cleanOptionalString(prompt.sessionId);
 
     try {
-      const handle = await this.ensureSessionWithSignal({
+      const handle = prompt.sessionHandle ?? await this.ensureSessionWithSignal({
         sessionId: activeSessionId,
         title: prompt.sessionTitle,
         metadata: prompt.sessionMetadata,
@@ -663,38 +715,6 @@ export class OpenCodeAdapter {
       const agent = cleanOptionalString(prompt.agent) ?? this.options.agent;
       const system = cleanOptionalString(prompt.system) ?? this.options.system;
 
-      if (prompt.researchWithTools !== false) {
-        const research = await this.client.session.prompt<true>({
-          sessionID: handle.session.id,
-          ...this.location(),
-          agent,
-          model: model ? { providerID: model.providerID, modelID: model.modelID } : undefined,
-          variant: model?.variant,
-          tools: this.tools,
-          format: { type: "text" },
-          system,
-          parts: [{
-            type: "text",
-            text: `${message}
-
-PHASE DE RECHERCHE UNIQUEMENT
-- Établis une seule fois les faits nécessaires avec les outils OPS.
-- Un résultat de recherche ou de relations contient déjà les faits complets : ne relis pas chaque identifiant séparément.
-- Ne lance jamais deux fois la même requête ou le même identifiant.
-- Maximum deux tours de recherche. Dès que les preuves suffisent, arrête les outils.
-- Termine cette phase par une note factuelle concise destinée à préparer la réponse finale.`,
-          }],
-        }, { signal: scope.signal, throwOnError: true });
-
-        if (research.data.info.error) {
-          throw new OpenCodeAdapterError(
-            "opencode_assistant_error",
-            `L’assistant OpenCode a interrompu la recherche : ${assistantErrorMessage(research.data.info.error)}`,
-            { cause: research.data.info.error },
-          );
-        }
-      }
-
       const outputSchema = z.toJSONSchema(prompt.schema, {
         target: "draft-07",
         io: "output",
@@ -702,30 +722,46 @@ PHASE DE RECHERCHE UNIQUEMENT
       const finalRequest = prompt.researchWithTools === false
         ? `${message}
 
-RÉPONSE FINALE JSON
-Retourne uniquement un objet JSON valide, sans Markdown ni texte autour.
-Respecte exactement ce schéma JSON :
-${JSON.stringify(outputSchema)}`
-        : `Produis maintenant la réponse finale à la demande précédente.
-Toutes les preuves utiles sont déjà dans la conversation : n'effectue plus aucune recherche.
-Retourne uniquement un objet JSON valide, sans Markdown ni texte autour.
-Respecte exactement ce schéma JSON :
-${JSON.stringify(outputSchema)}`;
+RÉPONSE DIRECTE
+- Réponds naturellement à cette demande sans effectuer de recherche.
+- Produis immédiatement la sortie structurée demandée.`
+        : `${message}
 
-      const response = await this.client.session.prompt<true>({
-        sessionID: handle.session.id,
-        ...this.location(),
-        agent,
-        model: model ? { providerID: model.providerID, modelID: model.modelID } : undefined,
-        variant: model?.variant,
-        tools: this.finalizationTools,
-        format: { type: "text" },
-        system,
-        parts: [{
-          type: "text",
-          text: finalRequest,
-        }],
-      }, { signal: scope.signal, throwOnError: true });
+RECHERCHE ET RÉPONSE EN UNE SEULE PASSE
+- Utilise les outils OPS uniquement pour établir les faits nécessaires.
+- Un résultat de recherche contient déjà les faits complets utiles : ne relis pas chaque identifiant.
+- Ne lance jamais deux fois la même requête ou le même identifiant.
+- Maximum deux tours de recherche et quatre appels d’outils.
+- Dès que les preuves suffisent, produis directement la sortie structurée finale.`;
+
+      const liveDeltas = await this.subscribeToAnswerDeltas(
+        handle.session.id,
+        scope.signal,
+        prompt.onAnswerDelta,
+      );
+      let response;
+      try {
+        response = await this.client.session.prompt<true>({
+          sessionID: handle.session.id,
+          ...this.location(),
+          agent,
+          model: model ? { providerID: model.providerID, modelID: model.modelID } : undefined,
+          variant: model?.variant,
+          tools: prompt.researchWithTools === false ? this.finalizationTools : this.tools,
+          format: {
+            type: "json_schema",
+            schema: outputSchema,
+            retryCount: this.options.structuredOutputRetries,
+          },
+          system,
+          parts: [{
+            type: "text",
+            text: finalRequest,
+          }],
+        }, { signal: scope.signal, throwOnError: true });
+      } finally {
+        await liveDeltas?.stop();
+      }
 
       const assistant = response.data.info;
       const text = extractText(response.data.parts);
