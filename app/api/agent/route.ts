@@ -400,6 +400,7 @@ async function openCodeResponse(
   conversationId: string | undefined,
 ) {
   if (!process.env.OPENCODE_BASE_URL) return null;
+  const requestStartedAt = performance.now();
 
   let adapter: OpenCodeAdapter;
   let session: Awaited<ReturnType<OpenCodeAdapter["ensureSession"]>>;
@@ -460,6 +461,8 @@ async function openCodeResponse(
         const memoryContext = researchRequired
           ? await buildOpsMemoryContext(message, history)
           : null;
+        const retrievalFinishedAt = performance.now();
+        let firstDeltaAt: number | undefined;
         let streamedAnswer = "";
         const result = await adapter.runStructured({
           message: [
@@ -476,6 +479,7 @@ async function openCodeResponse(
           signal: request.signal,
           timeoutMs: documentRequested ? 90_000 : undefined,
           onAnswerDelta: (delta) => {
+            firstDeltaAt ??= performance.now();
             streamedAnswer += delta;
             enqueue({ type: "delta", delta });
           },
@@ -502,6 +506,13 @@ async function openCodeResponse(
         }
         enqueue({ type: "speech", text: result.data.speech });
         enqueue({ type: "done" });
+        console.info(
+          `[OPS latency] retrieval=${Math.round(retrievalFinishedAt - requestStartedAt)}ms `
+          + `first_delta=${firstDeltaAt ? Math.round(firstDeltaAt - requestStartedAt) : -1}ms `
+          + `total=${Math.round(performance.now() - requestStartedAt)}ms `
+          + `memory=${memoryContext ? "preloaded" : researchRequired ? "tools" : "none"} `
+          + `document=${documentRequested ? "yes" : "no"}`,
+        );
       } catch (error) {
         const code = error instanceof OpenCodeAdapterError
           ? error.code

@@ -109,8 +109,9 @@ export async function buildOpsMemoryContext(
 
   const selected = new Map<string, ObsidianMemoryRecord>();
   const transcript = [message, ...history.slice(-6).map((turn) => turn.content)].join("\n");
+  const referencedIds = extractMemoryIds(transcript);
 
-  for (const id of extractMemoryIds(transcript)) {
+  for (const id of referencedIds) {
     addRecord(selected, findObsidianMemoryRecord(index, id));
   }
 
@@ -118,14 +119,17 @@ export async function buildOpsMemoryContext(
     for (const record of latestOverviewRecords(index)) addRecord(selected, record);
   }
 
-  for (const match of searchObsidianMemory(index, message, 6)) {
+  for (const match of searchObsidianMemory(index, message, referencedIds.length ? 2 : 6)) {
     addRecord(selected, match.record);
   }
 
   if (
+    referencedIds.length === 0
+    && (
     selected.size < 5
     || /^(?:continue|detaille|compare|fais|genere|produis|et pour)\b/i.test(
       normalizeMemoryQuery(message),
+    )
     )
   ) {
     for (const match of searchObsidianMemory(
