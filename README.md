@@ -53,7 +53,7 @@ La clé doit rester exclusivement dans `.env.local` ou dans les secrets Vercel :
 
 ```bash
 OPENAI_API_KEY=nouvelle_cle_non_exposee
-OPENAI_MODEL=gpt-5.6
+OPENAI_MODEL=gpt-5.4-mini
 ```
 
 La route serveur `/api/agent` utilise la Responses API avec streaming. Les questions de démonstration connues restent disponibles sans clé.

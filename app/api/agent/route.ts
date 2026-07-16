@@ -104,7 +104,7 @@ export async function POST(request: Request) {
   let stream: Awaited<ReturnType<typeof client.responses.create>>;
   try {
     stream = await client.responses.create({
-    model: process.env.OPENAI_MODEL ?? "gpt-5.6-terra",
+    model: process.env.OPENAI_MODEL ?? "gpt-5.4-mini",
     instructions: `Tu es OPS, le copilote de direction de l'entreprise fictive Atelier Beaumarchais. Tu disposes de sa mémoire opérationnelle et tu aides Marie Delmas à comprendre, décider, préparer et contrôler l'exécution.
 
 PRINCIPES DE RÉPONSE
