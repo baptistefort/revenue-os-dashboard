@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=780, height=1392">
+    <title>OPS · Conversation dirigeant mobile</title>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      :root {
+        --navy: #031635;
+        --blue: #2e5f9d;
+        --pale: #d5e3ff;
+        --ice: #edf6fc;
+        --green: #47725d;
+        --green-text: #365f4b;
+        --surface: #f4f5f6;
+        --off-white: #fbfcfa;
+        --navy-72: rgba(3, 22, 53, 0.72);
+        --navy-10: rgba(3, 22, 53, 0.1);
+        --navy-07: rgba(3, 22, 53, 0.07);
+        --blue-12: rgba(46, 95, 157, 0.12);
+        --green-14: rgba(71, 114, 93, 0.14);
+      }
+
+      * { box-sizing: border-box; }
+      html,
+      body {
+        width: 780px;
+        height: 1392px;
+        margin: 0;
+        overflow: hidden;
+        color: var(--navy);
+        background: var(--off-white);
+        font-family: Montserrat, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: geometricPrecision;
+      }
+
+      button { font: inherit; }
+      #ops-dashboard-mobile { position: relative; width: 780px; height: 1392px; overflow: hidden; }
+      .clip { position: absolute; inset: 0; width: 100%; height: 100%; }
+      .canvas-fill { position: absolute; inset: 0; overflow: hidden; background: var(--off-white); }
+
+      .app-shell {
+        position: absolute;
+        inset: 0;
+        opacity: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: 68px 1fr;
+        overflow: hidden;
+        background: var(--surface);
+        transform-origin: 50% 50%;
+        will-change: transform, opacity;
+      }
+
+      .topbar {
+        padding: 0 24px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid var(--navy-07);
+        background: var(--off-white);
+      }
+
+      .brand { display: flex; align-items: center; font-size: 28px; font-weight: 700; letter-spacing: -0.065em; }
+      .brand-mark { width: 8px; height: 8px; margin: 0 0 13px 3px; border: 2px solid var(--blue); border-radius: 50%; }
+      .topbar-context { color: var(--navy-72); font: 700 8px/1 Space Mono, monospace; letter-spacing: 0.09em; text-transform: uppercase; }
+      .topbar-avatar { width: 36px; height: 36px; display: grid; place-items: center; border: 0; border-radius: 50%; color: var(--off-white); background: var(--navy); font-size: 10px; font-weight: 700; }
+
+      .dashboard-content {
+        min-height: 0;
+        padding: 20px 22px 22px;
+        display: grid;
+        grid-template-rows: 78px 82px minmax(0, 1fr);
+        gap: 14px;
+      }
+
+      .heading-row { display: flex; align-items: center; justify-content: space-between; }
+      .heading-copy span { color: var(--navy-72); font-size: 10px; font-weight: 700; }
+      h1 { margin: 8px 0 0; font-size: 35px; line-height: 1; letter-spacing: -0.055em; }
+      .memory-live {
+        padding: 9px 11px;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--green-text);
+        border: 1px solid rgba(71, 114, 93, 0.22);
+        border-radius: 999px;
+        background: var(--green-14);
+        font: 700 8px/1 Space Mono, monospace;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+      .live-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: var(--green); }
+
+      .kpi-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+      .kpi-card {
+        position: relative;
+        overflow: hidden;
+        padding: 13px 15px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border: 1px solid var(--navy-07);
+        border-radius: 14px;
+        background: var(--off-white);
+      }
+      .kpi-label { color: var(--navy-72); font-size: 9px; font-weight: 700; }
+      .kpi-value { font-size: 23px; line-height: 1; font-weight: 700; letter-spacing: -0.04em; font-variant-numeric: tabular-nums; }
+      .kpi-delta { margin-left: 8px; color: var(--green-text); font: 700 7px/1 Space Mono, monospace; }
+      .kpi-delta.neutral { color: var(--navy-72); }
+      .kpi-fill { position: absolute; right: 0; bottom: 0; left: 0; height: 3px; background: var(--blue); transform-origin: 0 50%; }
+      .kpi-fill-pipeline { transform: scaleX(0.64); }
+      .kpi-fill-margin { transform: scaleX(0.38); }
+
+      .conversation-card {
+        min-height: 0;
+        overflow: hidden;
+        display: grid;
+        grid-template-rows: 64px 1fr;
+        border: 1px solid var(--navy-07);
+        border-radius: 18px;
+        background: var(--off-white);
+        box-shadow: 0 12px 28px rgba(3, 22, 53, 0.05);
+      }
+
+      .conversation-head {
+        padding: 0 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid var(--navy-07);
+      }
+
+      .agent-title { display: flex; align-items: center; gap: 11px; font-size: 13px; font-weight: 700; }
+      .agent-glyph,
+      .agent-mini {
+        display: grid;
+        place-items: center;
+        color: var(--off-white);
+        border-radius: 50%;
+        background: var(--blue);
+        font: 700 8px/1 Space Mono, monospace;
+      }
+      .agent-glyph { width: 34px; height: 34px; box-shadow: 0 0 0 6px var(--blue-12); }
+      .conversation-state { display: flex; align-items: center; gap: 7px; color: var(--green-text); font: 700 8px/1 Space Mono, monospace; letter-spacing: 0.07em; text-transform: uppercase; }
+
+      .thread {
+        position: relative;
+        min-height: 0;
+        padding: 20px 18px 60px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        overflow: hidden;
+        background: var(--off-white);
+      }
+
+      .message { display: flex; align-items: flex-start; gap: 10px; max-width: 94%; opacity: 0; will-change: transform, opacity; }
+      .message.user { align-self: flex-end; justify-content: flex-end; max-width: 84%; }
+      .message.ai { align-self: flex-start; }
+      .agent-mini { width: 29px; height: 29px; flex: 0 0 auto; margin-top: 4px; font-size: 7px; }
+      .bubble {
+        padding: 11px 13px;
+        border-radius: 14px;
+        font-size: 14px;
+        line-height: 1.4;
+        font-weight: 700;
+      }
+      .user .bubble { color: var(--off-white); border-bottom-right-radius: 4px; background: var(--navy); }
+      .ai .bubble { border: 1px solid var(--navy-07); border-bottom-left-radius: 4px; background: var(--surface); }
+      .bubble-copy { display: block; }
+      .bubble-chips { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+      .bubble-chip {
+        padding: 5px 7px;
+        color: var(--navy);
+        border-radius: 6px;
+        background: var(--pale);
+        font: 700 8px/1 Space Mono, monospace;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .bubble-chip.green { color: var(--green-text); background: var(--green-14); }
+
+      .typing-indicator {
+        position: absolute;
+        z-index: 5;
+        left: 58px;
+        padding: 8px 11px;
+        display: flex;
+        gap: 4px;
+        border: 1px solid var(--navy-07);
+        border-radius: 11px;
+        background: var(--surface);
+        box-shadow: 0 8px 18px var(--navy-07);
+        pointer-events: none;
+        opacity: 0;
+      }
+      .typing-indicator span { width: 6px; height: 6px; border-radius: 50%; background: var(--blue); }
+      #m-typing-1 { top: 66px; }
+      #m-typing-2 { top: 226px; }
+      #m-typing-3 { top: 388px; }
+      #m-typing-4 { top: 550px; }
+
+      .final-state {
+        position: absolute;
+        right: 18px;
+        bottom: 17px;
+        z-index: 6;
+        padding: 9px 11px;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--green-text);
+        border: 1px solid rgba(71, 114, 93, 0.22);
+        border-radius: 999px;
+        background: var(--off-white);
+        box-shadow: 0 8px 20px var(--navy-07);
+        font: 700 8px/1 Space Mono, monospace;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        opacity: 0;
+      }
+      .final-state::before { width: 7px; height: 7px; border-radius: 50%; background: var(--green); content: ""; }
+      .memory-progress { position: absolute; z-index: 6; right: 18px; bottom: 9px; width: 186px; height: 2px; opacity: 0; background: var(--green); transform-origin: 0 50%; }
+
+    </style>
+  </head>
+  <body>
+    <div
+      id="ops-dashboard-mobile"
+      data-composition-id="ops-dashboard-mobile"
+      data-start="0"
+      data-width="780"
+      data-height="1392"
+      data-duration="20"
+      data-fps="30"
+    >
+      <section id="ops-dashboard-mobile-scene" class="clip" data-start="0" data-duration="20" data-track-index="1">
+        <div class="canvas-fill">
+          <main class="app-shell">
+            <header class="topbar"><div class="brand">OPS<span class="brand-mark"></span></div><span class="topbar-context">Mon agent · aujourd'hui</span><button type="button" class="topbar-avatar">M</button></header>
+
+            <div class="dashboard-content">
+              <div class="heading-row">
+                <div class="heading-copy"><span>Votre entreprise, en direct.</span><h1>Bonjour Marie.</h1></div>
+                <div class="memory-live"><span class="live-dot"></span>En direct</div>
+              </div>
+
+              <div class="kpi-grid">
+                <article class="kpi-card"><span class="kpi-label">Pipeline</span><div><strong class="kpi-value">184 K€</strong><span class="kpi-delta">+12 %</span></div><span class="kpi-fill kpi-fill-pipeline"></span></article>
+                <article class="kpi-card"><span class="kpi-label">Marge</span><div><strong class="kpi-value">29 %</strong><span class="kpi-delta neutral">−2 pts</span></div><span class="kpi-fill kpi-fill-margin"></span></article>
+              </div>
+
+              <section class="conversation-card">
+                <header class="conversation-head">
+                  <div class="agent-title"><span class="agent-glyph">O°</span>Vous parlez à OPS</div>
+                  <div class="conversation-state"><span class="live-dot"></span>Agent IA</div>
+                </header>
+
+                <div class="thread">
+                  <div id="m-msg-u1" class="message user"><div class="bubble"><span class="bubble-copy">Qui doit être relancé aujourd'hui ?</span></div></div>
+                  <div id="m-typing-1" class="typing-indicator"><span></span><span></span><span></span></div>
+                  <div id="m-msg-a1" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">3 dossiers : Atelier Sud (12,4 k€ · 28 j), Nova (7,8 k€ · 12 j) et Maison Cobalt (4,1 k€ · 8 j). Je prépare les relances ?</span><span class="bubble-chips"><span class="bubble-chip">CRM</span><span class="bubble-chip">Factures</span></span></div></div>
+
+                  <div id="m-msg-u2" class="message user"><div class="bubble"><span class="bubble-copy">Oui. Doux pour Atelier Sud, ferme pour Nova.</span></div></div>
+                  <div id="m-typing-2" class="typing-indicator"><span></span><span></span><span></span></div>
+                  <div id="m-msg-a2" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">Relances prêtes. 2 validations requises. Maison Cobalt attendra lundi.</span><span class="bubble-chips"><span class="bubble-chip">2 brouillons prêts</span></span></div></div>
+
+                  <div id="m-msg-u3" class="message user"><div class="bubble"><span class="bubble-copy">Pourquoi la marge atelier baisse ?</span></div></div>
+                  <div id="m-typing-3" class="typing-indicator"><span></span><span></span><span></span></div>
+                  <div id="m-msg-a3" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">−2,1 pts cette semaine. Le chantier Rivoli concentre 82 % de l'écart : 14 h non facturées.</span><span class="bubble-chips"><span class="bubble-chip">PROJET-241</span><span class="bubble-chip">TEMPS-86</span></span></div></div>
+
+                  <div id="m-msg-u4" class="message user"><div class="bubble"><span class="bubble-copy">Corrige et fais-moi un brief à 17 h.</span></div></div>
+                  <div id="m-typing-4" class="typing-indicator"><span></span><span></span><span></span></div>
+                  <div id="m-msg-a4" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">3 tâches assignées. Brief programmé à 17 h. Aucun message client ne part sans votre validation.</span><span class="bubble-chips"><span class="bubble-chip green">3 tâches</span><span class="bubble-chip green">Brief · 17:00</span></span></div></div>
+
+                  <div class="memory-progress"></div>
+                  <div class="final-state">Mémoire synchronisée · 8 messages</div>
+                </div>
+              </section>
+            </div>
+          </main>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+
+      const tl = gsap.timeline({ paused: true });
+
+      function showTyping(id, start, end) {
+        tl.fromTo(id, { scale: 0.94, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.2, ease: "power3.out" }, start);
+        tl.to(id, { scale: 0.97, opacity: 0, duration: 0.16, ease: "power2.in" }, end);
+      }
+
+      function showMessage(id, at, direction, ease) {
+        tl.fromTo(id, { x: direction, y: 7, scale: 0.988, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1, duration: 0.38, ease }, at);
+        tl.fromTo(id + " .bubble-copy", { x: direction * 0.18, opacity: 0 }, { x: 0, opacity: 1, duration: 0.26, ease: "power2.out" }, at + 0.1);
+        const chips = id + " .bubble-chip";
+        if (document.querySelector(chips)) tl.fromTo(chips, { scale: 0.92, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.22, stagger: 0.05, ease: "circ.out" }, at + 0.27);
+      }
+
+      showMessage("#m-msg-u1", 0.18, 20, "power4.out");
+      showTyping("#m-typing-1", 0.72, 0.98);
+      showMessage("#m-msg-a1", 1.12, -20, "expo.out");
+
+      showMessage("#m-msg-u2", 3.4, 22, "power3.out");
+      showTyping("#m-typing-2", 3.76, 4.1);
+      showMessage("#m-msg-a2", 4.25, -18, "circ.out");
+
+      showMessage("#m-msg-u3", 6.0, 20, "power4.out");
+      showTyping("#m-typing-3", 6.36, 6.75);
+      showMessage("#m-msg-a3", 6.9, -20, "expo.out");
+
+      showMessage("#m-msg-u4", 8.7, 22, "power3.out");
+      showTyping("#m-typing-4", 9.06, 9.48);
+      showMessage("#m-msg-a4", 9.65, -18, "circ.out");
+
+      tl.fromTo(".final-state", { x: 10, opacity: 0 }, { x: 0, opacity: 1, duration: 0.44, ease: "power4.out" }, 11.0);
+      tl.fromTo(".memory-progress", { scaleX: 0.08, opacity: 0 }, { scaleX: 1, opacity: 1, duration: 0.85, ease: "expo.out" }, 11.0);
+      tl.to(
+        ".thread > .message, .thread > .typing-indicator, .thread > .memory-progress, .thread > .final-state",
+        { opacity: 0, duration: 0.75, ease: "sine.inOut" },
+        19.25
+      );
+
+      if (Math.abs(tl.duration() - 20) > 0.001) throw new Error("OPS mobile timeline must be exactly 20 seconds");
+
+      window.__timelines["ops-dashboard-mobile"] = tl;
+
+      function playPreview() { tl.pause(0); tl.play(); }
+      if (new URLSearchParams(window.location.search).get("autoplay") === "1") playPreview();
+      window.addEventListener("message", (event) => {
+        const command = typeof event.data === "string" ? event.data : event.data && event.data.type;
+        if (command === "play" || command === "ops-dashboard:play") playPreview();
+      });
+    </script>
+  </body>
+</html>
