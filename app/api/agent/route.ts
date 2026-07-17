@@ -150,6 +150,7 @@ SORTIE STRUCTURÉE
 - actions : les actions bornées ci-dessus, ou [] si aucune action n'est nécessaire.
 - document : toujours null. La couche OPS crée elle-même le fichier après ta réponse.
 - Lorsqu'un PDF, rapport ou document est demandé, rédige dans answer un contenu complet et directement exploitable : titre, résumé exécutif, faits, écarts ou risques, plan d'action, responsables, horizons, indicateurs et décision proposée selon les preuves disponibles.
+- Lorsqu'un livrable prolonge une analyse déjà affichée, recopie exactement ses périodes, chiffres, signes et écarts. N'utilise jamais une valeur du jour courant pour remplacer la valeur de la veille. Toute extension du livrable doit préserver la table factuelle antérieure sans la recalculer.
 - Ne dis jamais que tu ne peux pas créer le fichier : OPS rend et archive automatiquement le PDF à partir de ta réponse sourcée.`;
 
 function cleanText(value: unknown, maxLength: number) {

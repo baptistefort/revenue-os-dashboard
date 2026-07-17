@@ -76,6 +76,34 @@ test("le transcript UI est réinjecté comme contexte autoritatif à chaque tour
   assert.match(prompt, /DEMANDE ACTUELLE DE MARIE\s+Résume ce document/);
 });
 
+test("un livrable PDF conserve intégralement les chiffres déjà établis", () => {
+  const priorAnswer = [
+    "Le SEO progresse.",
+    "",
+    "| Indicateur | 15 juillet 2026 | 16 juillet 2026 | Écart |",
+    "| --- | ---: | ---: | ---: |",
+    "| Position moyenne | 12,1 | 11,7 | -0,4 (amélioration) |",
+    "| Impressions | 4 210 | 4 790 | +580 |",
+    "",
+    "Priorité : maintenir la position sous 11,5.",
+    "Sources citées : SEO-DAY-20260715-AVERAGE_POSITION, SEO-DAY-20260716-AVERAGE_POSITION.",
+  ].join("\n");
+  const history: AgentHistoryTurn[] = [
+    { role: "user", content: "Compare le SEO du 16 juillet à la veille." },
+    { role: "assistant", content: priorAnswer },
+  ];
+
+  const prompt = buildOpenCodeMessage(
+    "Génère ce bilan en PDF avec un résumé Google Ads.",
+    history,
+  );
+
+  assert.match(prompt, /CONTINUITÉ FACTUELLE OBLIGATOIRE DU LIVRABLE/);
+  assert.match(prompt, /\| Position moyenne \| 12,1 \| 11,7 \| -0,4 \(amélioration\) \|/);
+  assert.doesNotMatch(prompt.split("DERNIÈRE RÉPONSE OPS À TRANSFORMER")[1], /Sources citées\s*:/);
+  assert.match(prompt, /Conserve exactement ses périodes, valeurs, signes et écarts/);
+});
+
 test("sans historique, le message OpenCode reste direct", () => {
   assert.equal(buildOpenCodeMessage("Bonjour", []), "Bonjour");
 });
