@@ -1,5 +1,5 @@
-import { OpsApp } from "@/components/ops-app";
+import { RevenueOSDashboard } from "@/components/revenue-os-dashboard";
 
 export default function Home() {
-  return <OpsApp />;
+  return <RevenueOSDashboard />;
 }
