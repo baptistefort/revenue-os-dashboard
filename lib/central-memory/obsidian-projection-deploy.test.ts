@@ -21,7 +21,10 @@ test("the projection tool is isolated but can reach PostgreSQL and write the vau
   assert.match(service, /user: "1001:1002"/);
   assert.match(service, /read_only: true/);
   assert.match(service, /database-migrate:/);
-  assert.match(service, /OBSIDIAN_VAULT_PATH: \/data\/obsidian/);
+  assert.match(
+    service,
+    /OBSIDIAN_VAULT_PATH: ["']?\/data\/obsidian\/OPS — Atelier Beaumarchais["']?/,
+  );
   assert.match(service, /\.\/data\/obsidian:\/data\/obsidian(?:\s|$)/);
   assert.match(service, /- ops_private/);
   assert.match(service, /cap_drop:\s*\n\s*- ALL/);
@@ -39,4 +42,3 @@ test("deploy backs up, seeds, projects, normalizes permissions, then cuts over",
   assert.ok(projection < cutover);
   assert.match(deploy.slice(projection, cutover), /normalize_writable_data_permissions/);
 });
-

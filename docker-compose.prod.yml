@@ -293,7 +293,10 @@ services:
       - .env.production
     environment:
       OPS_ORGANIZATION_SLUG: ${OPS_ORGANIZATION_SLUG:-atelier-beaumarchais}
-      OBSIDIAN_VAULT_PATH: /data/obsidian
+      # Keep the PostgreSQL projection inside the same business vault as the
+      # curated notes. Writing /data/obsidian/Central beside that vault would
+      # pass the first release but be rejected as a mixed layout on the next.
+      OBSIDIAN_VAULT_PATH: "/data/obsidian/OPS — Atelier Beaumarchais"
     command:
       - ./node_modules/.bin/tsx
       - scripts/project-central-memory.ts
