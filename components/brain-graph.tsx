@@ -163,6 +163,16 @@ function simNode(value: string | number | SimNode) {
   return typeof value === "object" ? value : null;
 }
 
+function graphFingerprint(nodes: BrainNode[], edges: BrainEdge[]) {
+  const nodeParts = nodes
+    .map((node) => `${node.id}:${node.type}:${node.label}:${node.summary}:${node.size}`)
+    .sort();
+  const edgeParts = edges
+    .map((edge) => `${edge.from}:${edge.to}:${edge.type}`)
+    .sort();
+  return `${nodeParts.join("|")}::${edgeParts.join("|")}`;
+}
+
 export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
   const [nodes, setNodes] = useState<BrainNode[]>(demoNodes);
   const [edges, setEdges] = useState<BrainEdge[]>(demoEdges);
@@ -186,24 +196,75 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
   const selectedRef = useRef<string | null>(null);
   const hoveredRef = useRef<string | null>(null);
   const paintRef = useRef<() => void>(() => undefined);
+  const graphRequestRef = useRef<AbortController | null>(null);
+  const graphFingerprintRef = useRef("");
 
   selectedRef.current = selected;
   hoveredRef.current = hovered;
 
-  useEffect(() => {
-    let active = true;
-    fetch("/api/vault", { cache: "no-store" })
-      .then((response) => response.ok ? response.json() as Promise<GraphPayload> : null)
-      .then((payload) => {
-        if (!active || !payload?.available || !payload.nodes?.length || !payload.edges?.length) return;
+  const refreshGraph = useCallback(async () => {
+    graphRequestRef.current?.abort();
+    const controller = new AbortController();
+    graphRequestRef.current = controller;
+
+    try {
+      const response = await fetch("/api/vault", {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) return;
+      const payload = await response.json() as GraphPayload;
+      if (
+        controller.signal.aborted
+        || !payload.available
+        || !payload.nodes?.length
+        || !payload.edges?.length
+      ) return;
+
+      const nextFingerprint = graphFingerprint(payload.nodes, payload.edges);
+      if (nextFingerprint !== graphFingerprintRef.current) {
+        graphFingerprintRef.current = nextFingerprint;
         setNodes(payload.nodes);
         setEdges(payload.edges);
-        setSelected(null);
-        setLiveSource(payload.source === "obsidian" ? "Obsidian · en direct" : "Démo Obsidian");
-      })
-      .catch(() => undefined);
-    return () => { active = false; };
+        setSelected((current) => (
+          current && payload.nodes?.some((node) => node.id === current)
+            ? current
+            : null
+        ));
+      }
+      setLiveSource(payload.source === "obsidian" ? "Obsidian · en direct" : "Démo Obsidian");
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        // Le graphe déjà affiché reste disponible si la synchronisation échoue.
+      }
+    } finally {
+      if (graphRequestRef.current === controller) graphRequestRef.current = null;
+    }
   }, []);
+
+  useEffect(() => {
+    const handleRecordCreated = () => {
+      void refreshGraph();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") void refreshGraph();
+    };
+
+    void refreshGraph();
+    document.addEventListener("ops-record-created", handleRecordCreated);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    const polling = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshGraph();
+    }, 20_000);
+
+    return () => {
+      window.clearInterval(polling);
+      document.removeEventListener("ops-record-created", handleRecordCreated);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      graphRequestRef.current?.abort();
+      graphRequestRef.current = null;
+    };
+  }, [refreshGraph]);
 
   const degreeMap = useMemo(() => {
     const result = new Map<string, number>();
@@ -701,7 +762,7 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
                 const target = nodesRef.current.find((node) => node.id === selectedNode.id);
                 if (target) centerNode(target, 2.2);
               }}><OpsIcon name="target" size={15} /> Centrer</button>
-              <button className="dark" onClick={() => onAsk("Explique-moi tout ce qui est important sur " + selectedNode.label)}><OpsIcon name="spark" size={15} /> Demander à OPS</button>
+              <button className="dark" onClick={() => onAsk(`Ouvre la source ${selectedNode.id} (${selectedNode.label}), cite ses faits clés, ses relations et ce qu'elle change pour la décision.`)}><OpsIcon name="spark" size={15} /> Demander à OPS</button>
             </footer>
           </aside>
         )}

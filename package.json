@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "tsc --noEmit",
-    "test": "tsx --test lib/*.test.ts"
+    "test": "tsx --test lib/*.test.ts",
+    "memory:lint": "node scripts/lint-obsidian.mjs"
   },
   "dependencies": {
     "@openai/agents": "^0.13.4",
@@ -21,6 +22,7 @@
     "pdf-lib": "^1.17.1",
     "react": "19.2.0",
     "react-dom": "19.2.0",
+    "unpdf": "^1.6.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {

@@ -239,6 +239,7 @@ function cleanForSpeech(text: string) {
   return text
     .replace(/```[\s\S]*?```/g, "")
     .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1")
+    .replace(/\[(?:[A-ZÀ-ÖØ-Þ0-9]+(?:-[A-ZÀ-ÖØ-Þ0-9]+)+)\]/g, "")
     .replace(/[*_#>`~]/g, "")
     .replace(/\bVAL-(\d+)\b/g, (_match, number: string) => `validation numéro ${Number(number)}`)
     .replace(/\bRULE-(\d+)\b/g, "la règle interne")
@@ -269,6 +270,7 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
     autoListenAfterResponse = true,
     assistantName = "OPS",
     onStateChange,
+    openDocuments,
   },
   ref,
 ) {
@@ -300,6 +302,7 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
   const speechRequestRef = useRef<AbortController | null>(null);
   const serverAudioPlaybackRef = useRef<StreamingAudioPlayback | null>(null);
   const lastSpokenSignatureRef = useRef<string | number | null>(null);
+  const assistantTranscriptBufferRef = useRef("");
 
   const updateState = useCallback(
     (nextState: VoiceModeState) => {
@@ -847,6 +850,7 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
           const data = event as TransportEvent & Record<string, unknown>;
           if (data.type === "input_audio_buffer.speech_started") {
             setTranscript("");
+            assistantTranscriptBufferRef.current = "";
             setAssistantTranscript("");
             updateState("listening");
           } else if (data.type === "input_audio_buffer.speech_stopped") {
@@ -862,7 +866,8 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
             if (itemId) submittedRealtimeItemIdsRef.current.add(itemId);
             void submitText(finalTranscript, true);
           } else if ((data.type === "response.output_audio_transcript.delta" || data.type === "response.audio_transcript.delta") && typeof data.delta === "string") {
-            setAssistantTranscript((current) => `${current}${data.delta}`);
+            assistantTranscriptBufferRef.current += data.delta;
+            setAssistantTranscript(cleanForSpeech(assistantTranscriptBufferRef.current));
           }
         });
         session.on("audio_start", () => {
@@ -894,7 +899,20 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
           }
         });
 
-        await session.connect({ apiKey: clientSecret, model: "gpt-realtime-2.1" });
+        let connectionTimeout: ReturnType<typeof setTimeout> | null = null;
+        try {
+          await Promise.race([
+            session.connect({ apiKey: clientSecret, model: "gpt-realtime-2.1" }),
+            new Promise<never>((_resolve, reject) => {
+              connectionTimeout = setTimeout(
+                () => reject(new Error("realtime_connection_timeout")),
+                8_000,
+              );
+            }),
+          ]);
+        } finally {
+          if (connectionTimeout) clearTimeout(connectionTimeout);
+        }
         if (generation !== connectionGenerationRef.current || !openRef.current) {
           session.close();
           return;
@@ -942,7 +960,8 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
   const speak = useCallback(
     (rawText: string) => {
       if (typeof window === "undefined" || !rawText.trim()) return;
-      setAssistantTranscript(cleanForSpeech(rawText));
+      assistantTranscriptBufferRef.current = cleanForSpeech(rawText);
+      setAssistantTranscript(assistantTranscriptBufferRef.current);
 
       realtimeSessionRef.current?.interrupt();
       if (backendRef.current === "realtime") realtimeSessionRef.current?.mute(true);
@@ -1200,11 +1219,21 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
     }
   };
 
+  const handleAddElement = useCallback(() => {
+    if (!openDocuments) {
+      setErrorDetail("L’ajout de document n’est pas disponible dans cette vue.");
+      return;
+    }
+    close();
+    openDocuments();
+  }, [close, openDocuments]);
+
   if (!open) return null;
 
   const copy = statusCopy[voiceState];
   const isListening = voiceState === "listening";
   const isSpeaking = voiceState === "speaking";
+  const hasLongAssistantResponse = assistantTranscript.length > 720;
 
   return (
     <section
@@ -1224,7 +1253,7 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
         </button>
       </header>
 
-      <div className="voice-mode__stage">
+      <div className={`voice-mode__stage${assistantTranscript ? " voice-mode__stage--has-response" : ""}${hasLongAssistantResponse ? " voice-mode__stage--long-response" : ""}`}>
         <div aria-hidden="true" className="voice-mode__orb-shell">
           <div className="voice-mode__orb" />
           <div className="voice-mode__orb-glow" />
@@ -1239,23 +1268,37 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
           <p>{copy.eyebrow}</p>
           <h2>{copy.title}</h2>
           <span>{errorDetail || copy.detail}</span>
-          {transcript ? (
-            <blockquote>
-              <small>{voiceState === "thinking" ? "Votre demande" : "Transcription"}</small>
-              {transcript}
-            </blockquote>
-          ) : null}
-          {assistantTranscript ? (
-            <blockquote className="voice-mode__assistant-transcript">
-              <small>{assistantName}</small>
-              {assistantTranscript}
-            </blockquote>
+          {transcript || assistantTranscript ? (
+            <div
+              aria-label="Transcription de la conversation"
+              className="voice-mode__transcripts"
+              tabIndex={0}
+            >
+              {transcript ? (
+                <blockquote>
+                  <small>{voiceState === "thinking" ? "Votre demande" : "Transcription"}</small>
+                  {transcript}
+                </blockquote>
+              ) : null}
+              {assistantTranscript ? (
+                <blockquote className="voice-mode__assistant-transcript">
+                  <small>{assistantName}</small>
+                  {assistantTranscript}
+                </blockquote>
+              ) : null}
+            </div>
           ) : null}
         </div>
       </div>
 
       <form className="voice-mode__dock" onSubmit={handleSubmit}>
-        <button aria-label="Ajouter un élément" className="voice-mode__dock-button" type="button">
+        <button
+          aria-label="Ajouter un document"
+          className="voice-mode__dock-button"
+          onClick={handleAddElement}
+          title="Ajouter un document"
+          type="button"
+        >
           <OpsIcon name="plus" size={22} />
         </button>
         <input
@@ -1362,19 +1405,42 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
           display: flex;
           flex-direction: column;
           align-items: center;
-          justify-content: center;
+          justify-content: safe center;
           min-height: 0;
           padding: 0 24px 56px;
+          overflow-x: hidden;
+          overflow-y: auto;
+          overscroll-behavior: contain;
+          scroll-padding-block: 32px;
+          scrollbar-width: none;
           text-align: center;
+        }
+
+        .voice-mode__stage::-webkit-scrollbar {
+          display: none;
         }
 
         .voice-mode__orb-shell {
           position: relative;
           display: grid;
           place-items: center;
+          flex: 0 0 auto;
           width: clamp(190px, 20vw, 286px);
           aspect-ratio: 1;
           margin-bottom: clamp(34px, 5vh, 64px);
+          transition:
+            width 260ms ease,
+            margin 260ms ease;
+        }
+
+        .voice-mode__stage--has-response .voice-mode__orb-shell {
+          width: clamp(156px, 16vw, 224px);
+          margin-bottom: clamp(24px, 3.2vh, 42px);
+        }
+
+        .voice-mode__stage--long-response .voice-mode__orb-shell {
+          width: clamp(138px, 14vw, 190px);
+          margin-bottom: clamp(18px, 2.4vh, 30px);
         }
 
         .voice-mode__orb,
@@ -1444,7 +1510,10 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
         }
 
         .voice-mode__copy {
+          flex: 0 0 auto;
+          min-width: 0;
           width: min(680px, 90vw);
+          max-width: calc(100vw - 48px);
         }
 
         .voice-mode__copy > p {
@@ -1470,18 +1539,57 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
           line-height: 1.5;
         }
 
-        .voice-mode__copy blockquote {
-          width: fit-content;
-          max-width: min(620px, 84vw);
+        .voice-mode__transcripts {
+          box-sizing: border-box;
+          width: min(620px, 84vw);
+          max-width: 100%;
+          max-height: min(34vh, 360px);
           margin: 28px auto 0;
+          padding: 0 5px 5px;
+          overflow-x: clip;
+          overflow-y: auto;
+          overscroll-behavior: contain;
+          scroll-behavior: smooth;
+          scrollbar-color: rgba(17, 19, 23, 0.2) transparent;
+          scrollbar-width: thin;
+          outline: none;
+        }
+
+        .voice-mode__transcripts:focus-visible {
+          border-radius: 18px;
+          box-shadow: 0 0 0 3px rgba(108, 114, 242, 0.15);
+        }
+
+        .voice-mode__transcripts::-webkit-scrollbar {
+          width: 5px;
+        }
+
+        .voice-mode__transcripts::-webkit-scrollbar-thumb {
+          background: rgba(17, 19, 23, 0.18);
+          border-radius: 999px;
+        }
+
+        .voice-mode__copy blockquote {
+          box-sizing: border-box;
+          width: fit-content;
+          max-width: 100%;
+          margin: 0 auto;
           padding: 13px 18px;
+          overflow: visible;
+          overflow-wrap: anywhere;
           color: #33363c;
           background: rgba(248, 248, 247, 0.84);
           border: 1px solid var(--voice-line);
           border-radius: 16px;
           font-size: 14px;
           line-height: 1.5;
+          white-space: normal;
+          word-break: break-word;
           backdrop-filter: blur(16px);
+        }
+
+        .voice-mode__copy blockquote + blockquote {
+          margin-top: 12px;
         }
 
         .voice-mode__copy blockquote small {
@@ -1495,6 +1603,7 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
         }
 
         .voice-mode__copy .voice-mode__assistant-transcript {
+          width: 100%;
           color: #fff;
           background: #17191d;
           border-color: transparent;
@@ -1631,12 +1740,30 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
           }
 
           .voice-mode__stage {
+            justify-content: safe center;
+            padding-top: 12px;
             padding-bottom: 30px;
           }
 
           .voice-mode__orb-shell {
             width: 184px;
             margin-bottom: 36px;
+          }
+
+          .voice-mode__stage--has-response .voice-mode__orb-shell {
+            width: 142px;
+            margin-bottom: 24px;
+          }
+
+          .voice-mode__stage--long-response .voice-mode__orb-shell {
+            width: 122px;
+            margin-bottom: 18px;
+          }
+
+          .voice-mode__transcripts {
+            max-width: calc(100vw - 40px);
+            max-height: min(32vh, 260px);
+            margin-top: 18px;
           }
 
           .voice-mode__dock {
@@ -1646,6 +1773,39 @@ export const VoiceMode = forwardRef<VoiceModeHandle, VoiceModeProps>(function Vo
           .voice-mode__dock-button {
             width: 42px;
             height: 42px;
+          }
+        }
+
+        @media (max-height: 760px) {
+          .voice-mode__header {
+            padding-top: 18px;
+            padding-bottom: 12px;
+          }
+
+          .voice-mode__stage {
+            padding-bottom: 20px;
+          }
+
+          .voice-mode__stage--has-response .voice-mode__orb-shell {
+            width: clamp(112px, 14vh, 154px);
+            margin-bottom: 16px;
+          }
+
+          .voice-mode__copy h2 {
+            font-size: clamp(26px, 4vh, 36px);
+          }
+
+          .voice-mode__copy > span {
+            margin-top: 8px;
+          }
+
+          .voice-mode__transcripts {
+            max-height: min(32vh, 230px);
+            margin-top: 16px;
+          }
+
+          .voice-mode__dock {
+            margin-bottom: 16px;
           }
         }
 

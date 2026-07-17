@@ -59,6 +59,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    user: "1001:1001"
     restart: unless-stopped
     init: true
     read_only: true
@@ -75,10 +76,15 @@ services:
       OPENCODE_DIRECTORY: /workspace/ops
       OBSIDIAN_VAULT_PATH: /data/obsidian
       OPS_DOCUMENTS_PATH: /data/documents
+      OPS_BUSINESS_DATE: ${OPS_BUSINESS_DATE:-2026-07-16}
     expose:
       - "3000"
+    command:
+      - sh
+      - -c
+      - umask 007 && exec node server.js
     volumes:
-      - ./data/obsidian:/data/obsidian:ro
+      - ./data/obsidian:/data/obsidian
       - ./data/documents:/data/documents
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=256m,mode=1777
@@ -114,12 +120,14 @@ services:
       dockerfile: deploy/opencode/Dockerfile
     profiles:
       - tools
+    user: "1001:1002"
     init: true
     environment:
       OBSIDIAN_VAULT_PATH: /data/obsidian
     command:
-      - node
-      - scripts/seed-obsidian.mjs
+      - sh
+      - -c
+      - umask 007 && exec node scripts/seed-obsidian.mjs
     volumes:
       - ./data/obsidian:/data/obsidian
     network_mode: none

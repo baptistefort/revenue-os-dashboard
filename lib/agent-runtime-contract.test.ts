@@ -15,8 +15,15 @@ test("la route agent ne contient plus de moteur métier de secours", async () =>
   assert.match(source, /unavailableResponse/);
   assert.match(source, /buildOpenCodeMessage\(message, history\)/);
   assert.match(source, /document: z\.null\(\)/);
-  assert.match(source, /document: openCodeDocumentSchema/);
-  assert.match(source, /if \(document\)[\s\S]*document/);
+  assert.match(source, /schema: openCodeOutputSchema/);
+  assert.match(source, /buildDocumentPlanFromAgent/);
+  assert.match(source, /const document = await verifiedDocument/);
+  assert.match(source, /recoverableStreamedOpenCodeAnswer/);
+  assert.match(source, /mode: "opencode-recovered"/);
+  assert.match(source, /actions: \[\]/);
+  assert.match(source, /shouldRetryBusyOpenCodeTurn/);
+  assert.match(source, /if \(document\)[\s\S]*mode: "opencode", document/);
+  assert.doesNotMatch(source, /openCodeDocumentOutputSchema/);
 });
 
 test("l'engine ne contient plus les décisions métier préfabriquées historiques", async () => {

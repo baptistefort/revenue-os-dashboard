@@ -16,6 +16,14 @@ export function guardPostRequest(request: Request, scope: string, limit: number,
   const allowedOrigins = new Set([requestUrl.origin]);
   if (forwardedHost) allowedOrigins.add(`${forwardedProtocol}://${forwardedHost}`);
 
+  // A browser includes Origin on state-changing fetch requests. Rejecting an
+  // absent Origin in production closes the common curl/script bypass while
+  // preserving local tooling during development. Caddy authentication remains
+  // the outer protection for the public demo.
+  if (!origin && (process.env.NODE_ENV === "production" || process.env.OPS_REQUIRE_ORIGIN === "true")) {
+    return Response.json({ error: "origin_required" }, { status: 403 });
+  }
+
   if (origin && !allowedOrigins.has(origin)) {
     let localEquivalent = false;
     try {

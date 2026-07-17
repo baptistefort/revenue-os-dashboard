@@ -4,9 +4,24 @@ import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { StoredOpsDocument } from "@/lib/ops-document";
+import {
+  isStoredOpsDocument,
+  type StoredOpsDocument,
+} from "@/lib/ops-document";
 
 const SAFE_DOCUMENT_ID = /^RAPPORT-[A-Z0-9-]{8,80}$/;
+
+export class DocumentStorageError extends Error {
+  constructor(
+    public readonly code:
+      | "document_storage_unavailable"
+      | "document_metadata_invalid",
+    options?: { cause?: unknown },
+  ) {
+    super(code, options);
+    this.name = "DocumentStorageError";
+  }
+}
 
 function documentsRoot() {
   return path.resolve(
@@ -41,21 +56,56 @@ export async function persistDocument(
   metadata: StoredOpsDocument,
   pdf: Uint8Array,
 ) {
-  if (!isDocumentId(metadata.id)) throw new Error("invalid_document_id");
+  if (!isDocumentId(metadata.id)) {
+    throw new DocumentStorageError("document_metadata_invalid");
+  }
   const root = documentsRoot();
-  await fs.mkdir(root, { recursive: true, mode: 0o750 });
-  await fs.writeFile(pdfPath(metadata.id), pdf, { mode: 0o640 });
-  await fs.writeFile(metadataPath(metadata.id), JSON.stringify(metadata, null, 2), {
-    encoding: "utf8",
-    mode: 0o640,
-  });
+  const suffix = randomBytes(8).toString("hex");
+  const temporaryPdf = path.join(root, `.${metadata.id}.${suffix}.pdf.tmp`);
+  const temporaryMetadata = path.join(root, `.${metadata.id}.${suffix}.json.tmp`);
+  const finalPdf = pdfPath(metadata.id);
+  const finalMetadata = metadataPath(metadata.id);
+  try {
+    await fs.mkdir(root, { recursive: true, mode: 0o750 });
+    await Promise.all([
+      fs.writeFile(temporaryPdf, pdf, { mode: 0o640, flag: "wx" }),
+      fs.writeFile(temporaryMetadata, JSON.stringify(metadata, null, 2), {
+        encoding: "utf8",
+        mode: 0o640,
+        flag: "wx",
+      }),
+    ]);
+    await fs.rename(temporaryPdf, finalPdf);
+    try {
+      await fs.rename(temporaryMetadata, finalMetadata);
+    } catch (error) {
+      await fs.rm(finalPdf, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  } catch (error) {
+    await Promise.all([
+      fs.rm(temporaryPdf, { force: true }).catch(() => undefined),
+      fs.rm(temporaryMetadata, { force: true }).catch(() => undefined),
+    ]);
+    if (error instanceof DocumentStorageError) throw error;
+    throw new DocumentStorageError("document_storage_unavailable", { cause: error });
+  }
+}
+
+export async function deleteDocument(id: string) {
+  if (!isDocumentId(id)) return;
+  await Promise.all([
+    fs.rm(pdfPath(id), { force: true }),
+    fs.rm(metadataPath(id), { force: true }),
+  ]);
 }
 
 export async function readDocumentMetadata(id: string) {
   if (!isDocumentId(id)) return null;
   try {
     const raw = await fs.readFile(metadataPath(id), "utf8");
-    return JSON.parse(raw) as StoredOpsDocument;
+    const parsed: unknown = JSON.parse(raw);
+    return isStoredOpsDocument(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -86,7 +136,8 @@ export async function listDocuments(limit = 40) {
       .map(async (name) => {
         try {
           const raw = await fs.readFile(path.join(root, name), "utf8");
-          return JSON.parse(raw) as StoredOpsDocument;
+          const parsed: unknown = JSON.parse(raw);
+          return isStoredOpsDocument(parsed) ? parsed : null;
         } catch {
           return null;
         }

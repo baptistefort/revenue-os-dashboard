@@ -13,6 +13,7 @@ import {
   validateOpenCodeStructuredOutput,
 } from "@/lib/opencode-output";
 import { StreamingJsonStringField } from "@/lib/streaming-json";
+import { isOpenCodeSessionBusyError } from "@/lib/opencode-reliability";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
 const DEFAULT_AGENT = "ops";
@@ -139,6 +140,7 @@ type AbortScope = {
 export type OpenCodeAdapterErrorCode =
   | "opencode_configuration_error"
   | "opencode_request_failed"
+  | "opencode_session_busy"
   | "opencode_session_not_found"
   | "opencode_assistant_error"
   | "opencode_invalid_structured_output"
@@ -148,17 +150,19 @@ export type OpenCodeAdapterErrorCode =
 export class OpenCodeAdapterError extends Error {
   readonly code: OpenCodeAdapterErrorCode;
   readonly status?: number;
+  readonly recoverableAnswer?: string;
   override readonly cause?: unknown;
 
   constructor(
     code: OpenCodeAdapterErrorCode,
     message: string,
-    options: { cause?: unknown; status?: number } = {},
+    options: { cause?: unknown; status?: number; recoverableAnswer?: string } = {},
   ) {
     super(message);
     this.name = "OpenCodeAdapterError";
     this.code = code;
     this.status = options.status;
+    this.recoverableAnswer = cleanOptionalString(options.recoverableAnswer);
     if (options.cause !== undefined) {
       Object.defineProperty(this, "cause", {
         configurable: true,
@@ -173,12 +177,23 @@ export class OpenCodeStructuredOutputError extends OpenCodeAdapterError {
   readonly issues: readonly unknown[];
   readonly outputPreview?: string;
 
-  constructor(message: string, issues: readonly unknown[] = [], outputPreview?: string) {
-    super("opencode_invalid_structured_output", message);
+  constructor(
+    message: string,
+    issues: readonly unknown[] = [],
+    outputPreview?: string,
+    recoverableAnswer?: string,
+  ) {
+    super("opencode_invalid_structured_output", message, { recoverableAnswer });
     this.name = "OpenCodeStructuredOutputError";
     this.issues = issues;
     this.outputPreview = outputPreview;
   }
+}
+
+function recoverableAnswerFromText(text: string) {
+  const parser = new StreamingJsonStringField("answer");
+  parser.push(text);
+  return cleanOptionalString(parser.value);
 }
 
 function cleanOptionalString(value: string | undefined) {
@@ -421,12 +436,19 @@ function normalizeRequestError(operation: string, error: unknown, scope: AbortSc
 
   const status = statusFromError(error);
   const notFound = status === 404;
+  const busy = isOpenCodeSessionBusyError(error, status);
   const detail = errorMessage(error);
   return new OpenCodeAdapterError(
-    notFound ? "opencode_session_not_found" : "opencode_request_failed",
+    notFound
+      ? "opencode_session_not_found"
+      : busy
+        ? "opencode_session_busy"
+        : "opencode_request_failed",
     notFound
       ? "La session OpenCode demandée n’existe pas ou n’est plus accessible."
-      : `La requête OpenCode a échoué pendant ${operation}${detail ? ` : ${detail}` : "."}`,
+      : busy
+        ? "La session OpenCode termine encore une réponse précédente."
+        : `La requête OpenCode a échoué pendant ${operation}${detail ? ` : ${detail}` : "."}`,
     { cause: error, status },
   );
 }
@@ -786,6 +808,7 @@ ${JSON.stringify(outputSchema)}`;
               error.message,
               error.issues,
               error.outputPreview,
+              recoverableAnswerFromText(text),
             )
           : error;
       }
@@ -794,7 +817,10 @@ ${JSON.stringify(outputSchema)}`;
         throw new OpenCodeAdapterError(
           "opencode_assistant_error",
           `L’assistant OpenCode a interrompu sa réponse : ${assistantErrorMessage(assistant.error)}`,
-          { cause: assistant.error },
+          {
+            cause: assistant.error,
+            recoverableAnswer: recoverableAnswerFromText(text),
+          },
         );
       }
 

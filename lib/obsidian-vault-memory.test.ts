@@ -133,3 +133,29 @@ test("safe note resolution rejects traversal and accepts an indexed markdown pat
   const note = await resolveSafeObsidianNote(root, "Finance/FIN-001 — Situation.md");
   assert.equal(note?.relativePath, "Finance/FIN-001 — Situation.md");
 });
+
+test("resolves a document through its stable external document_id", async (t) => {
+  const root = await fixtureVault();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.writeFile(
+    path.join(root, "Finance", "DOC-LEGACY — Rapport importé.md"),
+    `---
+id: DOC-LEGACY
+type: document
+title: "Rapport importé"
+document_id: RAPPORT-20260716-ABC123
+updated_at: 2026-07-16T09:00:00+02:00
+---
+
+# Rapport importé
+
+Le document conserve un identifiant de stockage distinct de l'identifiant de note.
+`,
+    "utf8",
+  );
+
+  const index = await buildObsidianVaultIndex(root);
+  const document = findObsidianMemoryRecord(index, "RAPPORT-20260716-ABC123");
+
+  assert.equal(document?.id, "DOC-LEGACY");
+});

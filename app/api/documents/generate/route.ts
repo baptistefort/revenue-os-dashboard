@@ -1,8 +1,15 @@
 import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 import { z } from "zod";
 import { guardPostRequest } from "@/lib/api-guard";
-import { createDocumentId, persistDocument } from "@/lib/document-store";
+import {
+  createDocumentId,
+  deleteDocument,
+  DocumentStorageError,
+  persistDocument,
+} from "@/lib/document-store";
+import { writeObsidianRecord } from "@/lib/obsidian-write";
 import type { StoredOpsDocument } from "@/lib/ops-document";
+import { buildGeneratedPdfMemoryBody } from "@/lib/pdf-memory";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -488,7 +495,63 @@ export async function POST(request: Request) {
     sources: sourceIds,
   };
 
-  await persistDocument(metadata, bytes);
+  try {
+    await persistDocument(metadata, bytes);
+  } catch (error) {
+    const code = error instanceof DocumentStorageError
+      ? error.code
+      : "document_storage_unavailable";
+    return Response.json({ error: code }, { status: 503 });
+  }
+
+  try {
+    await writeObsidianRecord({
+      id: documentId,
+      idPrefix: "RAPPORT",
+      folder: "08_Documents/Rapports",
+      type: "document",
+      title: plan.title,
+      summary: plan.executiveSummary.slice(0, 1_200),
+      body: buildGeneratedPdfMemoryBody({
+        documentId,
+        filename,
+        pages: pdf.getPageCount(),
+        size: metadata.size,
+        executiveSummary: plan.executiveSummary,
+        sections: plan.sections,
+        decisions: plan.decisions,
+        sourceIds,
+      }),
+      relations: sourceIds,
+      attributes: {
+        record_kind: "document",
+        document_id: documentId,
+        mime_type: "application/pdf",
+        size_bytes: bytes.byteLength,
+        pages: pdf.getPageCount(),
+        status: "generated",
+        source_count: sourceIds.length,
+      },
+      source: "Rapport généré par OPS",
+      actor: "OPS",
+    });
+  } catch {
+    let documentPersisted = true;
+    try {
+      await deleteDocument(documentId);
+      documentPersisted = false;
+    } catch {
+      // L'erreur indique explicitement si une reprise de nettoyage est requise.
+    }
+    return Response.json(
+      {
+        error: "obsidian_memory_write_failed",
+        documentId,
+        documentPersisted,
+      },
+      { status: 503 },
+    );
+  }
 
   return new Response(Buffer.from(bytes), {
     headers: {

@@ -26,13 +26,332 @@ import {
   type OpsDocument,
   type PageId,
 } from "@/lib/ops-demo-data";
-import type { OpsDocumentPlan, StoredOpsDocument } from "@/lib/ops-document";
+import type {
+  ListedOpsDocument,
+  OpsDocumentPlan,
+  StoredOpsDocument,
+} from "@/lib/ops-document";
+import type { OpsAgentActionResult } from "@/lib/ops-agent-actions";
+import type { OpsCompanyState } from "@/lib/ops-company-state";
 import {
   playStreamingAudioResponse,
   type StreamingAudioPlayback,
 } from "@/lib/streaming-audio";
 
 type OpenAgent = (prompt?: string) => void;
+
+type PersistedRecord = {
+  id: string;
+  title: string;
+  summary: string;
+  content: string;
+  createdAt: string;
+  attributes: Record<string, string | number | boolean | null | Array<string | number | boolean>>;
+  relations: string[];
+};
+
+async function createOpsRecord(payload: Record<string, unknown>) {
+  const response = await fetch("/api/records", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({})) as {
+    error?: string;
+    record?: { id: string; title: string; createdAt: string };
+  };
+  if (!response.ok || !result.record) throw new Error(result.error ?? "record_write_failed");
+  document.dispatchEvent(new CustomEvent("ops-record-created", {
+    detail: { kind: payload.kind, id: result.record.id },
+  }));
+  return result.record;
+}
+
+async function updateOpsRecord(id: string, payload: Record<string, unknown>) {
+  const response = await fetch("/api/records", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...payload, id }),
+  });
+  const result = await response.json().catch(() => ({})) as {
+    error?: string;
+    record?: { id: string; title: string; createdAt: string };
+  };
+  if (!response.ok || !result.record) throw new Error(result.error ?? "record_update_failed");
+  document.dispatchEvent(new CustomEvent("ops-record-created", {
+    detail: { kind: payload.kind, id: result.record.id },
+  }));
+  return result.record;
+}
+
+type OpportunityView = (typeof opportunities)[number];
+type ClientView = (typeof clients)[number] & { email?: string };
+type PlanningTaskView = {
+  id: string;
+  title: string;
+  owner: string;
+  due: string;
+  status: "open" | "in_progress" | "done";
+  description: string;
+  project: string;
+  dayIndex: number;
+  weekOffset: number;
+};
+
+function safeNumber(
+  value: unknown,
+  fallback: number,
+  minimum = Number.NEGATIVE_INFINITY,
+  maximum = Number.POSITIVE_INFINITY,
+) {
+  const normalized = typeof value === "string"
+    ? value.trim().replace(",", ".")
+    : value;
+  if (normalized === "") return fallback;
+  const numeric = Number(normalized);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(maximum, Math.max(minimum, numeric));
+}
+
+function useCompanyState() {
+  const [state, setState] = useState<OpsCompanyState | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const load = () => {
+      void fetch("/api/company-state", {
+        cache: "no-store",
+        signal: controller.signal,
+      })
+        .then(async (response) => (
+          response.ok
+            ? response.json() as Promise<OpsCompanyState>
+            : null
+        ))
+        .then((payload) => {
+          if (!controller.signal.aborted && payload) setState(payload);
+        })
+        .catch(() => {
+          // Les valeurs de démonstration restent visibles si le vault est indisponible.
+        });
+    };
+    const refresh = () => load();
+    load();
+    document.addEventListener("ops-record-created", refresh);
+    const interval = window.setInterval(load, 30_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+      document.removeEventListener("ops-record-created", refresh);
+    };
+  }, []);
+
+  return state;
+}
+
+function formatCompactEuro(value: number | null | undefined, fallback: string) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return fallback;
+  if (Math.abs(value) >= 1_000) {
+    return `${(value / 1_000).toLocaleString("fr-FR", {
+      minimumFractionDigits: value % 1_000 === 0 ? 0 : 1,
+      maximumFractionDigits: 1,
+    })} K€`;
+  }
+  return `${value.toLocaleString("fr-FR")} €`;
+}
+
+function formatDecimal(value: number | null | undefined, fallback: string, suffix = "") {
+  if (value === null || value === undefined || !Number.isFinite(value)) return fallback;
+  return `${value.toLocaleString("fr-FR", { maximumFractionDigits: 1 })}${suffix}`;
+}
+
+function companyKpis(state: OpsCompanyState | null, livePipeline: number) {
+  return kpis.map((kpi) => {
+    if (kpi.label === "Pipeline") {
+      return { ...kpi, value: formatCompactEuro(livePipeline, kpi.value) };
+    }
+    if (kpi.label === "CA du mois") {
+      return { ...kpi, value: formatCompactEuro(state?.finance.revenueMonth, kpi.value) };
+    }
+    if (kpi.label === "Marge moyenne") {
+      return { ...kpi, value: formatDecimal(state?.finance.marginPercent, kpi.value, " %") };
+    }
+    if (kpi.label === "Trésorerie") {
+      return { ...kpi, value: formatDecimal(state?.finance.cashVisibilityDays, kpi.value, " j") };
+    }
+    return kpi;
+  });
+}
+
+function usePersistedOpportunities() {
+  const [items, setItems] = useState<OpportunityView[]>(opportunities);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const load = () => {
+      void fetch("/api/records?kind=opportunity", {
+        cache: "no-store",
+        signal: controller.signal,
+      })
+        .then(async (response) => response.ok
+          ? response.json() as Promise<{ records?: PersistedRecord[] }>
+          : { records: [] })
+        .then(({ records = [] }) => {
+          if (controller.signal.aborted) return;
+          const stored = records.map((record): OpportunityView => ({
+            id: record.id,
+            name: record.title,
+            amount: Number(record.attributes.amount) || 0,
+            stage: (typeof record.attributes.stage === "string"
+              ? record.attributes.stage
+              : "Qualification") as OpportunityView["stage"],
+            probability: Number(record.attributes.probability) || 0,
+            owner: typeof record.attributes.owner === "string"
+              ? record.attributes.owner
+              : "Marie",
+            source: typeof record.attributes.source_channel === "string"
+              ? record.attributes.source_channel
+              : "OPS",
+            next: typeof record.attributes.next_action === "string"
+              ? record.attributes.next_action
+              : "À définir",
+          }));
+          setItems([...stored, ...opportunities.filter(
+            (item) => !stored.some((record) => record.id === item.id),
+          )]);
+        })
+        .catch(() => {
+          // Les données de démonstration restent disponibles hors connexion.
+        });
+    };
+    const refresh = (event: Event) => {
+      const kind = (event as CustomEvent<{ kind?: string }>).detail?.kind;
+      if (kind === "opportunity") load();
+    };
+    load();
+    document.addEventListener("ops-record-created", refresh);
+    return () => {
+      controller.abort();
+      document.removeEventListener("ops-record-created", refresh);
+    };
+  }, []);
+
+  return [items, setItems] as const;
+}
+
+function usePersistedClients() {
+  const [items, setItems] = useState<ClientView[]>(clients);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const load = () => {
+      void fetch("/api/records?kind=client", {
+        cache: "no-store",
+        signal: controller.signal,
+      })
+        .then(async (response) => response.ok
+          ? response.json() as Promise<{ records?: PersistedRecord[] }>
+          : { records: [] })
+        .then(({ records = [] }) => {
+          if (controller.signal.aborted) return;
+          const stored = records.map((record): ClientView => {
+            const words = record.title.split(/\s+/).filter(Boolean);
+            const revenue = safeNumber(record.attributes.revenue_12m, 0, 0, 100_000_000);
+            const margin = safeNumber(record.attributes.margin_percent, 0, -100, 100);
+            const health = safeNumber(record.attributes.health_score, 0, 0, 100);
+            return {
+              id: record.id,
+              name: record.title,
+              initials: words.map((word) => word[0]).join("").slice(0, 2).toLocaleUpperCase("fr"),
+              owner: typeof record.attributes.owner === "string" ? record.attributes.owner : "Marie",
+              revenue: `${(revenue / 1000).toLocaleString("fr-FR", { maximumFractionDigits: 1 })} K€`,
+              margin: `${margin.toLocaleString("fr-FR")} %`,
+              last: typeof record.attributes.last_interaction === "string" ? record.attributes.last_interaction : "Aujourd’hui",
+              health,
+              status: (typeof record.attributes.status === "string" ? record.attributes.status : "Prospect") as ClientView["status"],
+              opportunity: typeof record.attributes.next_opportunity === "string" ? record.attributes.next_opportunity : "À qualifier",
+              email: typeof record.attributes.email === "string" ? record.attributes.email : "",
+            };
+          });
+          setItems([...stored, ...clients.filter(
+            (item) => !stored.some((record) => record.id === item.id),
+          )]);
+        })
+        .catch(() => {
+          // Le portefeuille fictif reste visible sans écriture serveur.
+        });
+    };
+    const refresh = (event: Event) => {
+      const kind = (event as CustomEvent<{ kind?: string }>).detail?.kind;
+      if (kind === "client") load();
+    };
+    load();
+    document.addEventListener("ops-record-created", refresh);
+    return () => {
+      controller.abort();
+      document.removeEventListener("ops-record-created", refresh);
+    };
+  }, []);
+
+  return [items, setItems] as const;
+}
+
+function usePersistedPlanningTasks() {
+  const [items, setItems] = useState<PlanningTaskView[]>([]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const load = () => {
+      void fetch("/api/records?kind=task", {
+        cache: "no-store",
+        signal: controller.signal,
+      })
+        .then(async (response) => response.ok
+          ? response.json() as Promise<{ records?: PersistedRecord[] }>
+          : { records: [] })
+        .then(({ records = [] }) => {
+          if (controller.signal.aborted) return;
+          const stored = records.flatMap((record): PlanningTaskView[] => {
+            const dayIndex = Number(record.attributes.day_index);
+            const weekOffset = Number(record.attributes.week_offset);
+            const project = typeof record.attributes.project === "string"
+              ? record.attributes.project
+              : "";
+            if (!project || !Number.isInteger(dayIndex) || dayIndex < 0 || dayIndex > 4) return [];
+            return [{
+              id: record.id,
+              title: record.title,
+              owner: typeof record.attributes.owner === "string" ? record.attributes.owner : "Marie",
+              due: typeof record.attributes.due === "string" ? record.attributes.due : "À planifier",
+              status: (typeof record.attributes.status === "string"
+                ? record.attributes.status
+                : "open") as PlanningTaskView["status"],
+              description: record.summary,
+              project,
+              dayIndex,
+              weekOffset: Number.isInteger(weekOffset) ? weekOffset : 0,
+            }];
+          });
+          setItems(stored);
+        })
+        .catch(() => {
+          // Le planning de démonstration reste lisible si le vault est indisponible.
+        });
+    };
+    const refresh = (event: Event) => {
+      const kind = (event as CustomEvent<{ kind?: string }>).detail?.kind;
+      if (kind === "task") load();
+    };
+    load();
+    document.addEventListener("ops-record-created", refresh);
+    return () => {
+      controller.abort();
+      document.removeEventListener("ops-record-created", refresh);
+    };
+  }, []);
+
+  return [items, setItems] as const;
+}
 
 function Logo() {
   return <div className="ops-wordmark" aria-label="OPS">OPS<span>°</span></div>;
@@ -42,11 +361,12 @@ function IconTile({ name, active = false }: { name: IconName; active?: boolean }
   return <span className={`nav-icon ${active ? "active" : ""}`}><OpsIcon name={name} size={20} strokeWidth={1.65} /></span>;
 }
 
-function Sidebar({ page, setPage, collapsed, setCollapsed }: {
+function Sidebar({ page, setPage, collapsed, setCollapsed, openAgent }: {
   page: PageId;
   setPage: (page: PageId) => void;
   collapsed: boolean;
   setCollapsed: (value: boolean) => void;
+  openAgent: OpenAgent;
 }) {
   return (
     <aside className={`ops-sidebar ${collapsed ? "collapsed" : ""}`}>
@@ -56,7 +376,7 @@ function Sidebar({ page, setPage, collapsed, setCollapsed }: {
           <span /><span />
         </button>
       </div>
-      <button className="workspace-card">
+      <button className="workspace-card" onClick={() => openAgent("Présente-moi l’état complet d’Atelier Beaumarchais, les faits récents et les décisions qui demandent mon attention.")}>
         <span className="workspace-monogram">{company.initials}</span>
         <span className="workspace-copy"><strong>{company.name}</strong><small>{company.trade}</small></span>
         <OpsIcon name="chevron" size={14} />
@@ -86,7 +406,7 @@ function Sidebar({ page, setPage, collapsed, setCollapsed }: {
         ))}
       </nav>
       <div className="sidebar-footer">
-        <button className="sidebar-user">
+        <button className="sidebar-user" onClick={() => openAgent("Prépare mon brief personnel de direction : décisions, validations, rendez-vous et sujets à suivre.")}>
           <span className="user-avatar">MD</span>
           <span><strong>Marie Delmas</strong><small>Direction</small></span>
           <OpsIcon name="dots" size={16} />
@@ -106,24 +426,66 @@ function Topbar({ page, openAgent }: { page: PageId; openAgent: OpenAgent }) {
         </button>
         <span className="sync-status"><i /> {company.synced}</span>
         <button className="validation-button" onClick={() => openAgent("Que dois-je valider aujourd’hui ?")}>2 validations</button>
-        <button className="topbar-avatar">MD</button>
+        <button className="topbar-avatar" onClick={() => openAgent("Prépare mon brief personnel de direction pour aujourd’hui.")}>MD</button>
       </div>
     </header>
   );
 }
 
-function PageHeading({ page, action }: { page: PageId; action?: React.ReactNode }) {
+function PageHeading({ page, action, description }: { page: PageId; action?: React.ReactNode; description?: string }) {
   const meta = pageMeta[page];
   return (
     <div className="page-heading">
-      <div><span className="eyebrow">{meta.eyebrow}</span><h1>{meta.title}</h1><p>{meta.description}</p></div>
+      <div><span className="eyebrow">{meta.eyebrow}</span><h1>{meta.title}</h1><p>{description ?? meta.description}</p></div>
       {action}
     </div>
   );
 }
 
 function SourceChips({ sources }: { sources: string[] }) {
-  return <div className="source-chips">{sources.map((source) => <button key={source}><OpsIcon name="link" size={12} />{source}</button>)}</div>;
+  return (
+    <div className="source-chips">
+      {sources.map((source) => (
+        <button
+          key={source}
+          onClick={() => document.dispatchEvent(new CustomEvent("ops-open-source", { detail: source }))}
+          type="button"
+        >
+          <OpsIcon name="link" size={12} />{source}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function OpsModal({ open, title, description, onClose, children }: {
+  open: boolean;
+  title: string;
+  description?: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose, open]);
+
+  if (!open) return null;
+  return (
+    <div className="ops-modal-backdrop" onMouseDown={onClose}>
+      <section aria-modal="true" className="ops-modal" onMouseDown={(event) => event.stopPropagation()} role="dialog">
+        <header>
+          <div><span className="eyebrow">OPS · MÉMOIRE VIVANTE</span><h2>{title}</h2>{description ? <p>{description}</p> : null}</div>
+          <button aria-label="Fermer" onClick={onClose} type="button"><OpsIcon name="close" size={17} /></button>
+        </header>
+        {children}
+      </section>
+    </div>
+  );
 }
 
 function MiniComposer({ openAgent, placeholder = "Demandez quelque chose à votre entreprise…" }: { openAgent: OpenAgent; placeholder?: string }) {
@@ -137,13 +499,112 @@ function MiniComposer({ openAgent, placeholder = "Demandez quelque chose à votr
   );
 }
 
+function numbersPresentation(
+  companyState: OpsCompanyState | null,
+  liveKpis: ReturnType<typeof companyKpis>,
+  activeTab: string,
+  period: "Mensuel" | "Hebdomadaire",
+) {
+  const tabKpis: Record<string, typeof liveKpis> = {
+    "Vue d’ensemble": liveKpis,
+    Activité: [
+      { label: "CA du mois", value: formatCompactEuro(companyState?.finance.revenueMonth, "42,8 K€"), delta: "Source finance", tone: "positive", page: "numbers" },
+      { label: "Pipeline pondéré", value: formatCompactEuro(companyState?.crm.weightedPipeline, "96 K€"), delta: "Prévision équipe", tone: "neutral", page: "crm" },
+      { label: "Opportunités", value: formatDecimal(companyState?.crm.opportunities, "4"), delta: "Ouvertes", tone: "neutral", page: "crm" },
+      { label: "Transformation", value: formatDecimal(companyState?.crm.conversionRate90d, "31", " %"), delta: "Sur 90 jours", tone: "positive", page: "crm" },
+    ],
+    Marge: [
+      { label: "Marge moyenne", value: formatDecimal(companyState?.finance.marginPercent, "29", " %"), delta: "−2,1 pts", tone: "negative", page: "numbers" },
+      { label: "Charge atelier", value: formatDecimal(companyState?.operations.workshopLoadPercent, "86", " %"), delta: "Capacité suivie", tone: "neutral", page: "planning" },
+      { label: "Projets à risque", value: formatDecimal(companyState?.operations.projectsAtRisk, "2"), delta: "À arbitrer", tone: "negative", page: "planning" },
+      { label: "Capacité disponible", value: formatDecimal(companyState?.operations.availableCapacityDays, "4", " j"), delta: "À positionner", tone: "positive", page: "planning" },
+    ],
+    Trésorerie: [
+      { label: "Visibilité cash", value: formatDecimal(companyState?.finance.cashVisibilityDays, "67", " j"), delta: "Stable", tone: "neutral", page: "numbers" },
+      { label: "Créances en retard", value: formatCompactEuro(companyState?.finance.overdueReceivables, "24,3 K€"), delta: "À traiter", tone: "negative", page: "numbers" },
+      { label: "Actionnable", value: formatCompactEuro(companyState?.finance.immediatelyActionableReceivables, "20,2 K€"), delta: "Relances validées", tone: "positive", page: "emails" },
+      { label: "Pipeline pondéré", value: formatCompactEuro(companyState?.crm.weightedPipeline, "96 K€"), delta: "Entrées futures", tone: "neutral", page: "crm" },
+    ],
+    Acquisition: [
+      { label: "Dépenses payantes", value: formatCompactEuro(companyState?.acquisition.totalPaidSpend, "1 K€"), delta: "Canaux payants", tone: "neutral", page: "numbers" },
+      { label: "Pipeline attribué", value: formatCompactEuro(companyState?.acquisition.attributedPipeline, "86 K€"), delta: "Multi-canal", tone: "positive", page: "crm" },
+      { label: "Leads qualifiés", value: formatDecimal(companyState?.acquisition.qualifiedLeads, "6"), delta: "Tous canaux", tone: "positive", page: "crm" },
+      { label: "Google Ads", value: formatDecimal(companyState?.googleAds.qualifiedLeads, "5"), delta: "Leads qualifiés", tone: "positive", page: "numbers" },
+    ],
+    SEO: [
+      { label: "Clics organiques", value: formatDecimal(companyState?.seo.clicks, "447"), delta: companyState?.seo.window ?? "28 jours", tone: "positive", page: "numbers" },
+      { label: "Impressions", value: formatDecimal(companyState?.seo.impressions, "15 820"), delta: "Search Console", tone: "positive", page: "numbers" },
+      { label: "CTR moyen", value: formatDecimal(companyState?.seo.ctrPercent, "2,83", " %"), delta: "Trafic non-marque", tone: "neutral", page: "numbers" },
+      { label: "Position moyenne", value: formatDecimal(companyState?.seo.averagePosition, "13,4"), delta: "Plus bas = mieux", tone: "positive", page: "numbers" },
+    ],
+  };
+  const visibleKpis = tabKpis[activeTab] ?? liveKpis;
+  const tabCharts: Record<string, {
+    legend: [string, string];
+    monthly: { primary: string; secondary: string; area: string; labels: string[] };
+    weekly: { primary: string; secondary: string; area: string; labels: string[] };
+    insight: string;
+    source?: string;
+  }> = {
+    "Vue d’ensemble": {
+      legend: ["Chiffre d’affaires", "Marge"],
+      monthly: { primary: "M0 205 C80 190 105 142 170 155 S260 120 340 130 S445 75 510 102 S620 54 720 62", secondary: "M0 150 C90 138 130 132 190 121 S310 110 380 124 S490 136 555 144 S650 160 720 174", area: "M0 205 C80 190 105 142 170 155 S260 120 340 130 S445 75 510 102 S620 54 720 62 L720 260 L0 260Z", labels: ["Jan.", "Fév.", "Mars", "Avr.", "Mai", "Juin", "Juil."] },
+      weekly: { primary: "M0 186 C80 172 128 138 180 151 S292 95 356 111 S470 82 540 91 S642 61 720 69", secondary: "M0 126 C90 116 148 122 215 137 S330 147 402 158 S520 151 594 166 S676 172 720 180", area: "M0 186 C80 172 128 138 180 151 S292 95 356 111 S470 82 540 91 S642 61 720 69 L720 260 L0 260Z", labels: ["Lun.", "Mar.", "Mer.", "Jeu.", "Ven.", "Sam.", "Dim."] },
+      insight: "Le CA progresse, mais la marge se dégrade. Rivoli explique l’essentiel de l’écart.",
+      source: companyState?.finance.source?.id,
+    },
+    Activité: {
+      legend: ["CA réalisé", "Pipeline pondéré"],
+      monthly: { primary: "M0 216 C88 202 121 171 184 168 S279 142 348 131 S454 118 518 91 S629 73 720 58", secondary: "M0 195 C92 184 132 162 205 171 S315 143 389 151 S485 107 559 117 S654 89 720 96", area: "M0 216 C88 202 121 171 184 168 S279 142 348 131 S454 118 518 91 S629 73 720 58 L720 260 L0 260Z", labels: ["Jan.", "Fév.", "Mars", "Avr.", "Mai", "Juin", "Juil."] },
+      weekly: { primary: "M0 194 C82 185 118 149 181 157 S286 128 352 118 S455 100 520 79 S635 62 720 71", secondary: "M0 179 C91 167 145 143 207 151 S319 120 389 132 S492 101 557 109 S649 83 720 91", area: "M0 194 C82 185 118 149 181 157 S286 128 352 118 S455 100 520 79 S635 62 720 71 L720 260 L0 260Z", labels: ["Lun.", "Mar.", "Mer.", "Jeu.", "Ven.", "Sam.", "Dim."] },
+      insight: "L’activité reste en croissance et le pipeline pondéré donne une visibilité commerciale exploitable.",
+      source: companyState?.crm.source?.id,
+    },
+    Marge: {
+      legend: ["Marge réalisée", "Charge atelier"],
+      monthly: { primary: "M0 104 C91 96 142 105 209 117 S322 127 391 145 S496 158 565 169 S660 181 720 193", secondary: "M0 184 C88 171 142 157 211 144 S323 114 396 103 S503 83 574 76 S665 68 720 64", area: "M0 104 C91 96 142 105 209 117 S322 127 391 145 S496 158 565 169 S660 181 720 193 L720 260 L0 260Z", labels: ["Jan.", "Fév.", "Mars", "Avr.", "Mai", "Juin", "Juil."] },
+      weekly: { primary: "M0 121 C96 117 153 129 220 139 S335 146 402 163 S514 169 586 181 S674 186 720 191", secondary: "M0 174 C95 161 147 137 216 129 S329 103 402 91 S512 79 585 68 S671 65 720 59", area: "M0 121 C96 117 153 129 220 139 S335 146 402 163 S514 169 586 181 S674 186 720 191 L720 260 L0 260Z", labels: ["Lun.", "Mar.", "Mer.", "Jeu.", "Ven.", "Sam.", "Dim."] },
+      insight: "La marge est sous l’objectif tandis que la charge atelier augmente ; deux projets demandent un arbitrage.",
+      source: companyState?.operations.source?.id,
+    },
+    Trésorerie: {
+      legend: ["Visibilité de trésorerie", "Créances en retard"],
+      monthly: { primary: "M0 117 C84 111 132 107 200 112 S315 105 388 101 S499 97 566 91 S660 88 720 84", secondary: "M0 189 C90 180 142 171 213 159 S323 145 395 132 S502 118 574 105 S660 92 720 73", area: "M0 117 C84 111 132 107 200 112 S315 105 388 101 S499 97 566 91 S660 88 720 84 L720 260 L0 260Z", labels: ["Jan.", "Fév.", "Mars", "Avr.", "Mai", "Juin", "Juil."] },
+      weekly: { primary: "M0 102 C87 99 139 104 208 101 S320 97 390 94 S501 90 573 88 S659 86 720 84", secondary: "M0 174 C88 162 143 150 211 137 S322 124 392 111 S501 99 572 87 S657 76 720 67", area: "M0 102 C87 99 139 104 208 101 S320 97 390 94 S501 90 573 88 S659 86 720 84 L720 260 L0 260Z", labels: ["Lun.", "Mar.", "Mer.", "Jeu.", "Ven.", "Sam.", "Dim."] },
+      insight: "La visibilité reste stable, mais 24,3 K€ de créances doivent être convertis en encaissements.",
+      source: companyState?.finance.source?.id,
+    },
+    Acquisition: {
+      legend: ["Pipeline attribué", "Dépenses payantes"],
+      monthly: { primary: "M0 213 C91 201 134 181 201 167 S313 139 384 124 S490 95 561 82 S654 61 720 53", secondary: "M0 194 C91 188 140 174 207 168 S319 150 391 143 S500 132 571 123 S658 116 720 108", area: "M0 213 C91 201 134 181 201 167 S313 139 384 124 S490 95 561 82 S654 61 720 53 L720 260 L0 260Z", labels: ["Jan.", "Fév.", "Mars", "Avr.", "Mai", "Juin", "Juil."] },
+      weekly: { primary: "M0 198 C86 188 135 169 202 154 S316 126 386 111 S495 91 567 72 S654 56 720 48", secondary: "M0 181 C89 177 144 166 212 157 S322 143 393 136 S503 122 573 116 S659 109 720 102", area: "M0 198 C86 188 135 169 202 154 S316 126 386 111 S495 91 567 72 S654 56 720 48 L720 260 L0 260Z", labels: ["Lun.", "Mar.", "Mer.", "Jeu.", "Ven.", "Sam.", "Dim."] },
+      insight: "Google Ads concentre l’efficacité payante ; Meta doit être arbitré avant toute hausse de budget.",
+      source: companyState?.acquisition.source?.id,
+    },
+    SEO: {
+      legend: ["Clics organiques", "Position moyenne"],
+      monthly: { primary: "M0 219 C88 207 130 185 197 169 S310 141 382 121 S487 98 557 81 S651 58 720 49", secondary: "M0 87 C92 94 140 101 207 111 S318 121 389 132 S498 141 568 151 S655 158 720 169", area: "M0 219 C88 207 130 185 197 169 S310 141 382 121 S487 98 557 81 S651 58 720 49 L720 260 L0 260Z", labels: ["Jan.", "Fév.", "Mars", "Avr.", "Mai", "Juin", "Juil."] },
+      weekly: { primary: "M0 191 C86 181 133 161 201 147 S313 123 384 105 S492 85 563 69 S654 54 720 45", secondary: "M0 98 C89 105 143 113 210 122 S319 131 391 140 S500 149 570 157 S656 163 720 171", area: "M0 191 C86 181 133 161 201 147 S313 123 384 105 S492 85 563 69 S654 54 720 45 L720 260 L0 260Z", labels: ["Lun.", "Mar.", "Mer.", "Jeu.", "Ven.", "Sam.", "Dim."] },
+      insight: "Les clics et la visibilité progressent ; l’étude de cas Rivoli et les correctifs techniques sont prioritaires.",
+      source: companyState?.seo.source?.id,
+    },
+  };
+  const activeChart = tabCharts[activeTab] ?? tabCharts["Vue d’ensemble"];
+  const chartSeries = period === "Mensuel" ? activeChart.monthly : activeChart.weekly;
+  return { visibleKpis, activeChart, chartSeries };
+}
+
 function TodayPage({ setPage, openAgent }: { setPage: (page: PageId) => void; openAgent: OpenAgent }) {
+  const companyState = useCompanyState();
+  const [pipelineItems] = usePersistedOpportunities();
+  const livePipeline = pipelineItems.reduce((sum, item) => sum + item.amount, 0);
+  const liveKpis = companyKpis(companyState, livePipeline);
   return (
     <div className="content-page today-page">
       <PageHeading page="today" action={<button className="primary-button" onClick={() => openAgent()}><OpsIcon name="spark" size={16} /> Parler à OPS</button>} />
       <MiniComposer openAgent={openAgent} />
       <section className="kpi-row">
-        {kpis.map((kpi) => (
+        {liveKpis.map((kpi) => (
           <button key={kpi.label} onClick={() => setPage(kpi.page)} className="kpi-card">
             <span>{kpi.label}</span><strong>{kpi.value}</strong><small className={kpi.tone}>{kpi.delta}</small><i><b style={{ width: kpi.label === "Marge moyenne" ? "41%" : "72%" }} /></i>
           </button>
@@ -151,7 +612,7 @@ function TodayPage({ setPage, openAgent }: { setPage: (page: PageId) => void; op
       </section>
       <div className="today-grid">
         <section className="panel attention-panel">
-          <div className="panel-title"><div><span>Ce qui demande attention</span><small>Priorisé par impact</small></div><button><OpsIcon name="filter" size={15} /> Filtrer</button></div>
+          <div className="panel-title"><div><span>Ce qui demande attention</span><small>Priorisé par impact</small></div><button onClick={() => openAgent("Filtre tout ce qui demande mon attention par urgence, impact financier et décision requise.")}><OpsIcon name="filter" size={15} /> Filtrer</button></div>
           <div className="attention-list">
             {attentionItems.map((item) => (
               <article className="attention-row" key={item.title}>
@@ -164,7 +625,7 @@ function TodayPage({ setPage, openAgent }: { setPage: (page: PageId) => void; op
         </section>
         <div className="today-side">
           <section className="panel missions-panel">
-            <div className="panel-title"><div><span>Missions actives</span><small>3 en cours</small></div><button>Tout voir</button></div>
+            <div className="panel-title"><div><span>Missions actives</span><small>3 en cours</small></div><button onClick={() => openAgent("Liste toutes les missions actives, leurs responsables, leur progression, leurs blocages et leur prochaine action.")}>Tout voir</button></div>
             {missions.map((mission) => (
               <button className="mission-row" key={mission.id} onClick={() => openAgent(`Montre la mission ${mission.title}`)}>
                 <span className="mission-agent"><OpsIcon name="spark" size={15} /></span>
@@ -198,6 +659,7 @@ type ChatMessage = {
   loading?: boolean;
   statusText?: string;
   document?: OpsDocument;
+  actions?: OpsAgentActionResult[];
   progressKind?: "analysis" | "pdf";
   progressStartedAt?: number;
   progressStage?: string;
@@ -228,7 +690,13 @@ function serializeChatMessage(message: ChatMessage): ConversationTurn | null {
   const document = message.document
     ? `Document produit : ${message.document.name} (${message.document.id}, ${message.document.pages ?? 3} pages, disponible dans Documents).`
     : "";
-  const content = [answer, sources, document].filter(Boolean).join("\n\n");
+  const actions = message.actions?.length
+    ? `Actions structurées : ${message.actions.map((action) => {
+        const record = action.record ? `, enregistrement ${action.record.id}` : "";
+        return `${action.type} (${action.status}${record})`;
+      }).join("; ")}.`
+    : "";
+  const content = [answer, sources, document, actions].filter(Boolean).join("\n\n");
   return content ? { role: "assistant", content } : null;
 }
 
@@ -265,18 +733,19 @@ function createConversationId() {
   return `conv_${Date.now()}_${Math.random().toString(36).slice(2, 14)}`;
 }
 
-function storedDocumentToUi(document: StoredOpsDocument): OpsDocument {
+function storedDocumentToUi(document: StoredOpsDocument | ListedOpsDocument): OpsDocument {
   return {
     ...document,
-    objectUrl: document.url,
+    objectUrl: document.url || undefined,
   };
 }
 
-async function generatePdfDocument(plan: OpsDocumentPlan): Promise<OpsDocument> {
+async function generatePdfDocument(plan: OpsDocumentPlan, signal?: AbortSignal): Promise<OpsDocument> {
   const response = await fetch("/api/documents/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(plan),
+    signal,
   });
   if (!response.ok) throw new Error("document_generation_failed");
 
@@ -393,7 +862,14 @@ function AgentProgress({ kind, startedAt, stage, label, detail, etaMs, updatedAt
 }
 
 type AgentStreamEvent =
-  | { type: "meta"; scenario: AgentScenario; mode?: string; document?: OpsDocumentPlan }
+  | {
+      type: "meta";
+      scenario: AgentScenario;
+      mode?: string;
+      document?: OpsDocumentPlan;
+      actions?: OpsAgentActionResult[];
+      memoryCommit?: { id: string; title: string; relativePath?: string } | null;
+    }
   | { type: "progress"; stage: string; label: string; detail?: string; etaMs?: number }
   | { type: "delta"; delta: string }
   | { type: "replace"; text: string }
@@ -401,11 +877,13 @@ type AgentStreamEvent =
   | { type: "error"; message: string; retryable?: boolean }
   | { type: "done" };
 
-function FullComposer({ value, setValue, onSubmit, onVoice, processing, centered = false }: {
+function FullComposer({ value, setValue, onSubmit, onStop, onVoice, onAttach, processing, centered = false }: {
   value: string;
   setValue: (value: string) => void;
   onSubmit: () => void;
+  onStop: () => void;
   onVoice: () => void;
+  onAttach: () => void;
   processing: boolean;
   centered?: boolean;
 }) {
@@ -419,8 +897,8 @@ function FullComposer({ value, setValue, onSubmit, onVoice, processing, centered
         rows={1}
       />
       <div className="composer-actions">
-        <div><button aria-label="Joindre"><OpsIcon name="plus" size={23} /></button><span className="context-select">Toute l’entreprise <OpsIcon name="chevron" size={13} /></span></div>
-        <div><button type="button" aria-label="Démarrer une conversation vocale" onClick={onVoice}><OpsIcon name="microphone" size={21} /></button><button type="button" className="voice-button" onClick={onSubmit} aria-label={processing ? "Interrompre" : "Envoyer"}>{processing ? <span className="stop-square" /> : <OpsIcon name="send" size={20} />}</button></div>
+        <div><button aria-label="Joindre un document" onClick={onAttach} type="button"><OpsIcon name="plus" size={23} /></button><button className="context-select" onClick={() => document.dispatchEvent(new CustomEvent("ops-command"))} type="button">Toute l’entreprise <OpsIcon name="chevron" size={13} /></button></div>
+        <div><button type="button" aria-label="Démarrer une conversation vocale" onClick={onVoice}><OpsIcon name="microphone" size={21} /></button><button type="button" className="voice-button" onClick={processing ? onStop : onSubmit} aria-label={processing ? "Interrompre" : "Envoyer"}>{processing ? <span className="stop-square" /> : <OpsIcon name="send" size={20} />}</button></div>
       </div>
     </div>
   );
@@ -472,13 +950,63 @@ function PdfArtifactCard({ document, openDocuments }: {
   );
 }
 
-function ScenarioResponse({ scenario, text, document, openDocuments, onSpeak }: {
+function AgentActionReceipts({ actions, onAction }: {
+  actions: OpsAgentActionResult[];
+  onAction: (prompt: string) => void;
+}) {
+  if (!actions.length) return null;
+  const labels: Record<OpsAgentActionResult["type"], string> = {
+    create_opportunity: "Opportunité",
+    create_task: "Tâche",
+    create_client: "Client",
+    prepare_email: "Brouillon email",
+    send_demo_email: "Email de démonstration",
+  };
+  return (
+    <div className="agent-action-receipts">
+      {actions.map((action, index) => {
+        const executed = action.status === "executed";
+        const waiting = action.status === "validation_required" || action.status === "proposed";
+        const status = executed
+          ? "Enregistré dans la mémoire"
+          : action.status === "failed"
+            ? "Écriture impossible"
+            : "Validation requise";
+        return (
+          <article key={`${action.type}-${action.record?.id ?? index}`}>
+            <span className={executed ? "success" : action.status === "failed" ? "failure" : "waiting"}><i /> {status}</span>
+            <strong>{action.record?.title ?? labels[action.type]}</strong>
+            <small>{action.record?.id ?? action.reason}</small>
+            {waiting ? <button type="button" onClick={() => onAction("Oui, vas-y. Exécute l’action proposée précédemment.")}>Valider l’action <OpsIcon name="arrow" size={12} /></button> : null}
+          </article>
+        );
+      })}
+      <style jsx>{`
+        .agent-action-receipts { width: min(660px, 100%); margin-top: 18px; display: grid; gap: 8px; }
+        .agent-action-receipts article { position: relative; min-width: 0; padding: 13px 15px; background: #fff; border: 1px solid #e5e6e7; border-radius: 14px; box-shadow: 0 10px 28px rgba(18,22,28,.035); }
+        .agent-action-receipts span { display: flex; align-items: center; gap: 6px; color: #6d7378; font-size: 7px; font-weight: 720; letter-spacing: .08em; text-transform: uppercase; }
+        .agent-action-receipts span i { width: 5px; height: 5px; background: #a2a8ad; border-radius: 50%; }
+        .agent-action-receipts span.success { color: #4e745e; }.agent-action-receipts span.success i { background: #4e8063; }
+        .agent-action-receipts span.failure { color: #a35f58; }.agent-action-receipts span.failure i { background: #b66d65; }
+        .agent-action-receipts span.waiting { color: #8c6c3d; }.agent-action-receipts span.waiting i { background: #bf8a3d; }
+        .agent-action-receipts strong { display: block; margin-top: 6px; overflow-wrap: anywhere; color: #25282b; font-size: 10px; }
+        .agent-action-receipts small { display: block; margin-top: 4px; overflow-wrap: anywhere; color: #8a9095; font-size: 8px; line-height: 1.45; }
+        .agent-action-receipts button { margin-top: 10px; padding: 7px 10px; display: inline-flex; align-items: center; gap: 7px; color: #fff; background: #202326; border: 0; border-radius: 9px; font-size: 8px; font-weight: 650; }
+      `}</style>
+    </div>
+  );
+}
+
+function ScenarioResponse({ scenario, text, document, actions = [], openDocuments, onSpeak, onAction }: {
   scenario: AgentScenario;
   text?: string;
   document?: OpsDocument;
+  actions?: OpsAgentActionResult[];
   openDocuments: (documentId?: string) => void;
   onSpeak: (text: string) => void;
+  onAction: (prompt: string) => void;
 }) {
+  const [useful, setUseful] = useState(false);
   const body = text ? text.split(/\n{2,}/).filter(Boolean) : scenario.body;
   const answerText = [scenario.lead, ...body].filter(Boolean).join("\n\n");
   return (
@@ -492,14 +1020,15 @@ function ScenarioResponse({ scenario, text, document, openDocuments, onSpeak }: 
           <article className="agent-artifact">
             <span>{scenario.artifact.kicker}</span><h3>{scenario.artifact.title}</h3>
             <div>{scenario.artifact.metrics.map((metric) => <p key={metric.label}><small>{metric.label}</small><strong>{metric.value}</strong></p>)}</div>
-            <footer><small><OpsIcon name="shield" size={13} /> Aucune action externe sans validation</small><button>{scenario.artifact.action}</button></footer>
+            <footer><small><OpsIcon name="shield" size={13} /> Aucune action externe sans validation</small><button onClick={() => onAction(scenario.artifact?.action ?? "Prépare la prochaine action.")}>{scenario.artifact.action}</button></footer>
           </article>
         )}
+        <AgentActionReceipts actions={actions} onAction={onAction} />
         {document ? <PdfArtifactCard document={document} openDocuments={openDocuments} /> : null}
         <div className="response-actions">
           <button type="button" onClick={() => navigator.clipboard?.writeText(answerText)}><OpsIcon name="copy" size={14} /> Copier</button>
-          <button type="button"><OpsIcon name="thumb" size={14} /> Utile</button>
-          <button type="button"><OpsIcon name="edit" size={14} /> Corriger</button>
+          <button type="button" onClick={() => setUseful((current) => !current)}><OpsIcon name="thumb" size={14} /> {useful ? "Noté" : "Utile"}</button>
+          <button type="button" onClick={() => onAction("Corrige ta réponse précédente : vérifie chaque fait dans la mémoire, explicite ce qui était imprécis et redonne une réponse sourcée.")}><OpsIcon name="edit" size={14} /> Corriger</button>
           <button type="button" onClick={() => onSpeak(answerText)}><OpsIcon name="volume" size={14} /> Écouter</button>
         </div>
       </div>
@@ -523,6 +1052,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   const inlineSpeechPlaybackRef = useRef<StreamingAudioPlayback | null>(null);
   const inlineSpeechRequestRef = useRef<AbortController | null>(null);
   const inlineSpeechGenerationRef = useRef(0);
+  const agentRequestRef = useRef<AbortController | null>(null);
   const resetOpenCodeSessionRef = useRef(true);
   const conversationIdRef = useRef(createConversationId());
 
@@ -607,11 +1137,25 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   }, [voiceOpen]);
 
   useEffect(() => () => {
+    agentRequestRef.current?.abort();
     inlineSpeechGenerationRef.current += 1;
     inlineSpeechRequestRef.current?.abort();
     inlineSpeechPlaybackRef.current?.stop();
     window.speechSynthesis?.cancel();
   }, []);
+
+  const stopAgent = useCallback(() => {
+    agentRequestRef.current?.abort();
+    agentRequestRef.current = null;
+    setProcessing(false);
+  }, []);
+
+  const startNewConversation = useCallback(() => {
+    stopAgent();
+    setMessages([]);
+    conversationIdRef.current = createConversationId();
+    resetOpenCodeSessionRef.current = true;
+  }, [stopAgent]);
 
   const submit = useCallback(async (override?: string, fromVoice = false) => {
     const prompt = (override ?? value).trim();
@@ -621,6 +1165,9 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
     const userId = Date.now();
     const priorHistory = buildConversationHistory(messagesRef.current);
     const pendingScenario = emptyAgentScenario(prompt);
+    const requestController = new AbortController();
+    agentRequestRef.current?.abort();
+    agentRequestRef.current = requestController;
 
     setMessages((current) => [...current, { id: userId, role: "user", prompt }, {
       id: userId + 1,
@@ -642,6 +1189,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
           resetSession: resetOpenCodeSessionRef.current,
           conversationId: conversationIdRef.current,
         }),
+        signal: requestController.signal,
       });
       if (!response.ok) throw new Error(`agent_${response.status}`);
       if (!response.body) throw new Error("agent_unavailable");
@@ -654,6 +1202,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
       let speechText = "";
       let serverScenario = pendingScenario;
       let documentPlan: OpsDocumentPlan | undefined;
+      let actionResults: OpsAgentActionResult[] = [];
       let lineBuffer = "";
       const structured = response.headers.get("content-type")?.includes("application/x-ndjson") ?? false;
 
@@ -676,8 +1225,20 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         } else if (event.type === "meta") {
           serverScenario = event.scenario;
           documentPlan = event.document;
+          actionResults = event.actions ?? [];
+          for (const action of actionResults) {
+            if (action.status !== "executed" || !action.record) continue;
+            document.dispatchEvent(new CustomEvent("ops-record-created", {
+              detail: { kind: action.type, id: action.record.id },
+            }));
+          }
+          if (event.memoryCommit?.id) {
+            document.dispatchEvent(new CustomEvent("ops-record-created", {
+              detail: { kind: "analysis", id: event.memoryCommit.id },
+            }));
+          }
           setMessages((current) => current.map((message) => message.id === userId + 1
-            ? { ...message, scenario: serverScenario, loading: !text.trim(), text }
+            ? { ...message, scenario: serverScenario, actions: actionResults, loading: !text.trim(), text }
             : message));
         } else if (event.type === "delta") {
           text += event.delta;
@@ -692,7 +1253,9 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         } else if (event.type === "speech") {
           speechText = event.text.trim();
         } else if (event.type === "error") {
-          text = `${text}${text ? "\n\n" : ""}${event.message}`;
+          text = event.retryable
+            ? event.message
+            : `${text}${text ? "\n\n" : ""}${event.message}`;
           setMessages((current) => current.map((message) => message.id === userId + 1
             ? { ...message, scenario: serverScenario, loading: false, text }
             : message));
@@ -739,6 +1302,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
       setMessages((current) => current.map((message) => message.id === userId + 1 ? {
         ...message,
         scenario: serverScenario,
+        actions: actionResults,
         loading: false,
         text,
         progressKind: undefined,
@@ -764,13 +1328,17 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
           progressUpdatedAt: progressStartedAt,
         } : message));
         try {
-          const document = await generatePdfDocument(documentPlan);
+          const document = await generatePdfDocument(documentPlan, requestController.signal);
+          if (requestController.signal.aborted) {
+            throw new DOMException("La génération du document a été interrompue.", "AbortError");
+          }
           onDocumentGenerated(document);
           setMessages((current) => current.map((message) => message.id === userId + 1 ? {
             ...message,
             scenario: serverScenario,
             text,
             document,
+            actions: actionResults,
             loading: false,
             progressKind: undefined,
             progressStartedAt: undefined,
@@ -780,7 +1348,8 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
             progressEtaMs: undefined,
             progressUpdatedAt: undefined,
           } : message));
-        } catch {
+        } catch (error) {
+          if (requestController.signal.aborted) throw error;
           const documentFailure = "La réponse est conservée, mais le PDF n’a pas pu être généré ou archivé. Vous pouvez relancer uniquement la création du document.";
           text = `${text}${text ? "\n\n" : ""}${documentFailure}`;
           serverScenario = {
@@ -807,6 +1376,29 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         speak(speechText || [serverScenario.lead, text].filter(Boolean).join("\n\n"));
       }
     } catch {
+      if (requestController.signal.aborted) {
+        const interruptedScenario = createReply(
+          "agent-interrupted",
+          "Réponse interrompue.",
+          ["La demande a été arrêtée avant la fin. Aucune action externe n’a été exécutée."],
+          [],
+          ["Reprendre la demande"],
+        );
+        setMessages((current) => current.map((message) => message.id === userId + 1 ? {
+          ...message,
+          scenario: interruptedScenario,
+          text: "",
+          loading: false,
+          progressKind: undefined,
+          progressStartedAt: undefined,
+          progressStage: undefined,
+          progressLabel: undefined,
+          progressDetail: undefined,
+          progressEtaMs: undefined,
+          progressUpdatedAt: undefined,
+        } : message));
+        return;
+      }
       const technicalScenario = createReply(
         "agent-unavailable",
         "OPS n’a pas pu terminer cette demande.",
@@ -829,7 +1421,10 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
       } : message));
       if (fromVoice) speak(`${technicalScenario.lead} ${technicalScenario.body.join(" ")}`);
     } finally {
-      setProcessing(false);
+      if (agentRequestRef.current === requestController) {
+        agentRequestRef.current = null;
+        setProcessing(false);
+      }
     }
   }, [onDocumentGenerated, processing, speak, value]);
 
@@ -854,7 +1449,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
         <div className="agent-empty-page">
           <div className="agent-empty-center">
             <h1>Bonjour Marie. On commence&nbsp;?</h1>
-            <FullComposer value={value} setValue={setValue} onSubmit={() => submit()} onVoice={() => setVoiceOpen(true)} processing={processing} centered />
+            <FullComposer value={value} setValue={setValue} onSubmit={() => submit()} onStop={stopAgent} onVoice={() => setVoiceOpen(true)} onAttach={() => openDocuments()} processing={processing} centered />
             <div className="agent-starters">
               {agentScenarios.slice(0, 4).map((scenario, index) => (
                 <button key={scenario.id} onClick={() => submit(scenario.label)}><OpsIcon name={(["invoice", "trend", "target", "brain"] as IconName[])[index]} size={20} /><span>{scenario.label}</span></button>
@@ -878,7 +1473,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   return (
     <>
       <div className="agent-thread-page">
-        <div className="thread-toolbar"><button onClick={() => { setMessages([]); conversationIdRef.current = createConversationId(); resetOpenCodeSessionRef.current = true; }}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button><OpsIcon name="dots" size={18} /></button></div>
+        <div className="thread-toolbar"><button onClick={startNewConversation}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button onClick={() => document.dispatchEvent(new CustomEvent("ops-command"))} aria-label="Actions de la conversation"><OpsIcon name="dots" size={18} /></button></div>
         <div className="thread-scroll" ref={scrollRef}>
           <div className="thread-content">
             {messages.map((message) => message.role === "user" ? (
@@ -898,7 +1493,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
                 ) : message.loading ? (
                   <div className="agent-thinking"><span className="assistant-mark"><OpsIcon name="spark" size={18} /></span><div><i /><span>{message.statusText ?? "Recherche dans 7 sources"}</span></div></div>
                 ) : null}
-                {!message.loading && message.scenario ? <ScenarioResponse scenario={message.scenario} text={message.text} document={message.document} openDocuments={openDocuments} onSpeak={speak} /> : null}
+                {!message.loading && message.scenario ? <ScenarioResponse scenario={message.scenario} text={message.text} document={message.document} actions={message.actions} openDocuments={openDocuments} onSpeak={speak} onAction={(prompt) => submit(prompt)} /> : null}
                 {!message.loading && !message.progressKind && message.scenario && (
                   <div className="followups">{message.scenario.followups.map((followup) => <button key={followup} onClick={() => submit(followup)}>{followup}<OpsIcon name="arrow" size={13} /></button>)}</div>
                 )}
@@ -906,7 +1501,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
             ))}
           </div>
         </div>
-        <div className="thread-composer-wrap"><FullComposer value={value} setValue={setValue} onSubmit={() => submit()} onVoice={() => setVoiceOpen(true)} processing={processing} /><p>OPS cite ses sources et demande votre validation avant toute action externe.</p></div>
+        <div className="thread-composer-wrap"><FullComposer value={value} setValue={setValue} onSubmit={() => submit()} onStop={stopAgent} onVoice={() => setVoiceOpen(true)} onAttach={() => openDocuments()} processing={processing} /><p>OPS cite ses sources et demande votre validation avant toute action externe.</p></div>
       </div>
       <VoiceMode
         ref={voiceModeRef}
@@ -921,82 +1516,1001 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
 }
 
 function CyclePage({ openAgent }: { openAgent: OpenAgent }) {
+  const [pipelineItems] = usePersistedOpportunities();
   return (
     <div className="content-page">
       <PageHeading page="cycle" action={<button className="primary-button" onClick={() => openAgent("Quels dossiers risquent de se bloquer cette semaine ?")}><OpsIcon name="spark" size={16} /> Analyser le cycle</button>} />
       <section className="cycle-ribbon">
-        {cycleStages.map((stage, index) => <button key={stage.label}><span>0{index + 1}</span><strong>{stage.label}</strong><em>{stage.count} dossiers</em><b>{stage.value}</b><i style={{ width: `${stage.progress}%` }} /></button>)}
+        {cycleStages.map((stage, index) => <button key={stage.label} onClick={() => openAgent(`Analyse les ${stage.count} dossiers de l'étape ${stage.label}, explique les risques et les prochaines actions.`)}><span>0{index + 1}</span><strong>{stage.label}</strong><em>{stage.count} dossiers</em><b>{stage.value}</b><i style={{ width: `${stage.progress}%` }} /></button>)}
       </section>
       <section className="panel data-panel">
-        <div className="panel-title"><div><span>Dossiers en mouvement</span><small>14 changements depuis hier</small></div><div className="table-actions"><button><OpsIcon name="filter" size={15} /> Filtrer</button><button><OpsIcon name="plus" size={15} /> Nouveau</button></div></div>
+        <div className="panel-title"><div><span>Dossiers en mouvement</span><small>14 changements depuis hier</small></div><div className="table-actions"><button onClick={() => openAgent("Filtre les dossiers du cycle par niveau de risque et échéance.")}><OpsIcon name="filter" size={15} /> Filtrer</button><button onClick={() => openAgent("Crée un nouveau dossier commercial. Demande-moi les informations nécessaires une par une.")}><OpsIcon name="plus" size={15} /> Nouveau</button></div></div>
         <div className="entity-table cycle-table">
           <div className="table-head"><span>Dossier</span><span>Étape</span><span>Responsable</span><span>Montant</span><span>Prochaine action</span><span>Risque</span></div>
-          {opportunities.map((opportunity) => <button className="table-row" key={opportunity.id} onClick={() => openAgent(`Résume le dossier ${opportunity.name}`)}><span><strong>{opportunity.name}</strong><small>{opportunity.id} · {opportunity.source}</small></span><span><i className="stage-dot" />{opportunity.stage}</span><span>{opportunity.owner}</span><span><strong>{(opportunity.amount / 1000).toLocaleString("fr-FR")} K€</strong></span><span>{opportunity.next}</span><span className={opportunity.probability > 70 ? "risk-low" : "risk-mid"}>{opportunity.probability > 70 ? "Faible" : "À suivre"}</span></button>)}
+          {pipelineItems.map((opportunity) => <button className="table-row" key={opportunity.id} onClick={() => openAgent(`Résume le dossier ${opportunity.name}`)}><span><strong>{opportunity.name}</strong><small>{opportunity.id} · {opportunity.source}</small></span><span><i className="stage-dot" />{opportunity.stage}</span><span>{opportunity.owner}</span><span><strong>{(opportunity.amount / 1000).toLocaleString("fr-FR")} K€</strong></span><span>{opportunity.next}</span><span className={opportunity.probability > 70 ? "risk-low" : "risk-mid"}>{opportunity.probability > 70 ? "Faible" : "À suivre"}</span></button>)}
         </div>
       </section>
     </div>
   );
 }
 
+type EmailThreadView = (typeof emailThreads)[number] & {
+  folder: "to_process" | "priority" | "waiting" | "sent";
+  classification: "positive" | "question" | "later" | "opposition" | "priority" | "neutral";
+  body?: string;
+  recipient?: string;
+};
+
+function baseEmailThreads(): EmailThreadView[] {
+  return emailThreads.map((thread) => ({
+    ...thread,
+    folder: thread.tag === "Prioritaire"
+      ? "priority"
+      : thread.tag === "Plus tard"
+        ? "waiting"
+        : "to_process",
+    classification: thread.tag === "Question"
+      ? "question"
+      : thread.tag === "Plus tard"
+        ? "later"
+        : thread.tag === "Prioritaire"
+          ? "priority"
+          : "positive",
+  }));
+}
+
 function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
-  const [selected, setSelected] = useState(emailThreads[0]);
+  const [threads, setThreads] = useState<EmailThreadView[]>(baseEmailThreads);
+  const [selectedId, setSelectedId] = useState(emailThreads[0].id);
+  const [folder, setFolder] = useState<"to_process" | "priority" | "waiting" | "sent" | "all">("to_process");
+  const [classification, setClassification] = useState<EmailThreadView["classification"] | null>(null);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [compose, setCompose] = useState({ to: "", company: "", subject: "", body: "" });
+  const [sending, setSending] = useState(false);
+  const [sendStatus, setSendStatus] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const load = () => {
+      void fetch("/api/records?kind=email", { cache: "no-store", signal: controller.signal })
+        .then(async (response) => response.ok ? response.json() as Promise<{ records?: PersistedRecord[] }> : { records: [] })
+        .then(({ records = [] }) => {
+          if (controller.signal.aborted) return;
+          const created = records.map((record): EmailThreadView => {
+            const attributes = record.attributes;
+            const sent = attributes.mailbox === "sent" || attributes.direction === "outbound";
+            const classificationValue = typeof attributes.classification === "string"
+              ? attributes.classification as EmailThreadView["classification"]
+              : "neutral";
+            const sender = typeof attributes.sender === "string" && attributes.sender
+              ? attributes.sender.replace(/\s*<[^>]+>\s*$/, "")
+              : sent
+                ? "Marie Delmas"
+                : record.title.split(" — ")[0] || "Contact";
+            const relationCompany = record.relations
+              .find((relation) => /^(?:CLI|CLIENT)-/i.test(relation))
+              ?.split(" — ")
+              .slice(1)
+              .join(" — ");
+            const companyName = typeof attributes.company === "string" && attributes.company
+              ? attributes.company
+              : relationCompany || (sent ? "Message sortant" : "Entreprise");
+            const receivedAt = [attributes.received_at, attributes.sent_at, record.createdAt]
+              .find((value): value is string => typeof value === "string" && Boolean(value));
+            const timestamp = receivedAt && !Number.isNaN(new Date(receivedAt).getTime())
+              ? new Intl.DateTimeFormat("fr-FR", {
+                day: "2-digit",
+                month: "short",
+                hour: "2-digit",
+                minute: "2-digit",
+              }).format(new Date(receivedAt)).replace(",", " ·")
+              : "À l’instant";
+            const folderValue: EmailThreadView["folder"] = sent
+              ? "sent"
+              : attributes.mailbox === "waiting" || classificationValue === "later"
+                ? "waiting"
+                : classificationValue === "priority"
+                  ? "priority"
+                  : "to_process";
+            const tag = sent
+              ? "Envoyé"
+              : classificationValue === "priority"
+                ? "Prioritaire"
+                : classificationValue === "question"
+                  ? "Question"
+                  : classificationValue === "later"
+                    ? "Plus tard"
+                    : classificationValue === "positive"
+                      ? "Positif"
+                      : "À suivre";
+            const replyAddress = typeof attributes.sender_email === "string" && attributes.sender_email
+              ? attributes.sender_email
+              : typeof attributes.recipient === "string"
+                ? attributes.recipient
+                : "";
+            return {
+              id: record.id,
+              sender,
+              company: companyName,
+              subject: record.title,
+              preview: record.summary,
+              time: timestamp,
+              tag,
+              unread: !sent && attributes.status === "to_process",
+              linked: record.relations.find((relation) => /^(?:CLI|OPP|FACT|PROJET)-/.test(relation)) ?? "ORG-001",
+              folder: folderValue,
+              classification: classificationValue,
+              body: sent ? record.content : record.summary,
+              recipient: replyAddress,
+            };
+          });
+          setThreads((current) => [
+            ...created,
+            ...current.filter((thread) => !created.some((record) => record.id === thread.id)),
+          ]);
+        })
+        .catch(() => {
+          // La boîte de démonstration locale reste utilisable.
+        });
+    };
+    const refresh = (event: Event) => {
+      const kind = (event as CustomEvent<{ kind?: string }>).detail?.kind;
+      if (kind === "email") load();
+    };
+    load();
+    document.addEventListener("ops-record-created", refresh);
+    return () => {
+      controller.abort();
+      document.removeEventListener("ops-record-created", refresh);
+    };
+  }, []);
+
+  const filteredThreads = threads.filter((thread) => {
+    const folderMatches = folder === "all" || thread.folder === folder;
+    const classificationMatches = !classification || thread.classification === classification;
+    return folderMatches && classificationMatches;
+  });
+  const selected = threads.find((thread) => thread.id === selectedId)
+    ?? filteredThreads[0]
+    ?? threads[0];
+  const reply = `Bonjour ${selected.sender.split(" ")[0]}, merci pour votre retour. Je note le traitement cette semaine et reste disponible si votre équipe a besoin d’un document complémentaire.`;
+
+  useEffect(() => {
+    if (filteredThreads.length && !filteredThreads.some((thread) => thread.id === selectedId)) {
+      setSelectedId(filteredThreads[0].id);
+    }
+  }, [filteredThreads, selectedId]);
+
+  const sendEmail = useCallback(async (payload: {
+    to: string;
+    company?: string;
+    subject: string;
+    body: string;
+    threadId?: string;
+    linked?: string[];
+  }) => {
+    setSending(true);
+    setSendStatus("");
+    try {
+      const created = await createOpsRecord({
+        kind: "email",
+        ...payload,
+        mailbox: "sent",
+        classification: "neutral",
+        status: "sent_demo",
+        validated: true,
+      });
+      const outgoing: EmailThreadView = {
+        id: created.id,
+        sender: "Marie Delmas",
+        company: payload.company || "Message sortant",
+        subject: payload.subject,
+        preview: payload.body.replace(/\s+/g, " ").slice(0, 92),
+        time: "À l’instant",
+        tag: "Envoyé",
+        unread: false,
+        linked: payload.linked?.[0] ?? payload.threadId ?? "ORG-001",
+        folder: "sent",
+        classification: "neutral",
+        body: payload.body,
+        recipient: payload.to,
+      };
+      setThreads((current) => [outgoing, ...current]);
+      setSelectedId(outgoing.id);
+      setFolder("sent");
+      setClassification(null);
+      setSendStatus("Envoyé et ajouté à la mémoire Obsidian.");
+      return true;
+    } catch {
+      setSendStatus("L’envoi de démonstration n’a pas pu être archivé.");
+      return false;
+    } finally {
+      setSending(false);
+    }
+  }, []);
+
+  const folders = [
+    { id: "to_process" as const, label: "À traiter", icon: "mail" as IconName },
+    { id: "priority" as const, label: "Prioritaires", icon: "target" as IconName },
+    { id: "waiting" as const, label: "En attente", icon: "clock" as IconName },
+    { id: "sent" as const, label: "Envoyés", icon: "send" as IconName },
+    { id: "all" as const, label: "Tous les emails", icon: "document" as IconName },
+  ];
+  const classifications: Array<{ id: EmailThreadView["classification"]; label: string }> = [
+    { id: "positive", label: "Positif" },
+    { id: "question", label: "Question" },
+    { id: "later", label: "Plus tard" },
+    { id: "opposition", label: "Opposition" },
+  ];
+
   return (
-    <div className="content-page wide-page">
-      <PageHeading page="emails" action={<button className="primary-button" onClick={() => openAgent("Quels emails demandent une réponse aujourd’hui ?")}><OpsIcon name="spark" size={16} /> Prioriser avec OPS</button>} />
-      <section className="mail-shell">
-        <aside className="mail-folders"><button className="compose-mail"><OpsIcon name="plus" size={16} /> Nouveau message</button><span>Boîtes</span>{["À traiter · 7", "Prioritaires · 3", "En attente · 5", "Envoyés", "Tous les emails"].map((item, index) => <button className={index === 0 ? "active" : ""} key={item}><OpsIcon name={index === 0 ? "mail" : index === 1 ? "target" : "document"} size={16} />{item}</button>)}<span>Classification OPS</span>{["Positif · 3", "Question · 2", "Plus tard · 4", "Opposition · 0"].map((item) => <button key={item}><i />{item}</button>)}</aside>
-        <div className="mail-list"><div className="mail-list-head"><strong>À traiter</strong><button><OpsIcon name="filter" size={15} /></button></div>{emailThreads.map((thread) => <button key={thread.id} onClick={() => setSelected(thread)} className={`mail-thread ${selected.id === thread.id ? "active" : ""}`}><span className="contact-avatar">{thread.sender.split(" ").map((part) => part[0]).join("")}</span><span><strong>{thread.sender}</strong><small>{thread.company}</small><b>{thread.subject}</b><p>{thread.preview}</p><em>{thread.tag}</em></span><time>{thread.time}</time>{thread.unread && <i className="unread-dot" />}</button>)}</div>
-        <article className="mail-reader"><header><div><span>{selected.tag}</span><h2>{selected.subject}</h2><p>{selected.sender} · {selected.company}</p></div><div><button><OpsIcon name="dots" size={17} /></button><button><OpsIcon name="arrow" size={17} /></button></div></header><div className="mail-ai-summary"><span><OpsIcon name="spark" size={15} /> Résumé OPS</span><p>Le client confirme le traitement interne de la facture. Aucun litige n’est mentionné. Une réponse courte est recommandée pour confirmer le suivi sans créer de tension.</p><SourceChips sources={[selected.linked, selected.id]} /></div><div className="mail-body"><p>Bonjour Marie,</p><p>Nous avons bien reçu votre message et faisons le nécessaire avec notre service comptable. Le règlement devrait être traité cette semaine.</p><p>Je reviens vers vous dès que le virement est confirmé.</p><p>Bien à vous,<br />{selected.sender}</p></div><div className="draft-box"><span><OpsIcon name="spark" size={14} /> Brouillon préparé</span><p>Bonjour {selected.sender.split(" ")[0]}, merci pour votre retour. Je note le traitement cette semaine et reste disponible si votre service comptable a besoin d’un duplicata.</p><footer><small>Ton : cordial · aucune pression</small><button onClick={() => openAgent(`Améliore le brouillon pour ${selected.sender}`)}>Modifier avec OPS</button><button className="dark">Valider</button></footer></div></article>
-      </section>
-    </div>
+    <>
+      <div className="content-page wide-page">
+        <PageHeading page="emails" action={<button className="primary-button" onClick={() => openAgent("Quels emails demandent une réponse aujourd’hui ?")}><OpsIcon name="spark" size={16} /> Prioriser avec OPS</button>} />
+        <section className="mail-shell">
+          <aside className="mail-folders">
+            <button className="compose-mail" onClick={() => { setSendStatus(""); setComposeOpen(true); }}><OpsIcon name="plus" size={16} /> Nouveau message</button>
+            <span>Boîtes</span>
+            {folders.map((item) => {
+              const count = item.id === "all" ? threads.length : threads.filter((thread) => thread.folder === item.id).length;
+              return (
+                <button
+                  className={folder === item.id && !classification ? "active" : ""}
+                  key={item.id}
+                  onClick={() => { setFolder(item.id); setClassification(null); }}
+                >
+                  <OpsIcon name={item.icon} size={16} />{item.label}{count ? ` · ${count}` : ""}
+                </button>
+              );
+            })}
+            <span>Classification OPS</span>
+            {classifications.map((item) => {
+              const count = threads.filter((thread) => thread.classification === item.id).length;
+              return (
+                <button
+                  className={classification === item.id ? "active" : ""}
+                  key={item.id}
+                  onClick={() => { setClassification(item.id); setFolder("all"); }}
+                >
+                  <i />{item.label} · {count}
+                </button>
+              );
+            })}
+          </aside>
+          <div className="mail-list">
+            <div className="mail-list-head">
+              <strong>{classification ? classifications.find((item) => item.id === classification)?.label : folders.find((item) => item.id === folder)?.label}</strong>
+              <button onClick={() => openAgent(`Analyse et filtre les emails de la vue ${folder}`)}><OpsIcon name="filter" size={15} /></button>
+            </div>
+            {filteredThreads.map((thread) => (
+              <button key={thread.id} onClick={() => setSelectedId(thread.id)} className={`mail-thread ${selected.id === thread.id ? "active" : ""}`}>
+                <span className="contact-avatar">{thread.sender.split(" ").map((part) => part[0]).join("").slice(0, 2)}</span>
+                <span><strong>{thread.sender}</strong><small>{thread.company}</small><b>{thread.subject}</b><p>{thread.preview}</p><em>{thread.tag}</em></span>
+                <time>{thread.time}</time>{thread.unread && <i className="unread-dot" />}
+              </button>
+            ))}
+            {!filteredThreads.length ? <div className="mail-empty">Aucun message dans cette vue.</div> : null}
+          </div>
+          <article className="mail-reader">
+            <header>
+              <div><span>{selected.tag}</span><h2>{selected.subject}</h2><p>{selected.sender} · {selected.company}</p></div>
+              <div>
+                <button onClick={() => openAgent(`Résume toutes les relations de ${selected.id}`)}><OpsIcon name="dots" size={17} /></button>
+                <button onClick={() => openAgent(`Prépare une réponse à ${selected.id} pour ${selected.sender}`)}><OpsIcon name="arrow" size={17} /></button>
+              </div>
+            </header>
+            <div className="mail-ai-summary"><span><OpsIcon name="spark" size={15} /> Résumé OPS</span><p>{selected.preview} Le message est relié au dossier {selected.linked} et sa prochaine action peut être préparée sans perdre l’historique.</p><SourceChips sources={[selected.linked, selected.id]} /></div>
+            <div className="mail-body">
+              {selected.body ? <p className="mail-preserved-body">{selected.body}</p> : <><p>Bonjour Marie,</p><p>{selected.preview}</p><p>Je reviens vers vous dès que le point est confirmé.</p><p>Bien à vous,<br />{selected.sender}</p></>}
+            </div>
+            {selected.folder !== "sent" ? (
+              <div className="draft-box">
+                <span><OpsIcon name="spark" size={14} /> Brouillon préparé</span><p>{reply}</p>
+                <footer>
+                  <small>{sendStatus || "Ton : cordial · validation requise"}</small>
+                  <button onClick={() => openAgent(`Améliore ce brouillon de réponse pour ${selected.id} : ${reply}`)}>Modifier avec OPS</button>
+                  <button
+                    className="dark"
+                    disabled={sending}
+                    onClick={() => void sendEmail({
+                      to: selected.recipient || `${selected.sender.split(" ")[0].toLocaleLowerCase("fr")}@exemple.fr`,
+                      company: selected.company,
+                      subject: /^re\s*:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`,
+                      body: reply,
+                      threadId: selected.id,
+                      linked: [selected.id, selected.linked],
+                    })}
+                  >
+                    {sending ? "Envoi…" : "Valider et envoyer"}
+                  </button>
+                </footer>
+              </div>
+            ) : <div className="mail-sent-state"><OpsIcon name="check" size={15} /> Message envoyé et archivé dans Obsidian.</div>}
+          </article>
+        </section>
+      </div>
+      <OpsModal
+        open={composeOpen}
+        title="Nouveau message"
+        description="Le message est envoyé dans la démo puis inscrit dans la mémoire de l’entreprise."
+        onClose={() => setComposeOpen(false)}
+      >
+        <form
+          className="ops-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void sendEmail(compose).then((sent) => {
+              if (!sent) return;
+              setCompose({ to: "", company: "", subject: "", body: "" });
+              setComposeOpen(false);
+            });
+          }}
+        >
+          <label><span>Destinataire</span><input required value={compose.to} onChange={(event) => setCompose((current) => ({ ...current, to: event.target.value }))} placeholder="nom@entreprise.fr" /></label>
+          <label><span>Entreprise</span><input value={compose.company} onChange={(event) => setCompose((current) => ({ ...current, company: event.target.value }))} placeholder="Entreprise liée" /></label>
+          <label className="full"><span>Objet</span><input required value={compose.subject} onChange={(event) => setCompose((current) => ({ ...current, subject: event.target.value }))} placeholder="Objet du message" /></label>
+          <label className="full"><span>Message</span><textarea required rows={8} value={compose.body} onChange={(event) => setCompose((current) => ({ ...current, body: event.target.value }))} placeholder="Écrivez votre message…" /></label>
+          <footer className="full"><span>{sendStatus}</span><button type="button" onClick={() => openAgent(`Aide-moi à rédiger un email avec cet objet : ${compose.subject}`)}><OpsIcon name="spark" size={15} /> Rédiger avec OPS</button><button className="primary-button" disabled={sending} type="submit">{sending ? "Envoi…" : "Valider et envoyer"}</button></footer>
+        </form>
+      </OpsModal>
+    </>
   );
 }
 
-function DocumentsPage({ openAgent, generatedDocuments, preferredDocumentId }: {
+function DocumentsPage({ openAgent, generatedDocuments, preferredDocumentId, onDocumentImported }: {
   openAgent: OpenAgent;
   generatedDocuments: OpsDocument[];
   preferredDocumentId?: string;
+  onDocumentImported?: (document: OpsDocument) => void;
 }) {
-  const allDocuments = useMemo(() => [...generatedDocuments, ...documents], [generatedDocuments]);
+  const allDocuments = useMemo(() => {
+    const merged = new Map<string, OpsDocument>();
+    for (const document of documents) merged.set(document.id, document);
+    for (const document of generatedDocuments) merged.set(document.id, document);
+    return [...merged.values()];
+  }, [generatedDocuments]);
   const [selectedId, setSelectedId] = useState(preferredDocumentId ?? allDocuments[0].id);
-  const selected = allDocuments.find((document) => document.id === selectedId) ?? allDocuments[0];
+  const [query, setQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [typeFilter, setTypeFilter] = useState("Tous");
+  const [importing, setImporting] = useState(false);
+  const [importStatus, setImportStatus] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const documentTypes = ["Tous", ...new Set(allDocuments.map((document) => document.type))];
+  const pdfCount = allDocuments.filter((document) => (
+    Boolean(document.url || document.objectUrl || document.dataUrl)
+  )).length;
+  const visibleDocuments = allDocuments.filter((document) => {
+    const matchesType = typeFilter === "Tous" || document.type === typeFilter;
+    const haystack = `${document.name} ${document.id} ${document.linked} ${document.owner}`.toLocaleLowerCase("fr");
+    return matchesType && haystack.includes(query.toLocaleLowerCase("fr").trim());
+  });
+  const selected = visibleDocuments.find((document) => document.id === selectedId)
+    ?? visibleDocuments[0];
 
   useEffect(() => {
     if (preferredDocumentId && allDocuments.some((document) => document.id === preferredDocumentId)) setSelectedId(preferredDocumentId);
   }, [allDocuments, preferredDocumentId]);
 
+  const cycleType = () => {
+    const index = documentTypes.indexOf(typeFilter);
+    setTypeFilter(documentTypes[(index + 1) % documentTypes.length]);
+  };
+  const importPdf = async (file: File) => {
+    setImporting(true);
+    setImportStatus("");
+    try {
+      const form = new FormData();
+      form.set("file", file);
+      form.set("linked", "Direction");
+      const response = await fetch("/api/documents/import", { method: "POST", body: form });
+      const payload = await response.json().catch(() => ({})) as {
+        error?: string;
+        document?: StoredOpsDocument;
+      };
+      if (!response.ok || !payload.document) throw new Error(payload.error ?? "document_import_failed");
+      const imported = storedDocumentToUi(payload.document);
+      onDocumentImported?.(imported);
+      setSelectedId(imported.id);
+      setImportStatus(`${file.name} est archivé dans Documents et relié à Obsidian.`);
+    } catch {
+      setImportStatus("Le PDF n’a pas pu être importé. Vérifiez qu’il est valide et inférieur à 15 Mo.");
+    } finally {
+      setImporting(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
   return (
     <div className="content-page">
-      <PageHeading page="documents" action={<button className="primary-button"><OpsIcon name="plus" size={16} /> Importer</button>} />
+      <PageHeading page="documents" action={<><input ref={fileInputRef} hidden accept="application/pdf,.pdf" type="file" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importPdf(file); }} /><button className="primary-button" disabled={importing} onClick={() => fileInputRef.current?.click()}><OpsIcon name="plus" size={16} /> {importing ? "Import…" : "Importer"}</button></>} />
       <div className="documents-layout">
-        <section className="panel documents-panel"><div className="panel-title"><div><span>{286 + generatedDocuments.length} documents</span><small>{17 + generatedDocuments.length} ajoutés cette semaine</small></div><div className="table-actions"><button><OpsIcon name="search" size={15} /> Rechercher</button><button><OpsIcon name="filter" size={15} /> Filtrer</button></div></div><div className="entity-table documents-table"><div className="table-head"><span>Document</span><span>Type</span><span>Lié à</span><span>Responsable</span><span>Mise à jour</span><span>État OPS</span></div>{allDocuments.map((document) => <button className={`table-row ${selected.id === document.id ? "selected" : ""}`} onClick={() => setSelectedId(document.id)} key={document.id}><span><i className="doc-type"><OpsIcon name={document.generated ? "download" : "document"} size={16} /></i><span><strong>{document.name}</strong><small>{document.id}</small></span></span><span>{document.type}</span><span>{document.linked}</span><span>{document.owner}</span><span>{document.updated}</span><span className={`doc-status status-${document.status.toLocaleLowerCase("fr").replace("à ", "").replaceAll(" ", "-")}`}>{document.status}</span></button>)}</div></section>
-        <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.url || selected.objectUrl || selected.dataUrl ? <object className="pdf-preview" data={selected.url ?? selected.objectUrl ?? selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.url ?? selected.objectUrl ?? selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} faits exploitables</strong><p>Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné.</p>{selected.url || selected.objectUrl || selected.dataUrl ? <a className="document-download" href={selected.downloadUrl ?? selected.url ?? selected.objectUrl ?? selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse ${selected.name}`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside>
+        <section className="panel documents-panel">
+          <div className="panel-title"><div><span>{allDocuments.length} documents disponibles</span><small>{importStatus || `${allDocuments.length} éléments indexés dans Obsidian · ${pdfCount} PDF ouvrables`}</small></div><div className="table-actions"><button className={searchOpen ? "active" : ""} onClick={() => setSearchOpen((current) => !current)}><OpsIcon name="search" size={15} /> Rechercher</button><button onClick={cycleType}><OpsIcon name="filter" size={15} /> {typeFilter === "Tous" ? "Filtrer" : typeFilter}</button></div></div>
+          {searchOpen ? <div className="entity-search"><OpsIcon name="search" size={15} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Titre, identifiant, client ou responsable…" /></div> : null}
+          <div className="entity-table documents-table"><div className="table-head"><span>Document</span><span>Type</span><span>Lié à</span><span>Responsable</span><span>Mise à jour</span><span>État OPS</span></div>{visibleDocuments.map((document) => <button className={`table-row ${selected?.id === document.id ? "selected" : ""}`} onClick={() => setSelectedId(document.id)} key={document.id}><span><i className="doc-type"><OpsIcon name={document.generated ? "download" : "document"} size={16} /></i><span><strong>{document.name}</strong><small>{document.id}</small></span></span><span>{document.type}</span><span>{document.linked}</span><span>{document.owner}</span><span>{document.updated}</span><span className={`doc-status status-${document.status.toLocaleLowerCase("fr").replace("à ", "").replaceAll(" ", "-")}`}>{document.status}</span></button>)}{!visibleDocuments.length ? <div className="entity-empty">Aucun document ne correspond à cette vue.</div> : null}</div>
+        </section>
+        {selected ? <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button onClick={() => openAgent(`Liste les relations, décisions et usages du document ${selected.id}.`)}><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.url || selected.objectUrl || selected.dataUrl ? <object className="pdf-preview" data={selected.url ?? selected.objectUrl ?? selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.url ?? selected.objectUrl ?? selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} éléments indexés</strong><p>{selected.summary || "Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné."}</p>{selected.url || selected.objectUrl || selected.dataUrl ? <a className="document-download" href={selected.downloadUrl ?? selected.url ?? selected.objectUrl ?? selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse uniquement le document ${selected.id} (${selected.name}). Commence par les faits extraits de cette source, puis distingue clairement tes éventuelles comparaisons avec le reste de la mémoire.`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside> : null}
       </div>
     </div>
   );
 }
 
 function ClientsPage({ openAgent }: { openAgent: OpenAgent }) {
-  const [selected, setSelected] = useState(clients[0]);
+  const [portfolio, setPortfolio] = usePersistedClients();
+  const [selectedId, setSelectedId] = useState(clients[0].id);
+  const [query, setQuery] = useState("");
+  const [segment, setSegment] = useState<"Tous" | ClientView["status"]>("Tous");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState("");
+  const [draft, setDraft] = useState({
+    name: "",
+    status: "Prospect" as ClientView["status"],
+    owner: "Camille",
+    revenue: "0",
+    margin: "30",
+    health: "70",
+    last: "Aujourd’hui",
+    opportunity: "Premier rendez-vous à planifier",
+    email: "",
+  });
+  const segments: Array<"Tous" | ClientView["status"]> = [
+    "Tous",
+    "Actif",
+    "À risque",
+    "À suivre",
+    "Dormant",
+    "Prospect",
+  ];
+  const filtered = portfolio.filter((client) => {
+    const matchesSegment = segment === "Tous" || client.status === segment;
+    const haystack = `${client.name} ${client.owner} ${client.status}`.toLocaleLowerCase("fr");
+    return matchesSegment && haystack.includes(query.toLocaleLowerCase("fr").trim());
+  });
+  const selected = filtered.find((client) => client.id === selectedId)
+    ?? filtered[0];
+  const cycleSegment = () => {
+    const index = segments.indexOf(segment);
+    setSegment(segments[(index + 1) % segments.length]);
+  };
+  const openClientModal = (client?: ClientView) => {
+    setStatus("");
+    setEditingId(client?.id ?? null);
+    if (client) {
+      setDraft({
+        name: client.name,
+        status: client.status,
+        owner: client.owner,
+        revenue: String(safeNumber(client.revenue.replace(/[^\d,.-]/g, ""), 0) * 1_000),
+        margin: String(safeNumber(client.margin.replace(/[^\d,.-]/g, ""), 30)),
+        health: String(client.health),
+        last: client.last,
+        opportunity: client.opportunity,
+        email: client.email ?? "",
+      });
+    } else {
+      setDraft({
+        name: "",
+        status: "Prospect",
+        owner: "Camille",
+        revenue: "0",
+        margin: "30",
+        health: "70",
+        last: "Aujourd’hui",
+        opportunity: "Premier rendez-vous à planifier",
+        email: "",
+      });
+    }
+    setModalOpen(true);
+  };
+  const saveClient = async () => {
+    setSaving(true);
+    setStatus("");
+    try {
+      const revenue = safeNumber(draft.revenue, 0, 0, 100_000_000);
+      const margin = safeNumber(draft.margin, 30, -100, 100);
+      const health = safeNumber(draft.health, 70, 0, 100);
+      const payload = {
+        kind: "client",
+        name: draft.name,
+        status: draft.status,
+        owner: draft.owner,
+        revenue,
+        margin,
+        health,
+        last: draft.last,
+        opportunity: draft.opportunity,
+        email: draft.email || undefined,
+        linked: ["ORG-001"],
+      };
+      const created = editingId
+        ? await updateOpsRecord(editingId, payload)
+        : await createOpsRecord(payload);
+      const words = draft.name.split(/\s+/).filter(Boolean);
+      const client: ClientView = {
+        id: created.id,
+        name: draft.name,
+        initials: words.map((word) => word[0]).join("").slice(0, 2).toLocaleUpperCase("fr"),
+        owner: draft.owner,
+        revenue: `${(revenue / 1000).toLocaleString("fr-FR", { maximumFractionDigits: 1 })} K€`,
+        margin: `${margin.toLocaleString("fr-FR")} %`,
+        last: draft.last,
+        health,
+        status: draft.status,
+        opportunity: draft.opportunity,
+        email: draft.email,
+      };
+      setPortfolio((current) => [client, ...current.filter((item) => item.id !== client.id)]);
+      setSelectedId(client.id);
+      setDraft({
+        name: "",
+        status: "Prospect",
+        owner: "Camille",
+        revenue: "0",
+        margin: "30",
+        health: "70",
+        last: "Aujourd’hui",
+        opportunity: "Premier rendez-vous à planifier",
+        email: "",
+      });
+      setEditingId(null);
+      setModalOpen(false);
+    } catch {
+      setStatus("Le client n’a pas pu être inscrit dans Obsidian.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
-    <div className="content-page">
-      <PageHeading page="clients" action={<button className="primary-button"><OpsIcon name="plus" size={16} /> Nouveau client</button>} />
-      <div className="clients-layout"><section className="panel clients-panel"><div className="panel-title"><div><span>126 clients & prospects</span><small>Portefeuille actualisé aujourd’hui</small></div><div className="table-actions"><button><OpsIcon name="search" size={15} /> Rechercher</button><button><OpsIcon name="filter" size={15} /> Segments</button></div></div><div className="entity-table clients-table"><div className="table-head"><span>Client</span><span>Statut</span><span>CA 12 mois</span><span>Marge</span><span>Dernier échange</span><span>Santé</span></div>{clients.map((client) => <button key={client.id} className={`table-row ${selected.id === client.id ? "selected" : ""}`} onClick={() => setSelected(client)}><span><i className="client-avatar">{client.initials}</i><span><strong>{client.name}</strong><small>{client.id} · {client.owner}</small></span></span><span>{client.status}</span><span><strong>{client.revenue}</strong></span><span>{client.margin}</span><span>{client.last}</span><span><i className="health-bar"><b style={{ width: `${client.health}%` }} /></i>{client.health}</span></button>)}</div></section><aside className="client-inspector"><header><span className="large-client-avatar">{selected.initials}</span><button><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.status}</span><h2>{selected.name}</h2><p>Compte suivi par {selected.owner}</p><button className="primary-button full" onClick={() => openAgent(`Résume-moi le compte ${selected.name} avant mon appel`)}><OpsIcon name="spark" size={15} /> Demander à OPS</button><div className="client-summary"><span>Résumé OPS</span><p>{selected.name} représente {selected.revenue} sur 12 mois, avec une marge de {selected.margin}. La prochaine action identifiée est : {selected.opportunity}.</p></div><div className="client-numbers"><div><span>CA 12 mois</span><strong>{selected.revenue}</strong></div><div><span>Marge</span><strong>{selected.margin}</strong></div><div><span>Santé</span><strong>{selected.health}/100</strong></div></div><div className="client-timeline"><span>Derniers événements</span><p><i />Aujourd’hui · Données synchronisées</p><p><i />{selected.last} · Dernière interaction</p><p><i />90 j · Revue de compte OPS</p></div></aside></div>
-    </div>
+    <>
+      <div className="content-page">
+        <PageHeading page="clients" action={<button className="primary-button" onClick={() => openClientModal()}><OpsIcon name="plus" size={16} /> Nouveau client</button>} />
+        <div className="clients-layout">
+          <section className="panel clients-panel">
+            <div className="panel-title">
+              <div><span>{portfolio.length} clients & prospects</span><small>Portefeuille actualisé aujourd’hui</small></div>
+              <div className="table-actions">
+                <button className={searchOpen ? "active" : ""} onClick={() => setSearchOpen((current) => !current)}><OpsIcon name="search" size={15} /> Rechercher</button>
+                <button onClick={cycleSegment}><OpsIcon name="filter" size={15} /> {segment === "Tous" ? "Segments" : segment}</button>
+              </div>
+            </div>
+            {searchOpen ? <div className="entity-search"><OpsIcon name="search" size={15} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Nom, responsable ou statut…" /></div> : null}
+            <div className="entity-table clients-table">
+              <div className="table-head"><span>Client</span><span>Statut</span><span>CA 12 mois</span><span>Marge</span><span>Dernier échange</span><span>Santé</span></div>
+              {filtered.map((client) => <button key={client.id} className={`table-row ${selected?.id === client.id ? "selected" : ""}`} onClick={() => setSelectedId(client.id)}><span><i className="client-avatar">{client.initials}</i><span><strong>{client.name}</strong><small>{client.id} · {client.owner}</small></span></span><span>{client.status}</span><span><strong>{client.revenue}</strong></span><span>{client.margin}</span><span>{client.last}</span><span><i className="health-bar"><b style={{ width: `${client.health}%` }} /></i>{client.health}</span></button>)}
+              {!filtered.length ? <div className="entity-empty">Aucun compte dans ce segment.</div> : null}
+            </div>
+          </section>
+          {selected ? <aside className="client-inspector">
+            <header><span className="large-client-avatar">{selected.initials}</span><button aria-label={`Modifier ${selected.name}`} onClick={() => openClientModal(selected)}><OpsIcon name="dots" size={17} /></button></header>
+            <span className="eyebrow">{selected.id} · {selected.status}</span><h2>{selected.name}</h2><p>Compte suivi par {selected.owner}</p>
+            <button className="primary-button full" onClick={() => openAgent(`Résume-moi le compte ${selected.name} avant mon appel`)}><OpsIcon name="spark" size={15} /> Demander à OPS</button>
+            <div className="client-summary"><span>Résumé OPS</span><p>{selected.name} représente {selected.revenue} sur 12 mois, avec une marge de {selected.margin}. La prochaine action identifiée est : {selected.opportunity}.</p></div>
+            <div className="client-numbers"><div><span>CA 12 mois</span><strong>{selected.revenue}</strong></div><div><span>Marge</span><strong>{selected.margin}</strong></div><div><span>Santé</span><strong>{selected.health}/100</strong></div></div>
+            <div className="client-timeline"><span>Derniers événements</span><p><i />Aujourd’hui · Données synchronisées</p><p><i />{selected.last} · Dernière interaction</p><p><i />90 j · Revue de compte OPS</p></div>
+          </aside> : null}
+        </div>
+      </div>
+      <OpsModal open={modalOpen} title={editingId ? "Modifier le client" : "Nouveau client"} description="Le compte est écrit immédiatement dans la mémoire Obsidian et devient interrogeable par OPS." onClose={() => { setModalOpen(false); setEditingId(null); }}>
+        <form className="ops-form" onSubmit={(event) => { event.preventDefault(); void saveClient(); }}>
+          <label className="full"><span>Entreprise</span><input required value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} placeholder="Ex. Hôtel Voltaire" /></label>
+          <label><span>Statut</span><select value={draft.status} onChange={(event) => setDraft((current) => ({ ...current, status: event.target.value as ClientView["status"] }))}>{segments.slice(1).map((value) => <option key={value}>{value}</option>)}</select></label>
+          <label><span>Responsable</span><input required value={draft.owner} onChange={(event) => setDraft((current) => ({ ...current, owner: event.target.value }))} /></label>
+          <label><span>CA 12 mois (€)</span><input min="0" required type="number" value={draft.revenue} onChange={(event) => setDraft((current) => ({ ...current, revenue: event.target.value }))} /></label>
+          <label><span>Marge (%)</span><input max="100" min="-100" required type="number" value={draft.margin} onChange={(event) => setDraft((current) => ({ ...current, margin: event.target.value }))} /></label>
+          <label><span>Santé (/100)</span><input max="100" min="0" required type="number" value={draft.health} onChange={(event) => setDraft((current) => ({ ...current, health: event.target.value }))} /></label>
+          <label><span>Dernier échange</span><input required value={draft.last} onChange={(event) => setDraft((current) => ({ ...current, last: event.target.value }))} /></label>
+          <label className="full"><span>Prochaine action</span><input required value={draft.opportunity} onChange={(event) => setDraft((current) => ({ ...current, opportunity: event.target.value }))} /></label>
+          <label className="full"><span>Email principal</span><input type="email" value={draft.email} onChange={(event) => setDraft((current) => ({ ...current, email: event.target.value }))} placeholder="direction@entreprise.fr" /></label>
+          <footer className="full"><span>{status}</span><button type="button" onClick={() => openAgent(`Aide-moi à préparer l'onboarding du client ${draft.name || "à créer"}.`)}><OpsIcon name="spark" size={15} /> Préparer avec OPS</button><button className="primary-button" disabled={saving} type="submit">{saving ? "Enregistrement…" : editingId ? "Enregistrer" : "Créer le client"}</button></footer>
+        </form>
+      </OpsModal>
+    </>
   );
 }
 
 function PlanningPage({ openAgent }: { openAgent: OpenAgent }) {
-  return <div className="content-page"><PageHeading page="planning" action={<button className="primary-button" onClick={() => openAgent("Quels conflits de planning dois-je résoudre ?")}><OpsIcon name="spark" size={16} /> Optimiser avec OPS</button>} /><div className="planning-summary"><div><span>Charge atelier</span><strong>86 %</strong><small>+9 pts vs semaine dernière</small></div><div><span>Projets à risque</span><strong>2</strong><small>Rivoli · CNC</small></div><div><span>Capacité disponible</span><strong>4 j</strong><small>Équipe pose · vendredi</small></div><div><span>Échéances</span><strong>7</strong><small>2 sensibles cette semaine</small></div></div><section className="panel planning-panel"><div className="panel-title"><div><span>Semaine du 13 juillet</span><small>18 personnes · 7 projets</small></div><div className="week-switch"><button>‹</button><button>Aujourd’hui</button><button>›</button></div></div><div className="planning-grid"><div className="planning-corner">Projet / équipe</div>{planningDays.map((day, index) => <div className={`planning-day ${index === 2 ? "today" : ""}`} key={day}>{day}<small>{index === 2 ? "Aujourd’hui" : ""}</small></div>)}{planningRows.map((row) => <div className="planning-row" key={row.project}><div className="planning-project"><strong>{row.project}</strong><small>{row.owner}</small></div>{row.slots.map((active, index) => <div className={`planning-slot ${index === 2 ? "today" : ""}`} key={index}>{active ? <span className={row.tone}>{index === 2 && row.project.includes("Rivoli") ? "Contrôle qualité" : "Planifié"}</span> : null}</div>)}</div>)}</div><div className="planning-alert"><span><OpsIcon name="spark" size={17} /></span><div><strong>Risque détecté jeudi après-midi</strong><p>Thomas est affecté simultanément à Rivoli et à la calibration CNC. Hugo peut reprendre le contrôle qualité avec la procédure existante.</p></div><button onClick={() => openAgent("Que se passe-t-il si Thomas est absent ?")}>Examiner</button></div></section></div>;
+  const [weekOffset, setWeekOffset] = useState(0);
+  const [plannedTasks, setPlannedTasks] = usePersistedPlanningTasks();
+  const [slotDraft, setSlotDraft] = useState<{
+    id?: string;
+    project: string;
+    owner: string;
+    dayIndex: number;
+    title: string;
+    description: string;
+    status: PlanningTaskView["status"];
+  } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState("");
+  const weekStart = useMemo(() => {
+    const date = new Date(2026, 6, 13);
+    date.setDate(date.getDate() + weekOffset * 7);
+    return date;
+  }, [weekOffset]);
+  const visibleDays = useMemo(() => {
+    return Array.from({ length: 5 }, (_, index) => {
+      const date = new Date(weekStart);
+      date.setDate(date.getDate() + index);
+      const weekday = new Intl.DateTimeFormat("fr-FR", { weekday: "short" }).format(date).replace(".", "");
+      return `${weekday.slice(0, 3)}. ${date.getDate()}`;
+    });
+  }, [weekStart]);
+  const weekLabel = new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "long" }).format(weekStart);
+  const visiblePlanningRows = useMemo(() => {
+    const known = new Set(planningRows.map((row) => row.project));
+    const extraProjects = [...new Set(
+      plannedTasks
+        .filter((task) => task.project && !known.has(task.project))
+        .map((task) => task.project),
+    )];
+    const tones = ["blue", "peach", "green", "grey"];
+    return [
+      ...planningRows,
+      ...extraProjects.map((project, index) => ({
+        project,
+        owner: plannedTasks.find((task) => task.project === project)?.owner ?? "À assigner",
+        tone: tones[index % tones.length],
+        slots: [0, 0, 0, 0, 0],
+      })),
+    ];
+  }, [plannedTasks]);
+  const openSlot = (project: string, owner: string, dayIndex: number) => {
+    setStatus("");
+    setSlotDraft({
+      project,
+      owner: owner.split(" +")[0],
+      dayIndex,
+      title: `Intervention ${project}`,
+      description: `Créneau réservé pour ${project}, à confirmer avec ${owner}.`,
+      status: "open",
+    });
+  };
+  const openTask = (task: PlanningTaskView) => {
+    setStatus("");
+    setSlotDraft({
+      id: task.id,
+      project: task.project,
+      owner: task.owner,
+      dayIndex: task.dayIndex,
+      title: task.title,
+      description: task.description,
+      status: task.status,
+    });
+  };
+  const saveSlot = async () => {
+    if (!slotDraft) return;
+    setSaving(true);
+    setStatus("");
+    try {
+      const due = `${visibleDays[slotDraft.dayIndex]} · semaine du ${weekLabel}`;
+      const payload = {
+        kind: "task",
+        title: slotDraft.title,
+        owner: slotDraft.owner,
+        due,
+        status: slotDraft.status,
+        description: slotDraft.description,
+        project: slotDraft.project,
+        dayIndex: slotDraft.dayIndex,
+        weekOffset,
+        linked: ["ORG-001"],
+      };
+      const saved = slotDraft.id
+        ? await updateOpsRecord(slotDraft.id, payload)
+        : await createOpsRecord(payload);
+      setPlannedTasks((current) => [{
+        id: saved.id,
+        title: slotDraft.title,
+        owner: slotDraft.owner,
+        due,
+        status: slotDraft.status,
+        description: slotDraft.description,
+        project: slotDraft.project,
+        dayIndex: slotDraft.dayIndex,
+        weekOffset,
+      }, ...current.filter((task) => task.id !== saved.id)]);
+      setSlotDraft(null);
+    } catch {
+      setStatus("Le créneau n’a pas pu être inscrit dans Obsidian.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="content-page">
+        <PageHeading page="planning" action={<button className="primary-button" onClick={() => openAgent("Quels conflits de planning dois-je résoudre ?")}><OpsIcon name="spark" size={16} /> Optimiser avec OPS</button>} />
+        <div className="planning-summary">
+          <button className="planning-summary-card" onClick={() => openAgent("Explique la charge atelier de 86 % et les capacités encore disponibles.")}><span>Charge atelier</span><strong>86 %</strong><small>+9 pts vs semaine dernière</small></button>
+          <button className="planning-summary-card" onClick={() => openAgent("Analyse les deux projets à risque du planning : Rivoli et la maintenance CNC.")}><span>Projets à risque</span><strong>2</strong><small>Rivoli · CNC</small></button>
+          <button className="planning-summary-card" onClick={() => openAgent("Où sont les quatre jours de capacité disponible et comment les affecter ?")}><span>Capacité disponible</span><strong>4 j</strong><small>Équipe pose · vendredi</small></button>
+          <button className="planning-summary-card" onClick={() => openAgent("Classe les sept échéances du planning par urgence et impact.")}><span>Échéances</span><strong>7</strong><small>2 sensibles cette semaine</small></button>
+        </div>
+        <section className="panel planning-panel">
+          <div className="panel-title">
+            <div><span>Semaine du {weekLabel}</span><small>18 personnes · {visiblePlanningRows.length} projets visibles</small></div>
+            <div className="week-switch">
+              <button aria-label="Semaine précédente" onClick={() => setWeekOffset((current) => current - 1)}>‹</button>
+              <button onClick={() => setWeekOffset(0)}>Aujourd’hui</button>
+              <button aria-label="Semaine suivante" onClick={() => setWeekOffset((current) => current + 1)}>›</button>
+            </div>
+          </div>
+          <div className="planning-grid">
+            <div className="planning-corner">Projet / équipe</div>
+            {visibleDays.map((day, index) => <div className={`planning-day ${weekOffset === 0 && index === 2 ? "today" : ""}`} key={day}>{day}<small>{weekOffset === 0 && index === 2 ? "Aujourd’hui" : ""}</small></div>)}
+            {visiblePlanningRows.map((row) => (
+              <div className="planning-row" key={row.project}>
+                <button className="planning-project" onClick={() => openAgent(`Résume le planning, les risques et les prochaines étapes du projet ${row.project}.`)}><strong>{row.project}</strong><small>{row.owner}</small></button>
+                {row.slots.map((baseActive, index) => {
+                  const task = plannedTasks.find((item) => (
+                    item.project === row.project
+                    && item.dayIndex === index
+                    && item.weekOffset === weekOffset
+                  ));
+                  const active = weekOffset === 0 && baseActive;
+                  return (
+                    <div className={`planning-slot ${weekOffset === 0 && index === 2 ? "today" : ""}`} key={index}>
+                      {task ? (
+                        <button className={row.tone} title={`${task.title} · cliquer pour modifier`} onClick={() => openTask(task)}>{task.title}</button>
+                      ) : active ? (
+                        <button className={row.tone} onClick={() => openAgent(`Ouvre le créneau ${visibleDays[index]} de ${row.project} (${row.owner}) et explique les dépendances.`)}>{index === 2 && row.project.includes("Rivoli") ? "Contrôle qualité" : "Planifié"}</button>
+                      ) : (
+                        <button className="planning-slot-add" aria-label={`Planifier ${row.project} le ${visibleDays[index]}`} onClick={() => openSlot(row.project, row.owner, index)}><OpsIcon name="plus" size={14} /></button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          <div className="planning-alert"><span><OpsIcon name="spark" size={17} /></span><div><strong>Risque détecté jeudi après-midi</strong><p>Thomas est affecté simultanément à Rivoli et à la calibration CNC. Hugo peut reprendre le contrôle qualité avec la procédure existante.</p></div><button onClick={() => openAgent("Que se passe-t-il si Thomas est absent ?")}>Examiner</button></div>
+        </section>
+      </div>
+      <OpsModal open={Boolean(slotDraft)} title={slotDraft?.id ? "Modifier le créneau" : "Planifier un créneau"} description="L’affectation est écrite dans Obsidian et devient immédiatement visible par OPS." onClose={() => setSlotDraft(null)}>
+        {slotDraft ? <form className="ops-form" onSubmit={(event) => { event.preventDefault(); void saveSlot(); }}>
+          <label className="full"><span>Intervention</span><input required value={slotDraft.title} onChange={(event) => setSlotDraft((current) => current ? ({ ...current, title: event.target.value }) : current)} /></label>
+          <label><span>Projet</span><input disabled value={slotDraft.project} /></label>
+          <label><span>Jour</span><input disabled value={visibleDays[slotDraft.dayIndex]} /></label>
+          <label className="full"><span>Responsable</span><input required value={slotDraft.owner} onChange={(event) => setSlotDraft((current) => current ? ({ ...current, owner: event.target.value }) : current)} /></label>
+          <label className="full"><span>Statut</span><select value={slotDraft.status} onChange={(event) => setSlotDraft((current) => current ? ({ ...current, status: event.target.value as PlanningTaskView["status"] }) : current)}><option value="open">À faire</option><option value="in_progress">En cours</option><option value="done">Terminée</option></select></label>
+          <label className="full"><span>Consigne</span><textarea required value={slotDraft.description} onChange={(event) => setSlotDraft((current) => current ? ({ ...current, description: event.target.value }) : current)} /></label>
+          <footer className="full"><span>{status}</span><button type="button" onClick={() => openAgent(`Aide-moi à préparer le créneau ${slotDraft.title} pour ${slotDraft.project}.`)}><OpsIcon name="spark" size={15} /> Préparer avec OPS</button><button className="primary-button" disabled={saving} type="submit">{saving ? "Enregistrement…" : slotDraft.id ? "Enregistrer" : "Planifier"}</button></footer>
+        </form> : null}
+      </OpsModal>
+    </>
+  );
 }
 
 function CRMPage({ openAgent }: { openAgent: OpenAgent }) {
-  const stages = ["Qualification", "Découverte", "Proposition", "Négociation"];
-  return <div className="content-page"><PageHeading page="crm" action={<div className="heading-actions"><button className="soft-button"><OpsIcon name="filter" size={15} /> Filtres</button><button className="primary-button"><OpsIcon name="plus" size={16} /> Opportunité</button></div>} /><div className="crm-topline"><div><span>Pipeline ouvert</span><strong>184 K€</strong><small>+12 % ce mois</small></div><div><span>Prévision équipe</span><strong>96 K€</strong><small>OPS prévoit 88 K€</small></div><div><span>Taux de transformation</span><strong>31 %</strong><small>+4 pts sur 90 jours</small></div><button onClick={() => openAgent("Quelle opportunité faut-il prioriser ?")}><OpsIcon name="spark" size={16} /> Quelle affaire prioriser ?</button></div><section className="kanban-board">{stages.map((stage) => { const cards = opportunities.filter((item) => item.stage === stage); return <div className="kanban-column" key={stage}><header><span>{stage}</span><em>{cards.length}</em><strong>{cards.reduce((sum, item) => sum + item.amount, 0) / 1000} K€</strong></header>{cards.map((opportunity) => <article key={opportunity.id}><div><span>{opportunity.id}</span><em>{opportunity.probability} %</em></div><h3>{opportunity.name}</h3><strong>{opportunity.amount / 1000} K€</strong><p>{opportunity.next}</p><footer><span>{opportunity.owner}</span><small>{opportunity.source}</small></footer></article>)}{!cards.length && <div className="kanban-empty">Aucune affaire</div>}<button className="kanban-add"><OpsIcon name="plus" size={14} /> Ajouter</button></div>; })}</section></div>;
+  const stages = ["Qualification", "Découverte", "Proposition", "Négociation"] as const;
+  const [cards, setCards] = usePersistedOpportunities();
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState("");
+  const [draft, setDraft] = useState({
+    name: "",
+    amount: "25000",
+    stage: "Qualification" as OpportunityView["stage"],
+    probability: "45",
+    owner: "Camille",
+    source: "Recommandation",
+    next: "Appel de qualification",
+  });
+
+  const pipeline = cards.reduce((sum, item) => sum + item.amount, 0);
+  const openOpportunityModal = (
+    stage: OpportunityView["stage"] = "Qualification",
+    opportunity?: OpportunityView,
+  ) => {
+    setEditingId(opportunity?.id ?? null);
+    if (opportunity) {
+      setDraft({
+        name: opportunity.name,
+        amount: String(opportunity.amount),
+        stage: opportunity.stage,
+        probability: String(opportunity.probability),
+        owner: opportunity.owner,
+        source: opportunity.source,
+        next: opportunity.next,
+      });
+    } else {
+      setDraft((current) => ({ ...current, stage }));
+    }
+    setStatus("");
+    setModalOpen(true);
+  };
+  const saveOpportunity = async () => {
+    setSaving(true);
+    setStatus("");
+    try {
+      const payload = {
+        kind: "opportunity",
+        name: draft.name,
+        amount: Number(draft.amount),
+        stage: draft.stage,
+        probability: Number(draft.probability),
+        owner: draft.owner,
+        source: draft.source,
+        next: draft.next,
+        linked: ["ORG-001"],
+      };
+      const saved = editingId
+        ? await updateOpsRecord(editingId, payload)
+        : await createOpsRecord(payload);
+      setCards((current) => [{
+        id: saved.id,
+        name: draft.name,
+        amount: Number(draft.amount),
+        stage: draft.stage,
+        probability: Number(draft.probability),
+        owner: draft.owner,
+        source: draft.source,
+        next: draft.next,
+      }, ...current.filter((item) => item.id !== saved.id)]);
+      setDraft({ name: "", amount: "25000", stage: "Qualification", probability: "45", owner: "Camille", source: "Recommandation", next: "Appel de qualification" });
+      setEditingId(null);
+      setModalOpen(false);
+    } catch {
+      setStatus("L’opportunité n’a pas pu être inscrite dans Obsidian.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="content-page">
+        <PageHeading page="crm" description={`${(pipeline / 1000).toLocaleString("fr-FR")} K€ d’opportunités ouvertes, avec les risques et signaux expliqués.`} action={<div className="heading-actions"><button className="soft-button" onClick={() => openAgent("Filtre le pipeline par probabilité, montant, source et prochaine échéance.")}><OpsIcon name="filter" size={15} /> Filtres</button><button className="primary-button" onClick={() => openOpportunityModal()}><OpsIcon name="plus" size={16} /> Opportunité</button></div>} />
+        <div className="crm-topline">
+          <button className="crm-metric" onClick={() => openAgent("Analyse le pipeline commercial ouvert et explique son évolution.")}><span>Pipeline ouvert</span><strong>{(pipeline / 1000).toLocaleString("fr-FR")} K€</strong><small>+12 % ce mois</small></button>
+          <button className="crm-metric" onClick={() => openAgent("Compare la prévision équipe à la prévision OPS et explique l’écart.")}><span>Prévision équipe</span><strong>96 K€</strong><small>OPS prévoit 88 K€</small></button>
+          <button className="crm-metric" onClick={() => openAgent("Explique le taux de transformation sur 90 jours et les leviers de progression.")}><span>Taux de transformation</span><strong>31 %</strong><small>+4 pts sur 90 jours</small></button>
+          <button className="crm-ai-button" onClick={() => openAgent("Quelle opportunité faut-il prioriser ?")}><OpsIcon name="spark" size={16} /> Quelle affaire prioriser ?</button>
+        </div>
+        <section className="kanban-board">
+          {stages.map((stage) => {
+            const stageCards = cards.filter((item) => item.stage === stage);
+            return (
+              <div className="kanban-column" key={stage}>
+                <header><span>{stage}</span><em>{stageCards.length}</em><strong>{stageCards.reduce((sum, item) => sum + item.amount, 0) / 1000} K€</strong></header>
+                {stageCards.map((opportunity) => (
+                  <article
+                    key={opportunity.id}
+                    onClick={() => openOpportunityModal(opportunity.stage, opportunity)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      openOpportunityModal(opportunity.stage, opportunity);
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Modifier l'opportunité ${opportunity.name}`}
+                  >
+                    <div><span>{opportunity.id}</span><em>{opportunity.probability} %</em></div><h3>{opportunity.name}</h3><strong>{opportunity.amount / 1000} K€</strong><p>{opportunity.next}</p><footer><span>{opportunity.owner}</span><small>{opportunity.source}</small></footer>
+                  </article>
+                ))}
+                {!stageCards.length && <div className="kanban-empty">Aucune affaire</div>}
+                <button className="kanban-add" onClick={() => openOpportunityModal(stage)}><OpsIcon name="plus" size={14} /> Ajouter</button>
+              </div>
+            );
+          })}
+        </section>
+      </div>
+      <OpsModal open={modalOpen} title={editingId ? "Modifier l’opportunité" : "Nouvelle opportunité"} description="La fiche est immédiatement écrite dans le vault Obsidian et devient interrogeable par OPS." onClose={() => { setModalOpen(false); setEditingId(null); }}>
+        <form className="ops-form" onSubmit={(event) => { event.preventDefault(); void saveOpportunity(); }}>
+          <label className="full"><span>Affaire</span><input required value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} placeholder="Ex. Rénovation Hôtel Voltaire" /></label>
+          <label><span>Montant (€)</span><input min="0" required type="number" value={draft.amount} onChange={(event) => setDraft((current) => ({ ...current, amount: event.target.value }))} /></label>
+          <label><span>Probabilité (%)</span><input max="100" min="0" required type="number" value={draft.probability} onChange={(event) => setDraft((current) => ({ ...current, probability: event.target.value }))} /></label>
+          <label><span>Étape</span><select value={draft.stage} onChange={(event) => setDraft((current) => ({ ...current, stage: event.target.value as OpportunityView["stage"] }))}>{stages.map((stage) => <option key={stage}>{stage}</option>)}</select></label>
+          <label><span>Responsable</span><input required value={draft.owner} onChange={(event) => setDraft((current) => ({ ...current, owner: event.target.value }))} /></label>
+          <label><span>Source</span><input required value={draft.source} onChange={(event) => setDraft((current) => ({ ...current, source: event.target.value }))} /></label>
+          <label><span>Prochaine action</span><input required value={draft.next} onChange={(event) => setDraft((current) => ({ ...current, next: event.target.value }))} /></label>
+          <footer className="full"><span>{status}</span><button type="button" onClick={() => openAgent(`Aide-moi à qualifier cette opportunité : ${draft.name || "nouvelle affaire"}`)}><OpsIcon name="spark" size={15} /> Qualifier avec OPS</button><button className="primary-button" disabled={saving} type="submit">{saving ? "Enregistrement…" : editingId ? "Enregistrer" : "Créer l’opportunité"}</button></footer>
+        </form>
+      </OpsModal>
+    </>
+  );
 }
 
 function NumbersPage({ openAgent }: { openAgent: OpenAgent }) {
-  return <div className="content-page"><PageHeading page="numbers" action={<button className="primary-button" onClick={() => openAgent("Où en sommes-nous sur la stratégie du trimestre ?")}><OpsIcon name="spark" size={16} /> Expliquer avec OPS</button>} /><section className="number-tabs"><button className="active">Vue d’ensemble</button><button>Activité</button><button>Marge</button><button>Trésorerie</button><button>Acquisition</button><button>SEO</button></section><section className="kpi-row numbers-kpis">{kpis.map((kpi) => <div className="kpi-card" key={kpi.label}><span>{kpi.label}</span><strong>{kpi.value}</strong><small className={kpi.tone}>{kpi.delta}</small><i><b style={{ width: kpi.label === "Marge moyenne" ? "41%" : "72%" }} /></i></div>)}</section><div className="numbers-grid"><section className="panel performance-chart"><div className="panel-title"><div><span>Activité & marge</span><small>Janvier — juillet 2026</small></div><button>Mensuel <OpsIcon name="chevron" size={13} /></button></div><div className="chart-legend"><span><i className="blue" /> Chiffre d’affaires</span><span><i className="green" /> Marge</span></div><svg viewBox="0 0 720 260" preserveAspectRatio="none"><g className="chart-grid"><line x1="0" y1="40" x2="720" y2="40"/><line x1="0" y1="100" x2="720" y2="100"/><line x1="0" y1="160" x2="720" y2="160"/><line x1="0" y1="220" x2="720" y2="220"/></g><path className="area-path" d="M0 205 C80 190 105 142 170 155 S260 120 340 130 S445 75 510 102 S620 54 720 62 L720 260 L0 260Z"/><path className="revenue-path" d="M0 205 C80 190 105 142 170 155 S260 120 340 130 S445 75 510 102 S620 54 720 62"/><path className="margin-path" d="M0 150 C90 138 130 132 190 121 S310 110 380 124 S490 136 555 144 S650 160 720 174"/><g className="chart-labels"><text x="0" y="252">Jan.</text><text x="112" y="252">Fév.</text><text x="230" y="252">Mars</text><text x="350" y="252">Avr.</text><text x="470" y="252">Mai</text><text x="590" y="252">Juin</text><text x="690" y="252">Juil.</text></g></svg><div className="chart-insight"><OpsIcon name="spark" size={15} /><span><strong>OPS observe :</strong> le CA progresse, mais la marge se dégrade depuis mai. Rivoli explique l’essentiel de l’écart.</span><button onClick={() => openAgent("Pourquoi la marge atelier baisse ?")}>Comprendre</button></div></section><section className="panel acquisition-panel"><div className="panel-title"><div><span>Acquisition</span><small>Performance multi-canal</small></div><button onClick={() => openAgent("Google Ads ou Meta : où investir ?")}>Arbitrer</button></div>{acquisitionChannels.map((channel) => <article key={channel.name}><div><i className={channel.tone} /><span><strong>{channel.name}</strong><small>Dépense · {channel.spend}</small></span><em>{channel.trend}</em></div><p><strong>{channel.result}</strong><span>{channel.label}</span></p><i className="efficiency"><b style={{ width: `${channel.efficiency}%` }} /></i></article>)}</section></div><section className="seo-strategy"><div><span className="seo-rank">07</span><p><span>Position Google</span><strong>agencement hôtel Paris</strong><small>96 clics mensuels · 4 conversions</small></p></div><div><span><OpsIcon name="spark" size={17} /> Recommandation OPS</span><p>Transformer le chantier Rivoli en étude de cas vidéo + page SEO. Un seul actif peut soutenir référencement, Ads, Instagram et prospection.</p></div><button onClick={() => openAgent("Quelle stratégie SEO prioriser ?")}>Construire la stratégie <OpsIcon name="arrow" size={14} /></button></section></div>;
+  const tabs = ["Vue d’ensemble", "Activité", "Marge", "Trésorerie", "Acquisition", "SEO"];
+  const [activeTab, setActiveTab] = useState(tabs[0]);
+  const [period, setPeriod] = useState<"Mensuel" | "Hebdomadaire">("Mensuel");
+  const companyState = useCompanyState();
+  const [pipelineItems] = usePersistedOpportunities();
+  const livePipeline = pipelineItems.reduce((sum, item) => sum + item.amount, 0);
+  const liveKpis = companyKpis(companyState, livePipeline);
+  const { visibleKpis, activeChart, chartSeries } = numbersPresentation(
+    companyState,
+    liveKpis,
+    activeTab,
+    period,
+  );
+  const seoQualifiedLeads = companyState
+    ? Math.max(
+        0,
+        (companyState.acquisition.qualifiedLeads ?? 0)
+          - (companyState.googleAds.qualifiedLeads ?? 0)
+          - (companyState.meta.qualifiedLeads ?? 0),
+      )
+    : null;
+  const liveAcquisitionChannels = acquisitionChannels.map((channel) => {
+    if (channel.name === "Google Ads") {
+      return {
+        ...channel,
+        spend: companyState?.googleAds.spend === null || companyState?.googleAds.spend === undefined
+          ? channel.spend
+          : `${companyState.googleAds.spend.toLocaleString("fr-FR")} €`,
+        result: formatCompactEuro(companyState?.googleAds.attributedPipeline, channel.result),
+      };
+    }
+    if (channel.name === "SEO") {
+      return {
+        ...channel,
+        result: seoQualifiedLeads === null ? channel.result : String(seoQualifiedLeads),
+      };
+    }
+    if (channel.name === "Instagram") {
+      return {
+        ...channel,
+        result: formatCompactEuro(companyState?.instagram.attributedPipeline, channel.result),
+        trend: companyState?.instagram.opportunities === null
+          || companyState?.instagram.opportunities === undefined
+          ? channel.trend
+          : `${companyState.instagram.opportunities} opportunité`,
+      };
+    }
+    if (channel.name === "Meta Ads") {
+      return {
+        ...channel,
+        spend: companyState?.meta.spend === null || companyState?.meta.spend === undefined
+          ? channel.spend
+          : `${companyState.meta.spend.toLocaleString("fr-FR")} €`,
+        result: companyState?.meta.qualifiedLeads === null
+          || companyState?.meta.qualifiedLeads === undefined
+          ? channel.result
+          : String(companyState.meta.qualifiedLeads),
+      };
+    }
+    return channel;
+  });
+  const tabPrompt: Record<string, string> = {
+    "Vue d’ensemble": "Analyse la vue d’ensemble des chiffres de l’entreprise aujourd’hui.",
+    Activité: "Analyse l’activité et le chiffre d’affaires, puis compare à la période précédente.",
+    Marge: "Analyse la marge, ses causes et les leviers de correction.",
+    Trésorerie: "Analyse la trésorerie, les créances et les risques de cash.",
+    Acquisition: "Compare tous les canaux d’acquisition et recommande les arbitrages.",
+    SEO: "Donne-moi le récap SEO complet, chiffré, comparé à hier, avec les priorités.",
+  };
+  return (
+    <div className="content-page">
+      <PageHeading page="numbers" action={<button className="primary-button" onClick={() => openAgent("Où en sommes-nous sur la stratégie du trimestre ?")}><OpsIcon name="spark" size={16} /> Expliquer avec OPS</button>} />
+      <section className="number-tabs">{tabs.map((tab) => <button className={activeTab === tab ? "active" : ""} key={tab} onClick={() => setActiveTab(tab)}>{tab}</button>)}</section>
+      <section className="kpi-row numbers-kpis">{visibleKpis.map((kpi) => <button className="kpi-card" key={kpi.label} onClick={() => openAgent(`Explique le KPI ${kpi.label} (${kpi.value}, ${kpi.delta}), sa tendance, ses causes et les décisions recommandées.`)}><span>{kpi.label}</span><strong>{kpi.value}</strong><small className={kpi.tone}>{kpi.delta}</small><i><b style={{ width: kpi.tone === "negative" ? "41%" : "72%" }} /></i></button>)}</section>
+      <div className="numbers-grid">
+        <section className="panel performance-chart">
+          <div className="panel-title"><div><span>{activeTab === "Vue d’ensemble" ? "Activité & marge" : activeTab}</span><small>Janvier — juillet 2026 · vue {period.toLocaleLowerCase("fr")}</small></div><button onClick={() => setPeriod((current) => current === "Mensuel" ? "Hebdomadaire" : "Mensuel")}>{period} <OpsIcon name="chevron" size={13} /></button></div>
+          <div className="chart-legend"><span><i className="blue" /> {activeChart.legend[0]}</span><span><i className="green" /> {activeChart.legend[1]}</span></div>
+          <button className="chart-interaction" onClick={() => openAgent(tabPrompt[activeTab])} aria-label={`Analyser ${activeTab}`}>
+            <svg viewBox="0 0 720 260" preserveAspectRatio="none"><g className="chart-grid"><line x1="0" y1="40" x2="720" y2="40"/><line x1="0" y1="100" x2="720" y2="100"/><line x1="0" y1="160" x2="720" y2="160"/><line x1="0" y1="220" x2="720" y2="220"/></g><path className="area-path" d={chartSeries.area}/><path className="revenue-path" d={chartSeries.primary}/><path className="margin-path" d={chartSeries.secondary}/><g className="chart-labels">{chartSeries.labels.map((label, index) => <text key={label} x={index === 6 ? 690 : index * 116} y="252">{label}</text>)}</g></svg>
+          </button>
+          <div className="chart-insight"><OpsIcon name="spark" size={15} /><span><strong>OPS observe :</strong> {activeChart.insight}{activeChart.source ? ` [${activeChart.source}]` : ""}</span><button onClick={() => openAgent(tabPrompt[activeTab])}>Comprendre</button></div>
+        </section>
+        <section className="panel acquisition-panel"><div className="panel-title"><div><span>Acquisition</span><small>Performance multi-canal</small></div><button onClick={() => openAgent("Google Ads ou Meta : où investir ?")}>Arbitrer</button></div>{liveAcquisitionChannels.map((channel) => {
+          const inspectChannel = () => openAgent(`Analyse en détail le canal ${channel.name} : dépenses, résultats, attribution, comparaison à hier et recommandations.`);
+          return <article key={channel.name} onClick={inspectChannel} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); inspectChannel(); } }} role="button" tabIndex={0} aria-label={`Analyser le canal ${channel.name}`}><div><i className={channel.tone} /><span><strong>{channel.name}</strong><small>Dépense · {channel.spend}</small></span><em>{channel.trend}</em></div><p><strong>{channel.result}</strong><span>{channel.label}</span></p><i className="efficiency"><b style={{ width: `${channel.efficiency}%` }} /></i></article>;
+        })}</section>
+      </div>
+      <section className="seo-strategy"><div><span className="seo-rank">{formatDecimal(companyState?.seo.focusKeywordPosition, "07")}</span><p><span>Position Google</span><strong>agencement hôtel Paris</strong><small>{formatDecimal(companyState?.seo.focusKeywordClicks, "96")} clics mensuels · {formatDecimal(companyState?.seo.conversions, "4")} conversions</small></p></div><div><span><OpsIcon name="spark" size={17} /> Recommandation OPS</span><p>Transformer le chantier Rivoli en étude de cas vidéo + page SEO. Un seul actif peut soutenir référencement, Ads, Instagram et prospection.</p></div><button onClick={() => openAgent("Quelle stratégie SEO prioriser ?")}>Construire la stratégie <OpsIcon name="arrow" size={14} /></button></section>
+    </div>
+  );
 }
 
 function BrainPage({ openAgent }: { openAgent: OpenAgent }) {
@@ -1007,7 +2521,14 @@ function CommandMenu({ open, setOpen, setPage, openAgent }: { open: boolean; set
   const [query, setQuery] = useState("");
   if (!open) return null;
   const pages = navGroups.flatMap((group) => group.items).filter((item) => item.label.toLocaleLowerCase("fr").includes(query.toLocaleLowerCase("fr")));
-  return <div className="command-backdrop" onMouseDown={() => setOpen(false)}><div className="command-menu" onMouseDown={(event) => event.stopPropagation()}><div className="command-input"><OpsIcon name="search" size={19} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Rechercher une page, un client ou poser une question…" /><kbd>Échap</kbd></div><span className="command-label">Navigation</span>{pages.map((item) => <button key={item.id} onClick={() => { setPage(item.id); setOpen(false); }}><IconTile name={item.icon} /><span>{item.label}</span><small>Ouvrir</small><OpsIcon name="arrow" size={14} /></button>)}<span className="command-label">Demander à OPS</span>{agentScenarios.slice(0, 3).map((scenario) => <button key={scenario.id} onClick={() => { openAgent(scenario.label); setOpen(false); }}><IconTile name="spark" /><span>{scenario.label}</span><small>Question</small><OpsIcon name="arrow" size={14} /></button>)}</div></div>;
+  const submitQuery = () => {
+    const prompt = query.trim();
+    if (!prompt) return;
+    openAgent(prompt);
+    setOpen(false);
+    setQuery("");
+  };
+  return <div className="command-backdrop" onMouseDown={() => setOpen(false)}><div className="command-menu" onMouseDown={(event) => event.stopPropagation()}><form className="command-input" onSubmit={(event) => { event.preventDefault(); submitQuery(); }}><OpsIcon name="search" size={19} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Rechercher une page, un client ou poser une question…" /><kbd>Entrée</kbd></form><span className="command-label">Navigation</span>{pages.map((item) => <button key={item.id} onClick={() => { setPage(item.id); setOpen(false); }}><IconTile name={item.icon} /><span>{item.label}</span><small>Ouvrir</small><OpsIcon name="arrow" size={14} /></button>)}{query.trim() ? <button onClick={submitQuery}><IconTile name="spark" /><span>Demander « {query.trim().slice(0, 70)} »</span><small>Envoyer</small><OpsIcon name="arrow" size={14} /></button> : null}<span className="command-label">Demander à OPS</span>{agentScenarios.slice(0, 3).map((scenario) => <button key={scenario.id} onClick={() => { openAgent(scenario.label); setOpen(false); }}><IconTile name="spark" /><span>{scenario.label}</span><small>Question</small><OpsIcon name="arrow" size={14} /></button>)}</div></div>;
 }
 
 export function OpsApp() {
@@ -1039,19 +2560,27 @@ export function OpsApp() {
 
   useEffect(() => {
     const controller = new AbortController();
-    void fetch("/api/documents", { cache: "no-store", signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) return [];
-        const payload = await response.json() as { documents?: StoredOpsDocument[] };
-        return (payload.documents ?? []).map(storedDocumentToUi);
-      })
-      .then((items) => {
-        if (!controller.signal.aborted) setGeneratedDocuments(items);
-      })
-      .catch(() => {
-        // L’agent reste disponible même si l’index des documents est momentanément indisponible.
-      });
-    return () => controller.abort();
+    const load = () => {
+      void fetch("/api/documents?limit=250", { cache: "no-store", signal: controller.signal })
+        .then(async (response) => {
+          if (!response.ok) return [];
+          const payload = await response.json() as { documents?: ListedOpsDocument[] };
+          return (payload.documents ?? []).map(storedDocumentToUi);
+        })
+        .then((items) => {
+          if (!controller.signal.aborted) setGeneratedDocuments(items);
+        })
+        .catch(() => {
+          // L’agent reste disponible même si l’index des documents est momentanément indisponible.
+        });
+    };
+    const refresh = () => load();
+    load();
+    document.addEventListener("ops-record-created", refresh);
+    return () => {
+      controller.abort();
+      document.removeEventListener("ops-record-created", refresh);
+    };
   }, []);
 
   useEffect(() => {
@@ -1060,10 +2589,15 @@ export function OpsApp() {
       if (event.key === "Escape") setCommandOpen(false);
     };
     const handleCommand = () => setCommandOpen(true);
+    const handleOpenSource = (event: Event) => {
+      const source = (event as CustomEvent<string>).detail;
+      if (source) openAgent(`Ouvre la source ${source}, cite ses faits clés, ses relations et ce qu'elle change pour la décision.`);
+    };
     window.addEventListener("keydown", handleKey);
     document.addEventListener("ops-command", handleCommand);
-    return () => { window.removeEventListener("keydown", handleKey); document.removeEventListener("ops-command", handleCommand); };
-  }, []);
+    document.addEventListener("ops-open-source", handleOpenSource);
+    return () => { window.removeEventListener("keydown", handleKey); document.removeEventListener("ops-command", handleCommand); document.removeEventListener("ops-open-source", handleOpenSource); };
+  }, [openAgent]);
 
   const content = useMemo(() => {
     switch (page) {
@@ -1071,18 +2605,18 @@ export function OpsApp() {
       case "agent": return null;
       case "cycle": return <CyclePage openAgent={openAgent} />;
       case "emails": return <EmailsPage openAgent={openAgent} />;
-      case "documents": return <DocumentsPage openAgent={openAgent} generatedDocuments={generatedDocuments} preferredDocumentId={preferredDocumentId} />;
+      case "documents": return <DocumentsPage openAgent={openAgent} generatedDocuments={generatedDocuments} preferredDocumentId={preferredDocumentId} onDocumentImported={addGeneratedDocument} />;
       case "clients": return <ClientsPage openAgent={openAgent} />;
       case "planning": return <PlanningPage openAgent={openAgent} />;
       case "crm": return <CRMPage openAgent={openAgent} />;
       case "numbers": return <NumbersPage openAgent={openAgent} />;
       case "brain": return <BrainPage openAgent={openAgent} />;
     }
-  }, [generatedDocuments, openAgent, page, preferredDocumentId]);
+  }, [addGeneratedDocument, generatedDocuments, openAgent, page, preferredDocumentId]);
 
   return (
     <div className={`ops-app ${collapsed ? "sidebar-is-collapsed" : ""}`}>
-      <Sidebar page={page} setPage={setPage} collapsed={collapsed} setCollapsed={setCollapsed} />
+      <Sidebar page={page} setPage={setPage} collapsed={collapsed} setCollapsed={setCollapsed} openAgent={openAgent} />
       <div className="ops-main">
         <Topbar page={page} openAgent={openAgent} />
         <main className="ops-content">

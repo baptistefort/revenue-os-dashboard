@@ -111,7 +111,22 @@ export function asksForDocumentOutput(prompt: string) {
     .replace(/[!?.,;:]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  const directDocumentObject = /\b(?:produis|produire|produit|genere|generer|cree|creer|fais|fait|prepare|preparer|exporte|exporter|telecharge|telecharger)\s+(?:(?:moi|ce|cet|cette|le|la|les|un|une|mon|ma|notre)\s+){0,3}(?:pdf|rapport|document)\b/.test(normalized);
+  if (
+    /\b(?:ne|n)\s+(?:me\s+)?(?:produis|genere|cree|fais|prepare|exporte|telecharge)\s+pas\b/.test(normalized)
+    || /\b(?:sans|aucun)\s+(?:pdf|rapport|document)\b/.test(normalized)
+  ) {
+    return false;
+  }
+
+  const action = "(?:produis|produire|produit|genere|generer|cree|creer|fais|fait|prepare|preparer|exporte|exporter|telecharge|telecharger)";
+  const actionBeforePdf = new RegExp(`\\b${action}\\b.{0,140}\\bpdf\\b`).test(normalized);
   const convertToDocument = /\b(?:produis|genere|generer|transforme|transformer|convertis|convertir|exporte|exporter|fais|fait)\b.{0,120}\b(?:en|au format)\s+(?:(?:un|une|le|la)\s+)?(?:pdf|rapport|document)\b/.test(normalized);
-  return directDocumentObject || convertToDocument;
+  const directReportOrDocument = new RegExp(`\\b${action}\\b([^\\n]{0,100})\\b(?:rapport|document)\\b`).exec(normalized);
+  const interveningObject = directReportOrDocument?.[1] ?? "";
+  const targetsReportOrDocument = Boolean(
+    directReportOrDocument
+    && !/\b(?:missions?|email|message|sources?|resume|synthese|analyse|strategie|comparatif|liste)\b/.test(interveningObject),
+  );
+
+  return actionBeforePdf || convertToDocument || targetsReportOrDocument;
 }

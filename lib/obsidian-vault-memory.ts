@@ -563,7 +563,10 @@ export function findObsidianMemoryRecord(index: ObsidianVaultIndex, id: string) 
     if (normalizeLookup(record.id) === lookup) return true;
     if (normalizeLookup(record.path) === lookup) return true;
     if (normalizeLookup(path.basename(record.path, ".md")) === lookup) return true;
-    return record.aliases.some((alias) => normalizeLookup(alias) === lookup);
+    if (record.aliases.some((alias) => normalizeLookup(alias) === lookup)) return true;
+    return ["document_id", "record_id", "source_id", "external_id"].some((key) => (
+      stringList(record.attributes[key]).some((value) => normalizeLookup(value) === lookup)
+    ));
   }) ?? null;
 }
 

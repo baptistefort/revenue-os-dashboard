@@ -387,6 +387,9 @@ export type OpsDocument = {
   size?: string;
   pages?: number;
   generated?: boolean;
+  sourceKind?: "pdf" | "obsidian";
+  vaultPath?: string;
+  summary?: string;
 };
 
 export const documents: OpsDocument[] = [

@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 import type { BrainEdge, BrainNode } from "@/lib/ops-demo-data";
 
 export const dynamic = "force-dynamic";
+const GRAPH_NODE_LIMIT = 1_200;
 
 const supportedTypes = new Set<BrainNode["type"]>([
   "company",
@@ -34,9 +35,15 @@ function field(content: string, name: string) {
   return content.match(new RegExp(`^${name}:\\s*["']?(.+?)["']?\\s*$`, "mi"))?.[1]?.trim();
 }
 
-function normalizeType(value?: string): BrainNode["type"] {
+function normalizeType(value?: string, recordKind?: string): BrainNode["type"] {
   const type = value?.toLocaleLowerCase("fr");
+  const kind = recordKind?.toLocaleLowerCase("fr");
+  if (kind === "client") return "client";
+  if (kind === "email") return "document";
+  if (kind === "opportunity" || kind === "task") return "project";
   if (type && supportedTypes.has(type as BrainNode["type"])) return type as BrainNode["type"];
+  if (type === "entity" || type === "account" || type === "customer") return "client";
+  if (type === "report" || type === "pdf" || type === "attachment" || type === "note") return "document";
   if (type === "invoice" || type === "payment" || type === "purchase") return "finance";
   if (type === "opportunity" || type === "task") return "project";
   if (type === "strategy" || type === "rule" || type === "alert") return "decision";
@@ -63,12 +70,12 @@ export async function GET() {
     const allFiles = await walk(vaultPath);
     const demoFiles = allFiles.filter((filePath) => filePath.includes(`OPS Demo — Atelier Beaumarchais${path.sep}`));
     const files = demoFiles.length ? demoFiles : allFiles;
-    const parsedRecords = await Promise.all(files.slice(0, 180).map(async (filePath) => {
+    const parsedRecords = await Promise.all(files.map(async (filePath) => {
       const content = await fs.readFile(filePath, "utf8");
       const basename = path.basename(filePath, ".md");
       const id = field(content, "id") ?? basename.split(" — ")[0];
       const label = field(content, "title") ?? basename.replace(/^[A-Z]+-[\w-]+\s*—\s*/, "");
-      const type = normalizeType(field(content, "type"));
+      const type = normalizeType(field(content, "type"), field(content, "record_kind"));
       const mainBody = content
         .replace(/^---[\s\S]*?---/m, "")
         .replace(/^#\s+.*$/m, "")
@@ -79,7 +86,15 @@ export async function GET() {
         .trim()
         .slice(0, 180) || `Élément de mémoire ${label}.`;
       const links = [...content.matchAll(/\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]/g)].map((match) => match[1].trim());
-      return { id, label, type, summary, links, basename };
+      return {
+        id,
+        label,
+        type,
+        summary,
+        links,
+        basename,
+        archived: field(content, "archived")?.toLocaleLowerCase("fr") === "true",
+      };
     }));
     const typePriority: Record<BrainNode["type"], number> = {
       company: 0,
@@ -93,8 +108,9 @@ export async function GET() {
       document: 8,
     };
     const records = parsedRecords
+      .filter((record) => !record.archived)
       .sort((a, b) => typePriority[a.type] - typePriority[b.type] || b.links.length - a.links.length)
-      .slice(0, 180);
+      .slice(0, GRAPH_NODE_LIMIT);
 
     const aliasToId = new Map<string, string>();
     records.forEach((record) => {

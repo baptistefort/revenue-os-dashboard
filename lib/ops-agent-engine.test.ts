@@ -37,6 +37,8 @@ test("le plan document n'est demandé que pour une production explicite", () => 
     "Exporte le rapport",
     "Transforme cette analyse en document",
     "Fais-en un PDF",
+    "Génère maintenant le vrai PDF CODIR et ajoute-le à Documents",
+    "Fais-moi tout de suite un PDF de cette décision",
   ]) {
     assert.equal(asksForDocumentOutput(prompt), true, prompt);
   }
@@ -48,6 +50,7 @@ test("le plan document n'est demandé que pour une production explicite", () => 
     "Analyse le document existant",
     "Crée les missions du rapport",
     "Prépare l’email d’accompagnement du rapport",
+    "Ne génère pas de PDF, résume simplement",
   ]) {
     assert.equal(asksForDocumentOutput(prompt), false, prompt);
   }
