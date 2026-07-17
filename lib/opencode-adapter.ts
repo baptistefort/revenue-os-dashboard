@@ -747,7 +747,9 @@ export class OpenCodeAdapter {
 
 RÉPONSE DIRECTE
 - Réponds naturellement à cette demande sans effectuer de recherche.
-- Produis immédiatement la sortie structurée demandée.`
+- Produis immédiatement la sortie structurée demandée.
+- Retourne uniquement un objet JSON valide conforme à ce schéma :
+${JSON.stringify(outputSchema)}`
         : `${message}
 
 RECHERCHE ET RÉPONSE EN UNE SEULE PASSE
@@ -773,13 +775,12 @@ ${JSON.stringify(outputSchema)}`;
           model: model ? { providerID: model.providerID, modelID: model.modelID } : undefined,
           variant: model?.variant,
           tools: usesTools ? this.tools : this.finalizationTools,
-          format: usesTools
-            ? { type: "text" }
-            : {
-                type: "json_schema",
-                schema: outputSchema,
-                retryCount: this.options.structuredOutputRetries,
-              },
+          // OpenCode 1.18 can terminate some GPT responses with an empty
+          // StructuredOutputError when its native json_schema formatter is
+          // enabled. We keep the schema in the instruction and validate the
+          // returned JSON with Zod below. This preserves strict application
+          // output while allowing the model to produce a normal text part.
+          format: { type: "text" },
           system,
           parts: [{
             type: "text",

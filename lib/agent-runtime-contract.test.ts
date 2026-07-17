@@ -4,6 +4,15 @@ import test from "node:test";
 
 const routeUrl = new URL("../app/api/agent/route.ts", import.meta.url);
 const engineUrl = new URL("./ops-agent-engine.ts", import.meta.url);
+const adapterUrl = new URL("./opencode-adapter.ts", import.meta.url);
+
+function methodSource(source: string, startMarker: string, endMarker: string) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(start, -1, `marqueur de début introuvable : ${startMarker}`);
+  assert.notEqual(end, -1, `marqueur de fin introuvable : ${endMarker}`);
+  return source.slice(start, end);
+}
 
 test("la route agent ne contient plus de moteur métier de secours", async () => {
   const source = await readFile(routeUrl, "utf8");
@@ -39,4 +48,27 @@ test("l'engine ne contient plus les décisions métier préfabriquées historiqu
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
   }
+});
+
+test("la finalisation OpenCode directe demande un JSON texte sans format json_schema natif", async () => {
+  const source = await readFile(adapterUrl, "utf8");
+  const runStructured = methodSource(
+    source,
+    "  async runStructured<TSchema extends z.ZodType>(",
+    "\n}\n\nexport function createOpenCodeAdapter",
+  );
+
+  assert.doesNotMatch(runStructured, /type:\s*["']json_schema["']/);
+  assert.match(runStructured, /format:\s*\{\s*type:\s*["']text["']\s*\}/);
+
+  const directBranchStart = runStructured.indexOf("const finalRequest = !usesTools");
+  assert.notEqual(directBranchStart, -1, "branche de finalisation directe introuvable");
+  const directPromptStart = runStructured.indexOf("`", directBranchStart);
+  const directPromptEnd = runStructured.indexOf("`", directPromptStart + 1);
+  assert.notEqual(directPromptStart, -1, "prompt direct introuvable");
+  assert.notEqual(directPromptEnd, -1, "fin du prompt direct introuvable");
+  const directPrompt = runStructured.slice(directPromptStart + 1, directPromptEnd);
+
+  assert.match(directPrompt, /Retourne uniquement un objet JSON valide/i);
+  assert.match(directPrompt, /\$\{JSON\.stringify\(outputSchema\)\}/);
 });
