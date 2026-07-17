@@ -38,7 +38,7 @@ export const dynamic = "force-dynamic";
 const emailSchema = z.object({
   kind: z.literal("email"),
   subject: z.string().trim().min(1).max(180),
-  to: z.string().trim().min(1).max(240),
+  to: z.string().trim().email().max(240),
   from: z.string().trim().min(1).max(240).default("Marie Delmas <marie@atelier-beaumarchais.fr>"),
   company: z.string().trim().max(160).optional(),
   body: z.string().trim().min(1).max(20_000),

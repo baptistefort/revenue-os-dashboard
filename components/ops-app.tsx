@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { BrainGraph } from "@/components/brain-graph";
 import { OpsIcon } from "@/components/ops-icons";
 import { VoiceMode, type VoiceModeHandle } from "@/components/voice-mode";
@@ -53,6 +53,30 @@ type PersistedRecord = {
   createdAt: string;
   attributes: Record<string, string | number | boolean | null | Array<string | number | boolean>>;
   relations: string[];
+};
+
+type SourceEvidence = {
+  id: string;
+  title: string;
+  type: string;
+  summary: string;
+  facts: string[];
+  relations: string[];
+  updatedAt: string;
+  source: string | null;
+  path: string;
+  attributes: Record<string, string | number | boolean | null | Array<string | number | boolean>>;
+  content: string;
+  related: Array<{
+    id: string;
+    title: string;
+    type: string;
+    summary: string;
+    relation: "incoming" | "outgoing" | "bidirectional";
+    updatedAt: string;
+    source: string | null;
+    path: string;
+  }>;
 };
 
 async function createOpsRecord(payload: Record<string, unknown>) {
@@ -365,32 +389,34 @@ function IconTile({ name, active = false }: { name: IconName; active?: boolean }
   return <span className={`nav-icon ${active ? "active" : ""}`}><OpsIcon name={name} size={20} strokeWidth={1.65} /></span>;
 }
 
-function Sidebar({ page, setPage, collapsed, setCollapsed, openAgent }: {
+function Sidebar({ page, setPage, collapsed, setCollapsed, openAgent, mobileOpen, onMobileClose }: {
   page: PageId;
   setPage: (page: PageId) => void;
   collapsed: boolean;
   setCollapsed: (value: boolean) => void;
   openAgent: OpenAgent;
+  mobileOpen: boolean;
+  onMobileClose: () => void;
 }) {
   return (
-    <aside className={`ops-sidebar ${collapsed ? "collapsed" : ""}`}>
+    <aside className={`ops-sidebar ${collapsed ? "collapsed" : ""} ${mobileOpen ? "mobile-open" : ""}`}>
       <div className="sidebar-top">
         <Logo />
         <button
           className="sidebar-collapse"
-          onClick={() => setCollapsed(!collapsed)}
-          aria-label={collapsed ? "Déployer la navigation" : "Réduire la navigation"}
+          onClick={() => mobileOpen ? onMobileClose() : setCollapsed(!collapsed)}
+          aria-label={mobileOpen ? "Fermer la navigation" : collapsed ? "Déployer la navigation" : "Réduire la navigation"}
           aria-expanded={!collapsed}
         >
           <span /><span />
         </button>
       </div>
-      <button className="workspace-card" onClick={() => openAgent("Présente-moi l’état complet d’Atelier Beaumarchais, les faits récents et les décisions qui demandent mon attention.")}>
+      <button className="workspace-card" onClick={() => { onMobileClose(); openAgent("Présente-moi l’état complet d’Atelier Beaumarchais, les faits récents et les décisions qui demandent mon attention."); }}>
         <span className="workspace-monogram">{company.initials}</span>
         <span className="workspace-copy"><strong>{company.name}</strong><small>{company.trade}</small></span>
         <OpsIcon name="chevron" size={14} />
       </button>
-      <button className="sidebar-search" onClick={() => document.dispatchEvent(new CustomEvent("ops-command"))}>
+      <button className="sidebar-search" onClick={() => { onMobileClose(); document.dispatchEvent(new CustomEvent("ops-command")); }}>
         <OpsIcon name="search" size={16} /><span>Rechercher</span><kbd>⌘ K</kbd>
       </button>
       <nav className="sidebar-nav" aria-label="Navigation OPS">
@@ -401,7 +427,7 @@ function Sidebar({ page, setPage, collapsed, setCollapsed, openAgent }: {
               <button
                 key={item.id}
                 className={`nav-item ${page === item.id ? "active" : ""}`}
-                onClick={() => setPage(item.id)}
+                onClick={() => { setPage(item.id); onMobileClose(); }}
                 title={item.label}
                 aria-label={item.label}
                 aria-current={page === item.id ? "page" : undefined}
@@ -415,7 +441,7 @@ function Sidebar({ page, setPage, collapsed, setCollapsed, openAgent }: {
         ))}
       </nav>
       <div className="sidebar-footer">
-        <button className="sidebar-user" onClick={() => openAgent("Prépare mon brief personnel de direction : décisions, validations, rendez-vous et sujets à suivre.")}>
+        <button className="sidebar-user" onClick={() => { onMobileClose(); openAgent("Prépare mon brief personnel de direction : décisions, validations, rendez-vous et sujets à suivre."); }}>
           <span className="user-avatar">MD</span>
           <span><strong>Marie Delmas</strong><small>Direction</small></span>
           <OpsIcon name="dots" size={16} />
@@ -425,10 +451,13 @@ function Sidebar({ page, setPage, collapsed, setCollapsed, openAgent }: {
   );
 }
 
-function Topbar({ page, openAgent }: { page: PageId; openAgent: OpenAgent }) {
+function Topbar({ page, openAgent, onMobileMenu }: { page: PageId; openAgent: OpenAgent; onMobileMenu: () => void }) {
   return (
     <header className="ops-topbar">
-      <div className="topbar-location"><span>OPS</span><i>/</i><strong>{pageMeta[page].title}</strong></div>
+      <div className="topbar-location-wrap">
+        <button className="mobile-nav-toggle" aria-label="Ouvrir la navigation" onClick={onMobileMenu} type="button"><span /><span /></button>
+        <div className="topbar-location"><span>OPS</span><i>/</i><strong>{pageMeta[page].title}</strong></div>
+      </div>
       <div className="topbar-actions">
         <button className="topbar-search" onClick={() => document.dispatchEvent(new CustomEvent("ops-command"))}>
           <OpsIcon name="search" size={15} /><span>Rechercher ou commander</span><kbd>⌘ K</kbd>
@@ -474,26 +503,165 @@ function OpsModal({ open, title, description, onClose, children }: {
   onClose: () => void;
   children: React.ReactNode;
 }) {
+  const titleId = useId();
+  const descriptionId = useId();
+  const dialogRef = useRef<HTMLElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const closeRef = useRef(onClose);
+
+  useEffect(() => { closeRef.current = onClose; }, [onClose]);
+
   useEffect(() => {
     if (!open) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+    previousFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const dialog = dialogRef.current;
+    const focusable = dialog?.querySelector<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+    );
+    window.requestAnimationFrame(() => (focusable ?? dialog)?.focus());
+
+    const handleKeyboard = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+      const items = [...dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      )].filter((item) => item.offsetParent !== null);
+      if (!items.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1) ?? first;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose, open]);
+    window.addEventListener("keydown", handleKeyboard);
+    return () => {
+      window.removeEventListener("keydown", handleKeyboard);
+      previousFocusRef.current?.focus();
+    };
+  }, [open]);
 
   if (!open) return null;
   return (
     <div className="ops-modal-backdrop" onMouseDown={onClose}>
-      <section aria-modal="true" className="ops-modal" onMouseDown={(event) => event.stopPropagation()} role="dialog">
+      <section
+        aria-describedby={description ? descriptionId : undefined}
+        aria-labelledby={titleId}
+        aria-modal="true"
+        className="ops-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
         <header>
-          <div><span className="eyebrow">OPS · MÉMOIRE VIVANTE</span><h2>{title}</h2>{description ? <p>{description}</p> : null}</div>
+          <div><span className="eyebrow">OPS · MÉMOIRE VIVANTE</span><h2 id={titleId}>{title}</h2>{description ? <p id={descriptionId}>{description}</p> : null}</div>
           <button aria-label="Fermer" onClick={onClose} type="button"><OpsIcon name="close" size={17} /></button>
         </header>
         {children}
       </section>
     </div>
+  );
+}
+
+function SourceEvidenceDialog({ requested, evidence, loading, error, onClose, openAgent }: {
+  requested: string | null;
+  evidence: SourceEvidence | null;
+  loading: boolean;
+  error: string;
+  onClose: () => void;
+  openAgent: OpenAgent;
+}) {
+  const attributes = evidence
+    ? Object.entries(evidence.attributes)
+      .filter(([, value]) => value !== null && value !== "" && (!Array.isArray(value) || value.length))
+      .slice(0, 8)
+    : [];
+  const readableValue = (value: SourceEvidence["attributes"][string]) => (
+    Array.isArray(value) ? value.join(" · ") : String(value)
+  );
+
+  return (
+    <OpsModal
+      open={Boolean(requested)}
+      title={evidence?.title ?? requested ?? "Source"}
+      description={evidence
+        ? `${evidence.id} · ${evidence.source || "Mémoire OPS"} · preuve consultée directement`
+        : "Lecture de la note et de ses relations dans la mémoire de l’entreprise."
+      }
+      onClose={onClose}
+    >
+      {loading ? (
+        <div className="source-evidence-loading" role="status"><i /><span>Ouverture de la source…</span></div>
+      ) : error ? (
+        <div className="source-evidence-error">
+          <OpsIcon name="document" size={22} />
+          <strong>Cette preuve n’est pas disponible.</strong>
+          <p>{error}</p>
+          {requested ? <button onClick={() => { onClose(); openAgent(`Retrouve la source ${requested} dans toute la mémoire et explique ce qu’elle établit.`); }}>La rechercher avec OPS</button> : null}
+        </div>
+      ) : evidence ? (
+        <div className="source-evidence-body">
+          <div className="source-evidence-meta">
+            <span><OpsIcon name="shield" size={14} /> Source vérifiée</span>
+            <small>{evidence.path}</small>
+          </div>
+
+          {evidence.facts.length ? (
+            <section className="source-evidence-facts">
+              <span className="eyebrow">Faits extraits</span>
+              <ul>{evidence.facts.slice(0, 10).map((fact) => <li key={fact}>{fact}</li>)}</ul>
+            </section>
+          ) : null}
+
+          <section className="source-evidence-note">
+            <span className="eyebrow">Contenu de la note</span>
+            <OpsMarkdownResponse value={evidence.content || evidence.summary} />
+          </section>
+
+          {attributes.length ? (
+            <section className="source-evidence-attributes">
+              <span className="eyebrow">Données structurées</span>
+              <dl>{attributes.map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{readableValue(value)}</dd></div>)}</dl>
+            </section>
+          ) : null}
+
+          {evidence.related.length ? (
+            <section className="source-evidence-relations">
+              <span className="eyebrow">Relations utiles</span>
+              <div>{evidence.related.map((item) => (
+                <button
+                  key={`${item.relation}-${item.id}`}
+                  onClick={() => document.dispatchEvent(new CustomEvent("ops-open-source", { detail: item.id }))}
+                  type="button"
+                >
+                  <span><strong>{item.title}</strong><small>{item.id} · {item.relation === "bidirectional" ? "lien réciproque" : item.relation === "incoming" ? "mentionne cette source" : "cité par cette source"}</small></span>
+                  <OpsIcon name="arrow" size={15} />
+                </button>
+              ))}</div>
+            </section>
+          ) : null}
+
+          <footer className="source-evidence-actions">
+            <button onClick={() => navigator.clipboard?.writeText(evidence.content || evidence.summary)} type="button"><OpsIcon name="copy" size={15} /> Copier</button>
+            <button className="primary-button" onClick={() => { onClose(); openAgent(`Analyse uniquement la source ${evidence.id}, puis explique les décisions qu’elle soutient en citant ses relations utiles.`); }} type="button"><OpsIcon name="spark" size={15} /> Interroger cette source</button>
+          </footer>
+        </div>
+      ) : null}
+    </OpsModal>
   );
 }
 
@@ -1643,6 +1811,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
   const [compose, setCompose] = useState({ to: "", company: "", subject: "", body: "" });
   const [sending, setSending] = useState(false);
   const [sendStatus, setSendStatus] = useState("");
+  const [mobileReaderOpen, setMobileReaderOpen] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1820,6 +1989,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
   ];
   const selectThread = (threadId: string) => {
     setSelectedId(threadId);
+    setMobileReaderOpen(true);
     setThreads((current) => current.map((thread) => (
       thread.id === threadId && thread.unread
         ? { ...thread, unread: false }
@@ -1831,7 +2001,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
     <>
       <div className="content-page wide-page">
         <PageHeading page="emails" action={<button className="primary-button" onClick={() => openAgent("Quels emails demandent une réponse aujourd’hui ?")}><OpsIcon name="spark" size={16} /> Prioriser avec OPS</button>} />
-        <section className="mail-shell">
+        <section className={`mail-shell ${mobileReaderOpen ? "mobile-reader-open" : ""}`}>
           <aside className="mail-folders">
             <button className="compose-mail" onClick={() => { setSendStatus(""); setComposeOpen(true); }}><OpsIcon name="plus" size={16} /> Nouveau message</button>
             <span>Boîtes</span>
@@ -1863,8 +2033,31 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
           </aside>
           <div className="mail-list">
             <div className="mail-list-head">
-              <strong>{classification ? classifications.find((item) => item.id === classification)?.label : folders.find((item) => item.id === folder)?.label}</strong>
-              <button aria-label="Analyser et filtrer cette boîte" onClick={() => openAgent(`Analyse et filtre les emails de la vue ${folder}`)}><OpsIcon name="filter" size={15} /></button>
+              <div>
+                <strong>{classification ? classifications.find((item) => item.id === classification)?.label : folders.find((item) => item.id === folder)?.label}</strong>
+                <select
+                  aria-label="Choisir une boîte email"
+                  className="mail-mobile-folder"
+                  value={classification ? `classification:${classification}` : folder}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    if (value.startsWith("classification:")) {
+                      setClassification(value.replace("classification:", "") as EmailThreadView["classification"]);
+                      setFolder("all");
+                    } else {
+                      setFolder(value as typeof folder);
+                      setClassification(null);
+                    }
+                  }}
+                >
+                  <optgroup label="Boîtes">{folders.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</optgroup>
+                  <optgroup label="Classification OPS">{classifications.map((item) => <option key={item.id} value={`classification:${item.id}`}>{item.label}</option>)}</optgroup>
+                </select>
+              </div>
+              <div>
+                <button className="mail-mobile-compose" aria-label="Nouveau message" onClick={() => { setSendStatus(""); setComposeOpen(true); }}><OpsIcon name="plus" size={15} /></button>
+                <button aria-label="Analyser et filtrer cette boîte" onClick={() => openAgent(`Analyse et filtre les emails de la vue ${folder}`)}><OpsIcon name="filter" size={15} /></button>
+              </div>
             </div>
             {filteredThreads.map((thread) => (
               <button key={thread.id} onClick={() => selectThread(thread.id)} className={`mail-thread ${selected?.id === thread.id ? "active" : ""}`}>
@@ -1877,6 +2070,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
           </div>
           {selected ? <article className="mail-reader">
             <header>
+              <button className="mail-mobile-back" aria-label="Revenir à la liste des emails" onClick={() => setMobileReaderOpen(false)} type="button"><span aria-hidden="true">←</span></button>
               <div><span>{selected.tag}</span><h2>{selected.subject}</h2><p>{selected.sender} · {selected.company}</p></div>
               <div>
                 <button aria-label={`Analyser les relations de ${selected.subject}`} onClick={() => openAgent(`Résume toutes les relations de ${selected.id}`)}><OpsIcon name="dots" size={17} /></button>
@@ -1930,7 +2124,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
             });
           }}
         >
-          <label><span>Destinataire</span><input required value={compose.to} onChange={(event) => setCompose((current) => ({ ...current, to: event.target.value }))} placeholder="nom@client.example" /></label>
+          <label><span>Destinataire</span><input required type="email" value={compose.to} onChange={(event) => setCompose((current) => ({ ...current, to: event.target.value }))} placeholder="nom@client.example" /></label>
           <label><span>Entreprise</span><input value={compose.company} onChange={(event) => setCompose((current) => ({ ...current, company: event.target.value }))} placeholder="Entreprise liée" /></label>
           <label className="full"><span>Objet</span><input required value={compose.subject} onChange={(event) => setCompose((current) => ({ ...current, subject: event.target.value }))} placeholder="Objet du message" /></label>
           <label className="full"><span>Message</span><textarea required rows={8} value={compose.body} onChange={(event) => setCompose((current) => ({ ...current, body: event.target.value }))} placeholder="Écrivez votre message…" /></label>
@@ -2622,6 +2816,43 @@ function BrainPage({ openAgent }: { openAgent: OpenAgent }) {
 
 function CommandMenu({ open, setOpen, setPage, openAgent }: { open: boolean; setOpen: (value: boolean) => void; setPage: (page: PageId) => void; openAgent: OpenAgent }) {
   const [query, setQuery] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    window.requestAnimationFrame(() => inputRef.current?.focus());
+    const handleKeyboard = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const items = [...dialog.querySelectorAll<HTMLElement>('input, button:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+        .filter((item) => item.offsetParent !== null);
+      if (!items.length) return;
+      const first = items[0];
+      const last = items.at(-1) ?? first;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeyboard);
+    return () => {
+      window.removeEventListener("keydown", handleKeyboard);
+      previousFocusRef.current?.focus();
+    };
+  }, [open, setOpen]);
+
   if (!open) return null;
   const pages = navGroups.flatMap((group) => group.items).filter((item) => item.label.toLocaleLowerCase("fr").includes(query.toLocaleLowerCase("fr")));
   const submitQuery = () => {
@@ -2631,17 +2862,23 @@ function CommandMenu({ open, setOpen, setPage, openAgent }: { open: boolean; set
     setOpen(false);
     setQuery("");
   };
-  return <div className="command-backdrop" onMouseDown={() => setOpen(false)}><div className="command-menu" onMouseDown={(event) => event.stopPropagation()}><form className="command-input" onSubmit={(event) => { event.preventDefault(); submitQuery(); }}><OpsIcon name="search" size={19} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Rechercher une page, un client ou poser une question…" /><kbd>Entrée</kbd></form><span className="command-label">Navigation</span>{pages.map((item) => <button key={item.id} onClick={() => { setPage(item.id); setOpen(false); }}><IconTile name={item.icon} /><span>{item.label}</span><small>Ouvrir</small><OpsIcon name="arrow" size={14} /></button>)}{query.trim() ? <button onClick={submitQuery}><IconTile name="spark" /><span>Demander « {query.trim().slice(0, 70)} »</span><small>Envoyer</small><OpsIcon name="arrow" size={14} /></button> : null}<span className="command-label">Demander à OPS</span>{agentScenarios.slice(0, 3).map((scenario) => <button key={scenario.id} onClick={() => { openAgent(scenario.label); setOpen(false); }}><IconTile name="spark" /><span>{scenario.label}</span><small>Question</small><OpsIcon name="arrow" size={14} /></button>)}</div></div>;
+  return <div className="command-backdrop" onMouseDown={() => setOpen(false)}><div aria-label="Rechercher ou commander" aria-modal="true" className="command-menu" onMouseDown={(event) => event.stopPropagation()} ref={dialogRef} role="dialog"><form className="command-input" onSubmit={(event) => { event.preventDefault(); submitQuery(); }}><OpsIcon name="search" size={19} /><input aria-label="Rechercher une page, un client ou poser une question" ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Rechercher une page, un client ou poser une question…" /><kbd>Entrée</kbd></form><span className="command-label">Navigation</span>{pages.map((item) => <button key={item.id} onClick={() => { setPage(item.id); setOpen(false); }}><IconTile name={item.icon} /><span>{item.label}</span><small>Ouvrir</small><OpsIcon name="arrow" size={14} /></button>)}{query.trim() ? <button onClick={submitQuery}><IconTile name="spark" /><span>Demander « {query.trim().slice(0, 70)} »</span><small>Envoyer</small><OpsIcon name="arrow" size={14} /></button> : null}<span className="command-label">Demander à OPS</span>{agentScenarios.slice(0, 3).map((scenario) => <button key={scenario.id} onClick={() => { openAgent(scenario.label); setOpen(false); }}><IconTile name="spark" /><span>{scenario.label}</span><small>Question</small><OpsIcon name="arrow" size={14} /></button>)}</div></div>;
 }
 
 export function OpsApp() {
   const [page, setPage] = useState<PageId>("agent");
   const [collapsed, setCollapsed] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [pendingPrompt, setPendingPrompt] = useState("");
   const [commandOpen, setCommandOpen] = useState(false);
   const [generatedDocuments, setGeneratedDocuments] = useState<OpsDocument[]>([]);
   const [preferredDocumentId, setPreferredDocumentId] = useState<string>();
   const [crmCreateRequest, setCrmCreateRequest] = useState(0);
+  const [sourceRequested, setSourceRequested] = useState<string | null>(null);
+  const [sourceEvidence, setSourceEvidence] = useState<SourceEvidence | null>(null);
+  const [sourceLoading, setSourceLoading] = useState(false);
+  const [sourceError, setSourceError] = useState("");
+  const sourceRequestRef = useRef<AbortController | null>(null);
 
   const openAgent: OpenAgent = useCallback((prompt = "") => {
     setPage("agent");
@@ -2665,6 +2902,45 @@ export function OpsApp() {
   const openNewOpportunity = useCallback(() => {
     setPage("crm");
     setCrmCreateRequest((current) => current + 1);
+  }, []);
+
+  const openSource = useCallback(async (rawSource: string) => {
+    const source = rawSource.trim();
+    if (!source) return;
+    sourceRequestRef.current?.abort();
+    const controller = new AbortController();
+    sourceRequestRef.current = controller;
+    setSourceRequested(source);
+    setSourceEvidence(null);
+    setSourceError("");
+    setSourceLoading(true);
+    try {
+      const response = await fetch(`/api/sources/${encodeURIComponent(source)}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      const payload = await response.json().catch(() => ({})) as SourceEvidence & { error?: string };
+      if (!response.ok) {
+        throw new Error(payload.error === "source_not_found"
+          ? "La note n’a pas été retrouvée avec certitude dans la mémoire centrale."
+          : "La mémoire n’a pas pu ouvrir cette preuve pour le moment.");
+      }
+      if (!controller.signal.aborted) setSourceEvidence(payload);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setSourceError(error instanceof Error ? error.message : "La preuve n’a pas pu être ouverte.");
+    } finally {
+      if (!controller.signal.aborted) setSourceLoading(false);
+    }
+  }, []);
+
+  const closeSource = useCallback(() => {
+    sourceRequestRef.current?.abort();
+    sourceRequestRef.current = null;
+    setSourceRequested(null);
+    setSourceEvidence(null);
+    setSourceLoading(false);
+    setSourceError("");
   }, []);
 
   useEffect(() => {
@@ -2700,13 +2976,15 @@ export function OpsApp() {
     const handleCommand = () => setCommandOpen(true);
     const handleOpenSource = (event: Event) => {
       const source = (event as CustomEvent<string>).detail;
-      if (source) openAgent(`Ouvre la source ${source}, cite ses faits clés, ses relations et ce qu'elle change pour la décision.`);
+      if (source) void openSource(source);
     };
     window.addEventListener("keydown", handleKey);
     document.addEventListener("ops-command", handleCommand);
     document.addEventListener("ops-open-source", handleOpenSource);
     return () => { window.removeEventListener("keydown", handleKey); document.removeEventListener("ops-command", handleCommand); document.removeEventListener("ops-open-source", handleOpenSource); };
-  }, [openAgent]);
+  }, [openSource]);
+
+  useEffect(() => () => sourceRequestRef.current?.abort(), []);
 
   const content = useMemo(() => {
     switch (page) {
@@ -2725,9 +3003,10 @@ export function OpsApp() {
 
   return (
     <div className={`ops-app ${collapsed ? "sidebar-is-collapsed" : ""}`}>
-      <Sidebar page={page} setPage={setPage} collapsed={collapsed} setCollapsed={setCollapsed} openAgent={openAgent} />
+      <button className={`mobile-nav-backdrop ${mobileMenuOpen ? "visible" : ""}`} aria-label="Fermer la navigation" onClick={() => setMobileMenuOpen(false)} type="button" />
+      <Sidebar page={page} setPage={setPage} collapsed={collapsed} setCollapsed={setCollapsed} openAgent={openAgent} mobileOpen={mobileMenuOpen} onMobileClose={() => setMobileMenuOpen(false)} />
       <div className="ops-main">
-        <Topbar page={page} openAgent={openAgent} />
+        <Topbar page={page} openAgent={openAgent} onMobileMenu={() => setMobileMenuOpen(true)} />
         <main className="ops-content">
           <div style={{ display: page === "agent" ? "contents" : "none" }}>
             <AgentPage
@@ -2740,6 +3019,7 @@ export function OpsApp() {
           {content}
         </main>
       </div>
+      <SourceEvidenceDialog requested={sourceRequested} evidence={sourceEvidence} loading={sourceLoading} error={sourceError} onClose={closeSource} openAgent={openAgent} />
       <CommandMenu open={commandOpen} setOpen={setCommandOpen} setPage={setPage} openAgent={openAgent} />
     </div>
   );

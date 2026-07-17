@@ -78,6 +78,17 @@ test("les cartes non-button restent utilisables au clavier", async () => {
   assert.deepEqual(inaccessibleCards, []);
 });
 
+test("le graphe du Cerveau expose une navigation clavier complète", async () => {
+  const source = await readFile(brainGraphUrl, "utf8");
+
+  assert.match(source, /aria-describedby="brain-graph-instructions"/);
+  assert.match(source, /onKeyDown=\{handleCanvasKeyDown\}/);
+  assert.match(source, /event\.key === "Home"/);
+  assert.match(source, /"ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"/);
+  assert.match(source, /setTimeout\(\(\) => \{/);
+  assert.match(source, /centerNode\(match, 2\.15\)/);
+});
+
 test("les quatre écritures pilotables passent par l'API records", async () => {
   const { source } = await loadComponent();
 

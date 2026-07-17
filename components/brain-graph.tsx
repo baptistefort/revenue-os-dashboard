@@ -16,6 +16,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { OpsIcon } from "@/components/ops-icons";
@@ -472,6 +473,23 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
     requestAnimationFrame(step);
   }, []);
 
+  useEffect(() => {
+    const normalized = query.toLocaleLowerCase("fr").trim();
+    if (normalized.length < 3) return;
+    const timer = window.setTimeout(() => {
+      const candidates = nodesRef.current.filter((node) => filter === "all" || node.type === filter);
+      const match = candidates.find((node) => node.label.toLocaleLowerCase("fr") === normalized)
+        ?? candidates.find((node) => node.label.toLocaleLowerCase("fr").startsWith(normalized))
+        ?? candidates.find((node) => (
+          `${node.label} ${node.summary} ${node.id}`.toLocaleLowerCase("fr").includes(normalized)
+        ));
+      if (!match) return;
+      setSelected(match.id);
+      centerNode(match, 2.15);
+    }, 320);
+    return () => window.clearTimeout(timer);
+  }, [centerNode, filter, query]);
+
   const zoomAt = useCallback((factor: number, screenX?: number, screenY?: number) => {
     const { width, height } = sizeRef.current;
     const viewport = viewportRef.current;
@@ -676,6 +694,51 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
     }
   };
 
+  const handleCanvasKeyDown = (event: ReactKeyboardEvent<HTMLCanvasElement>) => {
+    if (event.key === "+" || event.key === "=") {
+      event.preventDefault();
+      zoomAt(1.22);
+      return;
+    }
+    if (event.key === "-" || event.key === "_") {
+      event.preventDefault();
+      zoomAt(1 / 1.22);
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      fitGraph(true);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setSelected(null);
+      return;
+    }
+    if (event.key === "Enter" && query.trim()) {
+      event.preventDefault();
+      runSearch();
+      return;
+    }
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    const normalized = query.toLocaleLowerCase("fr").trim();
+    const candidates = nodesRef.current.filter((node) => {
+      if (filter !== "all" && node.type !== filter) return false;
+      if (!normalized) return true;
+      return `${node.label} ${node.summary} ${node.id}`.toLocaleLowerCase("fr").includes(normalized);
+    });
+    if (!candidates.length) return;
+    const currentIndex = candidates.findIndex((node) => node.id === selectedRef.current);
+    const direction = event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
+    const nextIndex = currentIndex < 0
+      ? 0
+      : (currentIndex + direction + candidates.length) % candidates.length;
+    const next = candidates[nextIndex];
+    setSelected(next.id);
+    centerNode(next, 2.05);
+  };
+
   return (
     <section className="brain-workspace">
       <header className="brain-toolbar">
@@ -717,8 +780,10 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
           ref={canvasRef}
           className={hovered ? "is-hovering" : ""}
           aria-label="Graphe interactif de la mémoire de l'entreprise"
+          aria-describedby="brain-graph-instructions"
           role="application"
           tabIndex={0}
+          onKeyDown={handleCanvasKeyDown}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
@@ -727,7 +792,7 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
           onDoubleClick={handleDoubleClick}
         />
 
-        <div className="graph-status">
+        <div className="graph-status" id="brain-graph-instructions">
           <span className="graph-pulse" />
           <span>Graphe vivant</span>
           <i />
@@ -736,6 +801,8 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
           <span>Molette pour zoomer</span>
           <i />
           <span>Double-clic pour centrer</span>
+          <i />
+          <span>Flèches pour naviguer</span>
         </div>
 
         {selectedNode && (
