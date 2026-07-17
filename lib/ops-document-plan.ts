@@ -13,9 +13,50 @@ type DocumentPlanInput = {
 };
 
 const SECTION_HINT = /(?:r[eé]sum[eé]|synth[eè]se|faits?|constats?|[eé]carts?|risques?|causes?|analyse|plan d.action|actions?|responsable|indicateurs?|d[eé]cision|recommandation)/i;
+const MARKDOWN_HEADING = /^#{1,3}\s+(.+)$/;
+const LIST_ITEM = /^(?:[-*•]|\d+[.)])\s+(.+)$/;
+const TABLE_SEPARATOR_CELL = /^:?-{3,}:?$/;
 
 function clean(value: string, maxLength: number) {
   return value.replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function cleanMarkdown(value: string, maxLength: number) {
+  return clean(
+    value
+      .replace(/^#{1,6}\s+/, "")
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/\*([^*]+)\*/g, "$1")
+      .replace(/`([^`]+)`/g, "$1"),
+    maxLength,
+  );
+}
+
+function tableCells(line: string) {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cleanMarkdown(cell, 800));
+}
+
+function isTableSeparator(line: string) {
+  const cells = tableCells(line);
+  return cells.length > 1 && cells.every((cell) => TABLE_SEPARATOR_CELL.test(cell));
+}
+
+function tableRowAsBullet(headers: string[], cells: string[]) {
+  return clean(
+    headers
+      .map((header, index) => {
+        const value = cells[index];
+        return value ? `${header} : ${value}` : "";
+      })
+      .filter(Boolean)
+      .join(" · "),
+    1_200,
+  );
 }
 
 function answerBlocks(answer: string) {
@@ -42,48 +83,97 @@ function titleFromPrompt(prompt: string, answer: string, artifactTitle?: string)
 }
 
 function parseSections(answer: string) {
-  const blocks = answerBlocks(answer);
   const sections: OpsDocumentPlan["sections"] = [];
-  let fallbackParagraphs: string[] = [];
+  const lines = answer.replace(/\r/g, "").split("\n");
+  let current: OpsDocumentPlan["sections"][number] | null = null;
+  let paragraphLines: string[] = [];
 
-  const flushFallback = () => {
-    if (!fallbackParagraphs.length) return;
-    sections.push({
-      title: sections.length ? "Éléments complémentaires" : "Analyse de direction",
-      paragraphs: fallbackParagraphs.splice(0, 8),
+  const ensureSection = (title?: string) => {
+    if (current) return current;
+    current = {
+      title: title || (sections.length ? "Éléments complémentaires" : "Analyse de direction"),
+      paragraphs: [],
       bullets: [],
-    });
+    };
+    sections.push(current);
+    return current;
   };
 
-  for (const block of blocks) {
-    const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
-    const first = lines[0] ?? "";
-    const heading = first.match(/^(?:\d+[.)]\s*)?([^:\n]{2,90})\s*:\s*(.*)$/);
-    const standaloneHeading = lines.length > 1 && first.length <= 90 && SECTION_HINT.test(first);
-    if ((heading && SECTION_HINT.test(heading[1])) || standaloneHeading) {
-      flushFallback();
-      const sectionTitle = heading?.[1] ?? first;
-      const content = heading
-        ? [heading[2], ...lines.slice(1)].filter(Boolean)
-        : lines.slice(1);
-      const bullets = content
-        .filter((line) => /^(?:[-•]|\d+[.)])\s+/.test(line))
-        .map((line) => clean(line.replace(/^(?:[-•]|\d+[.)])\s+/, ""), 1_200));
-      const paragraphs = content
-        .filter((line) => !/^(?:[-•]|\d+[.)])\s+/.test(line))
-        .map((line) => clean(line, 4_000))
-        .filter(Boolean);
-      sections.push({
-        title: clean(sectionTitle.replace(/^(?:\d+[.)]\s*)/, ""), 180),
-        paragraphs: paragraphs.length ? paragraphs : [],
-        bullets,
-      });
+  const flushParagraph = () => {
+    const paragraph = cleanMarkdown(paragraphLines.join(" "), 4_000);
+    paragraphLines = [];
+    if (!paragraph) return;
+    const section = ensureSection();
+    if (section.paragraphs.length < 12) section.paragraphs.push(paragraph);
+  };
+
+  const startSection = (title: string) => {
+    flushParagraph();
+    const section: OpsDocumentPlan["sections"][number] = {
+      title: cleanMarkdown(title.replace(/^(?:\d+[.)]\s*)/, ""), 180),
+      paragraphs: [],
+      bullets: [],
+    };
+    current = section;
+    sections.push(section);
+    return section;
+  };
+
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index].trim();
+
+    if (!line) {
+      flushParagraph();
+      index += 1;
       continue;
     }
-    fallbackParagraphs.push(clean(block, 4_000));
-    if (fallbackParagraphs.length === 8) flushFallback();
+
+    const markdownHeading = line.match(MARKDOWN_HEADING);
+    if (markdownHeading) {
+      startSection(markdownHeading[1]);
+      index += 1;
+      continue;
+    }
+
+    if (line.includes("|") && isTableSeparator(lines[index + 1] ?? "")) {
+      flushParagraph();
+      const headers = tableCells(line);
+      const section = ensureSection(sections.length ? undefined : "Comparatif");
+      index += 2;
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+        const cells = tableCells(lines[index]);
+        if (cells.length !== headers.length) break;
+        const bullet = tableRowAsBullet(headers, cells);
+        if (bullet && section.bullets.length < 16) section.bullets.push(bullet);
+        index += 1;
+      }
+      continue;
+    }
+
+    const legacyHeading = line.match(/^(?:\d+[.)]\s*)?([^:\n]{2,90})\s*:\s*(.*)$/);
+    if (legacyHeading && SECTION_HINT.test(legacyHeading[1])) {
+      const section = startSection(legacyHeading[1]);
+      const content = cleanMarkdown(legacyHeading[2], 4_000);
+      if (content) section.paragraphs.push(content);
+      index += 1;
+      continue;
+    }
+
+    const listItem = line.match(LIST_ITEM);
+    if (listItem) {
+      flushParagraph();
+      const section = ensureSection();
+      if (section.bullets.length < 16) {
+        section.bullets.push(cleanMarkdown(listItem[1], 1_200));
+      }
+      index += 1;
+      continue;
+    }
+
+    paragraphLines.push(line);
+    index += 1;
   }
-  flushFallback();
+  flushParagraph();
 
   return sections.length
     ? sections.slice(0, 14)
@@ -95,9 +185,18 @@ function parseSections(answer: string) {
 }
 
 function executiveSummary(answer: string) {
-  const blocks = answerBlocks(answer);
-  const explicit = blocks.find((block) => /^(?:r[eé]sum[eé]|synth[eè]se|conclusion)\b/i.test(block));
-  return clean(explicit ?? blocks.slice(0, 2).join(" "), 6_000);
+  const sections = parseSections(answer);
+  const explicit = sections.find((section) => /^(?:r[eé]sum[eé]|synth[eè]se|conclusion)\b/i.test(section.title));
+  const explicitContent = explicit
+    ? [...explicit.paragraphs, ...explicit.bullets].join(" ")
+    : "";
+  if (explicitContent) return cleanMarkdown(explicitContent, 6_000);
+
+  const firstContent = sections
+    .flatMap((section) => [...section.paragraphs, ...section.bullets])
+    .slice(0, 2)
+    .join(" ");
+  return cleanMarkdown(firstContent || answer, 6_000);
 }
 
 export function buildDocumentPlanFromAgent({

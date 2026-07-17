@@ -39,3 +39,55 @@ test("ne fabrique aucun fait métier lorsque l'agent ne fournit qu'un texte simp
   assert.deepEqual(plan.decisions, []);
   assert.deepEqual(plan.sources, []);
 });
+
+test("transforme le Markdown de l'agent en sections PDF propres et lisibles", () => {
+  const plan = buildDocumentPlanFromAgent({
+    prompt: "Produis le comparatif SEO en PDF",
+    answer: [
+      "### Bilan SEO",
+      "Le trafic organique progresse sans baisse des conversions.",
+      "",
+      "- **447 clics** le 16 juillet",
+      "- 4 conversions confirmées",
+      "",
+      "### Comparaison avec la veille",
+      "| Indicateur | 16 juillet | 15 juillet | Écart |",
+      "|---|---:|---:|---:|",
+      "| Clics | **447** | 428 | +19 |",
+      "| Impressions | 15 820 | 15 240 | +580 |",
+    ].join("\n"),
+    sources: ["SEO-SNAPSHOT-20260716", "SEO-SNAPSHOT-20260715"],
+  });
+
+  assert.equal(plan.sections[0]?.title, "Bilan SEO");
+  assert.ok(plan.sections.every((section) => !section.title.includes("#")));
+  assert.deepEqual(plan.sections[0]?.bullets, [
+    "447 clics le 16 juillet",
+    "4 conversions confirmées",
+  ]);
+  assert.deepEqual(plan.sections[1]?.bullets, [
+    "Indicateur : Clics · 16 juillet : 447 · 15 juillet : 428 · Écart : +19",
+    "Indicateur : Impressions · 16 juillet : 15 820 · 15 juillet : 15 240 · Écart : +580",
+  ]);
+  assert.equal(
+    plan.executiveSummary,
+    "Le trafic organique progresse sans baisse des conversions. 447 clics le 16 juillet",
+  );
+});
+
+test("rend aussi un tableau Markdown autonome lisible dans le PDF", () => {
+  const plan = buildDocumentPlanFromAgent({
+    prompt: "Génère le tableau en PDF",
+    answer: [
+      "| Canal | Résultat |",
+      "|---|---|",
+      "| Google Search | 58 K€ de pipeline |",
+    ].join("\n"),
+    sources: ["GADS-2026-07"],
+  });
+
+  assert.equal(plan.sections[0]?.title, "Comparatif");
+  assert.deepEqual(plan.sections[0]?.bullets, [
+    "Canal : Google Search · Résultat : 58 K€ de pipeline",
+  ]);
+});

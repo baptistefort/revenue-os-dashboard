@@ -37,6 +37,11 @@ import {
   playStreamingAudioResponse,
   type StreamingAudioPlayback,
 } from "@/lib/streaming-audio";
+import {
+  parseOpsResponseMarkdown,
+  plainTextFromOpsMarkdown,
+  type OpsInlineSegment,
+} from "@/lib/ops-response-markdown";
 
 type OpenAgent = (prompt?: string) => void;
 
@@ -997,6 +1002,49 @@ function AgentActionReceipts({ actions, onAction }: {
   );
 }
 
+function OpsInlineContent({ segments }: { segments: OpsInlineSegment[] }) {
+  return segments.map((segment, index) => {
+    const key = `${segment.kind}-${index}-${segment.text.slice(0, 20)}`;
+    if (segment.kind === "strong") return <strong key={key}>{segment.text}</strong>;
+    if (segment.kind === "emphasis") return <em key={key}>{segment.text}</em>;
+    if (segment.kind === "code") return <code key={key}>{segment.text}</code>;
+    if (segment.kind === "citation") return <span className="answer-citation" key={key}>[{segment.text}]</span>;
+    return <span key={key}>{segment.text}</span>;
+  });
+}
+
+function OpsMarkdownResponse({ value }: { value: string }) {
+  const blocks = parseOpsResponseMarkdown(value);
+  return (
+    <div className="answer-body">
+      {blocks.map((block, index) => {
+        const key = `${block.kind}-${index}`;
+        if (block.kind === "heading") {
+          const content = <OpsInlineContent segments={block.content} />;
+          if (block.level === 2) return <h2 key={key}>{content}</h2>;
+          if (block.level === 3) return <h3 key={key}>{content}</h3>;
+          return <h4 key={key}>{content}</h4>;
+        }
+        if (block.kind === "list") {
+          const List = block.ordered ? "ol" : "ul";
+          return <List key={key}>{block.items.map((item, itemIndex) => <li key={`${key}-${itemIndex}`}><OpsInlineContent segments={item} /></li>)}</List>;
+        }
+        if (block.kind === "table") {
+          return (
+            <div className="answer-table-wrap" key={key}>
+              <table>
+                <thead><tr>{block.headers.map((header, cellIndex) => <th key={`${key}-h-${cellIndex}`}><OpsInlineContent segments={header} /></th>)}</tr></thead>
+                <tbody>{block.rows.map((row, rowIndex) => <tr key={`${key}-r-${rowIndex}`}>{row.map((cell, cellIndex) => <td key={`${key}-r-${rowIndex}-${cellIndex}`}><OpsInlineContent segments={cell} /></td>)}</tr>)}</tbody>
+              </table>
+            </div>
+          );
+        }
+        return <p key={key}><OpsInlineContent segments={block.content} /></p>;
+      })}
+    </div>
+  );
+}
+
 function ScenarioResponse({ scenario, text, document, actions = [], openDocuments, onSpeak, onAction }: {
   scenario: AgentScenario;
   text?: string;
@@ -1008,13 +1056,14 @@ function ScenarioResponse({ scenario, text, document, actions = [], openDocument
 }) {
   const [useful, setUseful] = useState(false);
   const body = text ? text.split(/\n{2,}/).filter(Boolean) : scenario.body;
+  const bodyMarkdown = text?.trim() || body.join("\n\n");
   const answerText = [scenario.lead, ...body].filter(Boolean).join("\n\n");
   return (
     <div className="assistant-answer">
       <div className="assistant-mark"><OpsIcon name="spark" size={18} /></div>
       <div className="assistant-content">
         {scenario.lead ? <strong className="answer-lead">{scenario.lead}</strong> : null}
-        <div className="answer-body">{body.map((paragraph, index) => <p key={`${index}-${paragraph.slice(0, 24)}`}>{paragraph}</p>)}</div>
+        {bodyMarkdown ? <OpsMarkdownResponse value={bodyMarkdown} /> : null}
         {scenario.sources.length ? <SourceChips sources={scenario.sources} /> : null}
         {scenario.artifact && (
           <article className="agent-artifact">
@@ -1029,7 +1078,7 @@ function ScenarioResponse({ scenario, text, document, actions = [], openDocument
           <button type="button" onClick={() => navigator.clipboard?.writeText(answerText)}><OpsIcon name="copy" size={14} /> Copier</button>
           <button type="button" onClick={() => setUseful((current) => !current)}><OpsIcon name="thumb" size={14} /> {useful ? "Noté" : "Utile"}</button>
           <button type="button" onClick={() => onAction("Corrige ta réponse précédente : vérifie chaque fait dans la mémoire, explicite ce qui était imprécis et redonne une réponse sourcée.")}><OpsIcon name="edit" size={14} /> Corriger</button>
-          <button type="button" onClick={() => onSpeak(answerText)}><OpsIcon name="volume" size={14} /> Écouter</button>
+          <button type="button" onClick={() => onSpeak(plainTextFromOpsMarkdown(answerText))}><OpsIcon name="volume" size={14} /> Écouter</button>
         </div>
       </div>
     </div>

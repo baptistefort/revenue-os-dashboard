@@ -155,8 +155,11 @@ const demoEdges = [...semanticDemoEdges, ...memorySpineEdges];
 const evidenceIds = new Set(["PROJET-241", "TEMPS-086", "ACHAT-109", "DEC-063", "CLI-001"]);
 
 function nodeRadius(node: BrainNode) {
-  if (node.type === "company") return 13;
-  return Math.max(3.5, Math.min(9, node.size * .36));
+  // Obsidian keeps the graph legible through density, not oversized markers.
+  // The restrained scale preserves hierarchy while letting hundreds of notes
+  // coexist without turning the canvas into a wall of dots.
+  if (node.type === "company") return 6.4;
+  return Math.max(1.25, Math.min(4.1, 1.2 + Math.max(0, node.size - 18) * .14));
 }
 
 function simNode(value: string | number | SimNode) {
@@ -329,16 +332,16 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
       const typeMatch = filter === "all" || source.type === filter || target.type === filter;
       const evidence = showEvidence && evidenceIds.has(source.id) && evidenceIds.has(target.id);
 
-      let opacity = .17;
-      if (focusNeighbors) opacity = connected ? .68 : .025;
-      if (queryActive) opacity = queryMatch ? .72 : .025;
+      let opacity = .145;
+      if (focusNeighbors) opacity = connected ? .62 : .018;
+      if (queryActive) opacity = queryMatch ? .7 : .018;
       if (!typeMatch) opacity *= .12;
-      if (evidence) opacity = .95;
+      if (evidence) opacity = .9;
 
       context.globalAlpha = opacity;
-      context.strokeStyle = evidence ? "#2f6eac" : link.edgeType === "risk" ? "#a78174" : "#626a73";
-      context.lineWidth = (evidence ? 1.8 : connected ? 1.1 : .7) / viewport.k;
-      context.setLineDash(link.edgeType === "influence" ? [4 / viewport.k, 5 / viewport.k] : []);
+      context.strokeStyle = evidence ? "#346fa8" : link.edgeType === "risk" ? "#8e746d" : "#5f6770";
+      context.lineWidth = (evidence ? 1.15 : connected ? .72 : .44) / viewport.k;
+      context.setLineDash(link.edgeType === "influence" ? [2.5 / viewport.k, 3.5 / viewport.k] : []);
       context.beginPath();
       context.moveTo(source.x, source.y);
       context.lineTo(target.x, target.y);
@@ -358,32 +361,31 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
       if (!queryMatch) opacity *= .12;
       if (!typeMatch) opacity *= .10;
 
-      const radius = nodeRadius(node) * (isHovered ? 1.18 : 1);
+      const radius = nodeRadius(node) * (isHovered ? 1.32 : 1);
       context.globalAlpha = opacity;
       context.beginPath();
       context.arc(node.x, node.y, radius, 0, Math.PI * 2);
-      context.fillStyle = evidence ? "#2f6eac" : isSelected ? "#102d50" : isHovered ? "#315f8b" : node.type === "company" ? "#292e34" : "#5a5e63";
+      context.fillStyle = evidence ? "#346fa8" : isSelected ? "#172231" : isHovered ? "#315f8b" : node.type === "company" ? "#2e3339" : "#5b5f64";
       context.fill();
 
       if (isSelected || evidence) {
-        context.globalAlpha = opacity * .95;
+        context.globalAlpha = opacity * .74;
         context.beginPath();
-        context.arc(node.x, node.y, radius + 5 / viewport.k, 0, Math.PI * 2);
+        context.arc(node.x, node.y, radius + 3.5 / viewport.k, 0, Math.PI * 2);
         context.strokeStyle = evidence ? "#2f6eac" : "#326eae";
-        context.lineWidth = 1.4 / viewport.k;
+        context.lineWidth = .9 / viewport.k;
         context.stroke();
       }
 
-      const importance = degreeMap.get(node.id) ?? 0;
-      const showLabel = isSelected || isHovered || node.type === "company" || (viewport.k > 2.2 && importance >= 5);
+      const showLabel = isSelected || isHovered || node.type === "company";
       if (showLabel && opacity > .25) {
-        const fontSize = (isSelected || isHovered ? 11.5 : 10) / viewport.k;
-        const labelY = node.y + radius + 13 / viewport.k;
+        const fontSize = (isSelected || isHovered ? 10.5 : 9.5) / viewport.k;
+        const labelY = node.y + radius + 11 / viewport.k;
         context.globalAlpha = Math.min(1, opacity + .15);
         context.font = (isSelected || isHovered ? "600 " : "500 ") + fontSize + "px ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
         context.textAlign = "center";
         context.textBaseline = "middle";
-        context.lineWidth = 4 / viewport.k;
+        context.lineWidth = 3.5 / viewport.k;
         context.strokeStyle = "rgba(255,255,255,.96)";
         context.strokeText(node.label, node.x, labelY);
         context.fillStyle = "#303740";
@@ -407,7 +409,7 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
     const maxY = Math.max(...ys);
     const graphWidth = Math.max(120, maxX - minX);
     const graphHeight = Math.max(120, maxY - minY);
-    const nextScale = Math.max(.42, Math.min(2, Math.min((width - 84) / graphWidth, (height - 84) / graphHeight)));
+    const nextScale = Math.max(.32, Math.min(2.35, Math.min((width - 118) / graphWidth, (height - 112) / graphHeight)));
     const target = {
       k: nextScale,
       x: width / 2 - ((minX + maxX) / 2) * nextScale,
@@ -471,7 +473,7 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
     const anchorY = screenY ?? height / 2;
     const graphX = (anchorX - viewport.x) / viewport.k;
     const graphY = (anchorY - viewport.y) / viewport.k;
-    const nextScale = Math.max(.32, Math.min(5, viewport.k * factor));
+    const nextScale = Math.max(.24, Math.min(6, viewport.k * factor));
     viewportRef.current = {
       k: nextScale,
       x: anchorX - graphX * nextScale,
@@ -489,7 +491,7 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
     const handleWheel = (event: WheelEvent) => {
       event.preventDefault();
       const rect = canvas.getBoundingClientRect();
-      const factor = Math.exp(-event.deltaY * .00125);
+      const factor = Math.exp(-event.deltaY * .001);
       zoomAt(factor, event.clientX - rect.left, event.clientY - rect.top);
     };
 
@@ -525,8 +527,8 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
   useEffect(() => {
     const simNodes: SimNode[] = nodes.map((node, index) => ({
       ...node,
-      x: Number.isFinite(node.x) ? (node.x - 500) * .72 : Math.cos(index * 2.39) * (80 + index * 2),
-      y: Number.isFinite(node.y) ? (node.y - 330) * .72 : Math.sin(index * 2.39) * (80 + index * 2),
+      x: Number.isFinite(node.x) ? (node.x - 500) * .82 : Math.cos(index * 2.39) * (74 + Math.sqrt(index + 1) * 19),
+      y: Number.isFinite(node.y) ? (node.y - 330) * .82 : Math.sin(index * 2.39) * (74 + Math.sqrt(index + 1) * 19),
     }));
     const validIds = new Set(simNodes.map((node) => node.id));
     const simLinks: SimLink[] = edges
@@ -538,12 +540,12 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
     hasInteractedRef.current = false;
 
     const simulation = forceSimulation<SimNode>(simNodes)
-      .force("link", forceLink<SimNode, SimLink>(simLinks).id((node) => node.id).distance((link) => link.edgeType === "knowledge" ? 66 : link.edgeType === "influence" ? 82 : 58).strength(.26))
-      .force("charge", forceManyBody<SimNode>().strength((node) => node.type === "company" ? -190 : -78).distanceMax(430))
-      .force("center", forceCenter<SimNode>(0, 0).strength(.075))
-      .force("collision", forceCollide<SimNode>().radius((node) => nodeRadius(node) + 9).strength(.82))
-      .alphaDecay(.031)
-      .velocityDecay(.36)
+      .force("link", forceLink<SimNode, SimLink>(simLinks).id((node) => node.id).distance((link) => link.edgeType === "knowledge" ? 58 : link.edgeType === "influence" ? 72 : 51).strength(.2))
+      .force("charge", forceManyBody<SimNode>().strength((node) => node.type === "company" ? -118 : -42).distanceMax(520).theta(.72))
+      .force("center", forceCenter<SimNode>(0, 0).strength(.048))
+      .force("collision", forceCollide<SimNode>().radius((node) => nodeRadius(node) + 2.8).strength(.7).iterations(2))
+      .alphaDecay(.024)
+      .velocityDecay(.31)
       .on("tick", () => paintRef.current());
 
     simulationRef.current = simulation;
