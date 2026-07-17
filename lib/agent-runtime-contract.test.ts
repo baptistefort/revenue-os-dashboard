@@ -32,6 +32,7 @@ test("la route agent ne contient plus de moteur métier de secours", async () =>
   assert.match(source, /actions: \[\]/);
   assert.match(source, /shouldRetryBusyOpenCodeTurn/);
   assert.match(source, /if \(document\)[\s\S]*mode: "opencode", document/);
+  assert.match(source, /Pour une position moyenne SEO, un nombre qui baisse est une amélioration/);
   assert.doesNotMatch(source, /openCodeDocumentOutputSchema/);
 });
 
