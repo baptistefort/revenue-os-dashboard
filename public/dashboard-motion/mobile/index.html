@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=780, height=1392">
-    <title>OPS · Conversation dirigeant mobile</title>
+    <title>OPS · Mémoire IA en action mobile</title>
     <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
     <style>
       :root {
@@ -240,17 +240,17 @@
       <section id="ops-dashboard-mobile-scene" class="clip" data-start="0" data-duration="20" data-track-index="1">
         <div class="canvas-fill">
           <main class="app-shell">
-            <header class="topbar"><div class="brand">OPS<span class="brand-mark"></span></div><span class="topbar-context">Mon agent · aujourd'hui</span><button type="button" class="topbar-avatar">M</button></header>
+            <header class="topbar"><div class="brand">OPS<span class="brand-mark"></span></div><span class="topbar-context">Mon agent IA · aujourd'hui</span><button type="button" class="topbar-avatar">M</button></header>
 
             <div class="dashboard-content">
               <div class="heading-row">
-                <div class="heading-copy"><span>Votre entreprise, en direct.</span><h1>Bonjour Marie.</h1></div>
+                <div class="heading-copy"><span>Votre mémoire IA, en direct.</span><h1>Bonjour Marie.</h1></div>
                 <div class="memory-live"><span class="live-dot"></span>En direct</div>
               </div>
 
               <div class="kpi-grid">
-                <article class="kpi-card"><span class="kpi-label">Pipeline</span><div><strong class="kpi-value">184 K€</strong><span class="kpi-delta">+12 %</span></div><span class="kpi-fill kpi-fill-pipeline"></span></article>
-                <article class="kpi-card"><span class="kpi-label">Marge</span><div><strong class="kpi-value">29 %</strong><span class="kpi-delta neutral">−2 pts</span></div><span class="kpi-fill kpi-fill-margin"></span></article>
+                <article class="kpi-card"><span class="kpi-label">Contexte relié</span><div><strong class="kpi-value">1 248</strong><span class="kpi-delta">+34</span></div><span class="kpi-fill kpi-fill-pipeline"></span></article>
+                <article class="kpi-card"><span class="kpi-label">Décisions</span><div><strong class="kpi-value">18</strong><span class="kpi-delta neutral">3 ouvertes</span></div><span class="kpi-fill kpi-fill-margin"></span></article>
               </div>
 
               <section class="conversation-card">
@@ -260,24 +260,24 @@
                 </header>
 
                 <div class="thread">
-                  <div id="m-msg-u1" class="message user"><div class="bubble"><span class="bubble-copy">Qui doit être relancé aujourd'hui ?</span></div></div>
+                  <div id="m-msg-u1" class="message user"><div class="bubble"><span class="bubble-copy">Que s'est-il passé avec Vitreflam cette semaine ?</span></div></div>
                   <div id="m-typing-1" class="typing-indicator"><span></span><span></span><span></span></div>
-                  <div id="m-msg-a1" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">3 dossiers : Atelier Sud (12,4 k€ · 28 j), Nova (7,8 k€ · 12 j) et Maison Cobalt (4,1 k€ · 8 j). Je prépare les relances ?</span><span class="bubble-chips"><span class="bubble-chip">CRM</span><span class="bubble-chip">Factures</span></span></div></div>
+                  <div id="m-msg-a1" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">Fabien a signalé un accès bloqué. Le projet Avis clients reste en attente. Deux décisions ont été prises lundi.</span><span class="bubble-chips"><span class="bubble-chip">5 échanges</span><span class="bubble-chip">1 réunion</span></span></div></div>
 
-                  <div id="m-msg-u2" class="message user"><div class="bubble"><span class="bubble-copy">Oui. Doux pour Atelier Sud, ferme pour Nova.</span></div></div>
+                  <div id="m-msg-u2" class="message user"><div class="bubble"><span class="bubble-copy">Qu'avons-nous promis à Fabien ?</span></div></div>
                   <div id="m-typing-2" class="typing-indicator"><span></span><span></span><span></span></div>
-                  <div id="m-msg-a2" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">Relances prêtes. 2 validations requises. Maison Cobalt attendra lundi.</span><span class="bubble-chips"><span class="bubble-chip">2 brouillons prêts</span></span></div></div>
+                  <div id="m-msg-a2" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">Un nouvel accès avant vendredi et une proposition d'automatisation après validation. Le premier engagement arrive à échéance demain.</span><span class="bubble-chips"><span class="bubble-chip">2 engagements</span></span></div></div>
 
-                  <div id="m-msg-u3" class="message user"><div class="bubble"><span class="bubble-copy">Pourquoi la marge atelier baisse ?</span></div></div>
+                  <div id="m-msg-u3" class="message user"><div class="bubble"><span class="bubble-copy">Qu'est-ce qui risque de se perdre ?</span></div></div>
                   <div id="m-typing-3" class="typing-indicator"><span></span><span></span><span></span></div>
-                  <div id="m-msg-a3" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">−2,1 pts cette semaine. Le chantier Rivoli concentre 82 % de l'écart : 14 h non facturées.</span><span class="bubble-chips"><span class="bubble-chip">PROJET-241</span><span class="bubble-chip">TEMPS-86</span></span></div></div>
+                  <div id="m-msg-a3" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">La validation des réponses sans commentaire. Décidée lundi, elle n'a encore ni responsable ni échéance.</span><span class="bubble-chips"><span class="bubble-chip">Décision · lundi</span><span class="bubble-chip">Suivi manquant</span></span></div></div>
 
-                  <div id="m-msg-u4" class="message user"><div class="bubble"><span class="bubble-copy">Corrige et fais-moi un brief à 17 h.</span></div></div>
+                  <div id="m-msg-u4" class="message user"><div class="bubble"><span class="bubble-copy">Prépare le brief et les actions.</span></div></div>
                   <div id="m-typing-4" class="typing-indicator"><span></span><span></span><span></span></div>
-                  <div id="m-msg-a4" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">3 tâches assignées. Brief programmé à 17 h. Aucun message client ne part sans votre validation.</span><span class="bubble-chips"><span class="bubble-chip green">3 tâches</span><span class="bubble-chip green">Brief · 17:00</span></span></div></div>
+                  <div id="m-msg-a4" class="message ai"><span class="agent-mini">O°</span><div class="bubble"><span class="bubble-copy">Brief prêt. 3 actions proposées. Rien ne sera assigné ni envoyé sans votre validation.</span><span class="bubble-chips"><span class="bubble-chip green">Brief prêt</span><span class="bubble-chip green">3 actions</span></span></div></div>
 
                   <div class="memory-progress"></div>
-                  <div class="final-state">Mémoire synchronisée · 8 messages</div>
+                  <div class="final-state">Mémoire IA actualisée · 12 sources reliées</div>
                 </div>
               </section>
             </div>

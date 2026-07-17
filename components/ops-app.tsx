@@ -221,9 +221,10 @@ function usePersistedOpportunities() {
               ? record.attributes.next_action
               : "À définir",
           }));
-          setItems([...stored, ...opportunities.filter(
-            (item) => !stored.some((record) => record.id === item.id),
-          )]);
+          // Dès que PostgreSQL répond, cette liste devient l'unique vérité de
+          // l'écran. Le portefeuille local n'est qu'un état de continuité hors
+          // connexion et ne doit jamais créer de doubles opportunités.
+          setItems(stored.length > 0 ? stored : opportunities);
         })
         .catch(() => {
           // Les données de démonstration restent disponibles hors connexion.
@@ -278,9 +279,7 @@ function usePersistedClients() {
               email: typeof record.attributes.email === "string" ? record.attributes.email : "",
             };
           });
-          setItems([...stored, ...clients.filter(
-            (item) => !stored.some((record) => record.id === item.id),
-          )]);
+          setItems(stored.length > 0 ? stored : clients);
         })
         .catch(() => {
           // Le portefeuille fictif reste visible sans écriture serveur.
@@ -377,7 +376,12 @@ function Sidebar({ page, setPage, collapsed, setCollapsed, openAgent }: {
     <aside className={`ops-sidebar ${collapsed ? "collapsed" : ""}`}>
       <div className="sidebar-top">
         <Logo />
-        <button className="sidebar-collapse" onClick={() => setCollapsed(!collapsed)} aria-label="Réduire la navigation">
+        <button
+          className="sidebar-collapse"
+          onClick={() => setCollapsed(!collapsed)}
+          aria-label={collapsed ? "Déployer la navigation" : "Réduire la navigation"}
+          aria-expanded={!collapsed}
+        >
           <span /><span />
         </button>
       </div>
@@ -965,7 +969,7 @@ function AgentActionReceipts({ actions, onAction }: {
     create_task: "Tâche",
     create_client: "Client",
     prepare_email: "Brouillon email",
-    send_demo_email: "Email de démonstration",
+    send_demo_email: "Email sortant",
   };
   return (
     <div className="agent-action-receipts">
@@ -1522,7 +1526,7 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   return (
     <>
       <div className="agent-thread-page">
-        <div className="thread-toolbar"><button onClick={startNewConversation}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · données de démonstration</span><button onClick={() => document.dispatchEvent(new CustomEvent("ops-command"))} aria-label="Actions de la conversation"><OpsIcon name="dots" size={18} /></button></div>
+        <div className="thread-toolbar"><button onClick={startNewConversation}><OpsIcon name="plus" size={17} /> Nouvelle conversation</button><span>Conversation privée · mémoire de l’entreprise</span><button onClick={() => document.dispatchEvent(new CustomEvent("ops-command"))} aria-label="Actions de la conversation"><OpsIcon name="dots" size={18} /></button></div>
         <div className="thread-scroll" ref={scrollRef}>
           <div className="thread-content">
             {messages.map((message) => message.role === "user" ? (
@@ -1564,7 +1568,10 @@ function AgentPage({ initialPrompt, consumePrompt, onDocumentGenerated, openDocu
   );
 }
 
-function CyclePage({ openAgent }: { openAgent: OpenAgent }) {
+function CyclePage({ openAgent, openNewOpportunity }: {
+  openAgent: OpenAgent;
+  openNewOpportunity: () => void;
+}) {
   const [pipelineItems] = usePersistedOpportunities();
   return (
     <div className="content-page">
@@ -1573,7 +1580,7 @@ function CyclePage({ openAgent }: { openAgent: OpenAgent }) {
         {cycleStages.map((stage, index) => <button key={stage.label} onClick={() => openAgent(`Analyse les ${stage.count} dossiers de l'étape ${stage.label}, explique les risques et les prochaines actions.`)}><span>0{index + 1}</span><strong>{stage.label}</strong><em>{stage.count} dossiers</em><b>{stage.value}</b><i style={{ width: `${stage.progress}%` }} /></button>)}
       </section>
       <section className="panel data-panel">
-        <div className="panel-title"><div><span>Dossiers en mouvement</span><small>14 changements depuis hier</small></div><div className="table-actions"><button onClick={() => openAgent("Filtre les dossiers du cycle par niveau de risque et échéance.")}><OpsIcon name="filter" size={15} /> Filtrer</button><button onClick={() => openAgent("Crée un nouveau dossier commercial. Demande-moi les informations nécessaires une par une.")}><OpsIcon name="plus" size={15} /> Nouveau</button></div></div>
+        <div className="panel-title"><div><span>Dossiers en mouvement</span><small>14 changements depuis hier</small></div><div className="table-actions"><button onClick={() => openAgent("Filtre les dossiers du cycle par niveau de risque et échéance.")}><OpsIcon name="filter" size={15} /> Filtrer</button><button onClick={openNewOpportunity}><OpsIcon name="plus" size={15} /> Nouveau</button></div></div>
         <div className="entity-table cycle-table">
           <div className="table-head"><span>Dossier</span><span>Étape</span><span>Responsable</span><span>Montant</span><span>Prochaine action</span><span>Risque</span></div>
           {pipelineItems.map((opportunity) => <button className="table-row" key={opportunity.id} onClick={() => openAgent(`Résume le dossier ${opportunity.name}`)}><span><strong>{opportunity.name}</strong><small>{opportunity.id} · {opportunity.source}</small></span><span><i className="stage-dot" />{opportunity.stage}</span><span>{opportunity.owner}</span><span><strong>{(opportunity.amount / 1000).toLocaleString("fr-FR")} K€</strong></span><span>{opportunity.next}</span><span className={opportunity.probability > 70 ? "risk-low" : "risk-mid"}>{opportunity.probability > 70 ? "Faible" : "À suivre"}</span></button>)}
@@ -1608,6 +1615,25 @@ function baseEmailThreads(): EmailThreadView[] {
   }));
 }
 
+function isInternalEmailRecord(record: PersistedRecord) {
+  const attributes = record.attributes;
+  const company = typeof attributes.company === "string" ? attributes.company : "";
+  const searchable = `${record.title} ${company}`
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("fr");
+  return /\b(?:test|audit|demo|demonstration)\b/.test(searchable)
+    || searchable.trim() === "heelo";
+}
+
+function emailPreview(record: PersistedRecord, sent: boolean) {
+  if (!sent) return record.summary;
+  const recipient = typeof record.attributes.recipient === "string"
+    ? record.attributes.recipient
+    : "son destinataire";
+  return `Email remis à la boîte d’envoi contrôlée pour ${recipient}.`;
+}
+
 function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
   const [threads, setThreads] = useState<EmailThreadView[]>(baseEmailThreads);
   const [selectedId, setSelectedId] = useState(emailThreads[0].id);
@@ -1625,7 +1651,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
         .then(async (response) => response.ok ? response.json() as Promise<{ records?: PersistedRecord[] }> : { records: [] })
         .then(({ records = [] }) => {
           if (controller.signal.aborted) return;
-          const created = records.map((record): EmailThreadView => {
+          const created = records.filter((record) => !isInternalEmailRecord(record)).map((record): EmailThreadView => {
             const attributes = record.attributes;
             const sent = attributes.mailbox === "sent" || attributes.direction === "outbound";
             const classificationValue = typeof attributes.classification === "string"
@@ -1682,14 +1708,14 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
               sender,
               company: companyName,
               subject: record.title,
-              preview: record.summary,
+              preview: emailPreview(record, sent),
               time: timestamp,
               tag,
               unread: !sent && attributes.status === "to_process",
               linked: record.relations.find((relation) => /^(?:CLI|OPP|FACT|PROJET)-/.test(relation)) ?? "ORG-001",
               folder: folderValue,
               classification: classificationValue,
-              body: sent ? record.content : record.summary,
+              body: record.content || record.summary,
               recipient: replyAddress,
             };
           });
@@ -1771,7 +1797,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
       setSendStatus("Envoyé et ajouté à la mémoire Obsidian.");
       return true;
     } catch {
-      setSendStatus("L’envoi de démonstration n’a pas pu être archivé.");
+      setSendStatus("Le message n’a pas pu être remis à la boîte d’envoi.");
       return false;
     } finally {
       setSending(false);
@@ -1791,6 +1817,14 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
     { id: "later", label: "Plus tard" },
     { id: "opposition", label: "Opposition" },
   ];
+  const selectThread = (threadId: string) => {
+    setSelectedId(threadId);
+    setThreads((current) => current.map((thread) => (
+      thread.id === threadId && thread.unread
+        ? { ...thread, unread: false }
+        : thread
+    )));
+  };
 
   return (
     <>
@@ -1829,10 +1863,10 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
           <div className="mail-list">
             <div className="mail-list-head">
               <strong>{classification ? classifications.find((item) => item.id === classification)?.label : folders.find((item) => item.id === folder)?.label}</strong>
-              <button onClick={() => openAgent(`Analyse et filtre les emails de la vue ${folder}`)}><OpsIcon name="filter" size={15} /></button>
+              <button aria-label="Analyser et filtrer cette boîte" onClick={() => openAgent(`Analyse et filtre les emails de la vue ${folder}`)}><OpsIcon name="filter" size={15} /></button>
             </div>
             {filteredThreads.map((thread) => (
-              <button key={thread.id} onClick={() => setSelectedId(thread.id)} className={`mail-thread ${selected.id === thread.id ? "active" : ""}`}>
+              <button key={thread.id} onClick={() => selectThread(thread.id)} className={`mail-thread ${selected.id === thread.id ? "active" : ""}`}>
                 <span className="contact-avatar">{thread.sender.split(" ").map((part) => part[0]).join("").slice(0, 2)}</span>
                 <span><strong>{thread.sender}</strong><small>{thread.company}</small><b>{thread.subject}</b><p>{thread.preview}</p><em>{thread.tag}</em></span>
                 <time>{thread.time}</time>{thread.unread && <i className="unread-dot" />}
@@ -1844,8 +1878,8 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
             <header>
               <div><span>{selected.tag}</span><h2>{selected.subject}</h2><p>{selected.sender} · {selected.company}</p></div>
               <div>
-                <button onClick={() => openAgent(`Résume toutes les relations de ${selected.id}`)}><OpsIcon name="dots" size={17} /></button>
-                <button onClick={() => openAgent(`Prépare une réponse à ${selected.id} pour ${selected.sender}`)}><OpsIcon name="arrow" size={17} /></button>
+                <button aria-label={`Analyser les relations de ${selected.subject}`} onClick={() => openAgent(`Résume toutes les relations de ${selected.id}`)}><OpsIcon name="dots" size={17} /></button>
+                <button aria-label={`Préparer une réponse à ${selected.sender}`} onClick={() => openAgent(`Prépare une réponse à ${selected.id} pour ${selected.sender}`)}><OpsIcon name="arrow" size={17} /></button>
               </div>
             </header>
             <div className="mail-ai-summary"><span><OpsIcon name="spark" size={15} /> Résumé OPS</span><p>{selected.preview} Le message est relié au dossier {selected.linked} et sa prochaine action peut être préparée sans perdre l’historique.</p><SourceChips sources={[selected.linked, selected.id]} /></div>
@@ -1881,7 +1915,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
       <OpsModal
         open={composeOpen}
         title="Nouveau message"
-        description="Le message est envoyé dans la démo puis inscrit dans la mémoire de l’entreprise."
+        description="Le message est remis à la boîte d’envoi puis inscrit dans la mémoire de l’entreprise."
         onClose={() => setComposeOpen(false)}
       >
         <form
@@ -1979,7 +2013,7 @@ function DocumentsPage({ openAgent, generatedDocuments, preferredDocumentId, onD
           {searchOpen ? <div className="entity-search"><OpsIcon name="search" size={15} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Titre, identifiant, client ou responsable…" /></div> : null}
           <div className="entity-table documents-table"><div className="table-head"><span>Document</span><span>Type</span><span>Lié à</span><span>Responsable</span><span>Mise à jour</span><span>État OPS</span></div>{visibleDocuments.map((document) => <button className={`table-row ${selected?.id === document.id ? "selected" : ""}`} onClick={() => setSelectedId(document.id)} key={document.id}><span><i className="doc-type"><OpsIcon name={document.generated ? "download" : "document"} size={16} /></i><span><strong>{document.name}</strong><small>{document.id}</small></span></span><span>{document.type}</span><span>{document.linked}</span><span>{document.owner}</span><span>{document.updated}</span><span className={`doc-status status-${document.status.toLocaleLowerCase("fr").replace("à ", "").replaceAll(" ", "-")}`}>{document.status}</span></button>)}{!visibleDocuments.length ? <div className="entity-empty">Aucun document ne correspond à cette vue.</div> : null}</div>
         </section>
-        {selected ? <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button onClick={() => openAgent(`Liste les relations, décisions et usages du document ${selected.id}.`)}><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.url || selected.objectUrl || selected.dataUrl ? <object className="pdf-preview" data={selected.url ?? selected.objectUrl ?? selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.url ?? selected.objectUrl ?? selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} éléments indexés</strong><p>{selected.summary || "Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné."}</p>{selected.url || selected.objectUrl || selected.dataUrl ? <a className="document-download" href={selected.downloadUrl ?? selected.url ?? selected.objectUrl ?? selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse uniquement le document ${selected.id} (${selected.name}). Commence par les faits extraits de cette source, puis distingue clairement tes éventuelles comparaisons avec le reste de la mémoire.`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside> : null}
+        {selected ? <aside className="document-inspector"><header><span className="doc-preview-icon"><OpsIcon name="document" size={28} /></span><button aria-label={`Analyser les relations de ${selected.name}`} onClick={() => openAgent(`Liste les relations, décisions et usages du document ${selected.id}.`)}><OpsIcon name="dots" size={17} /></button></header><span className="eyebrow">{selected.id} · {selected.type}</span><h2>{selected.name}</h2><p>Lié à <strong>{selected.linked}</strong> · mis à jour par {selected.owner}</p>{selected.url || selected.objectUrl || selected.dataUrl ? <object className="pdf-preview" data={selected.url ?? selected.objectUrl ?? selected.dataUrl} type="application/pdf" aria-label={`Aperçu de ${selected.name}`}><a href={selected.url ?? selected.objectUrl ?? selected.dataUrl} target="_blank" rel="noreferrer">Ouvrir le PDF</a></object> : <div className="doc-preview-lines"><i /><i /><i /><i /><i /></div>}<div className="doc-insight"><span><OpsIcon name="spark" size={15} /> Ce qu’OPS en retient</span><strong>{selected.facts} éléments indexés</strong><p>{selected.summary || "Montants, dates, engagements, personnes et relations ont été reliés au dossier concerné."}</p>{selected.url || selected.objectUrl || selected.dataUrl ? <a className="document-download" href={selected.downloadUrl ?? selected.url ?? selected.objectUrl ?? selected.dataUrl} download={selected.name}><OpsIcon name="download" size={15} /> Télécharger le PDF</a> : null}<button onClick={() => openAgent(`Résume et analyse uniquement le document ${selected.id} (${selected.name}). Commence par les faits extraits de cette source, puis distingue clairement tes éventuelles comparaisons avec le reste de la mémoire.`)}>Interroger ce document <OpsIcon name="arrow" size={14} /></button></div><SourceChips sources={[selected.id, selected.linked]} /></aside> : null}
       </div>
     </div>
   );
@@ -2251,7 +2285,11 @@ function PlanningPage({ openAgent }: { openAgent: OpenAgent }) {
       };
       const saved = slotDraft.id
         ? await updateOpsRecord(slotDraft.id, payload)
-        : await createOpsRecord(payload);
+        : await createOpsRecord(payload).then((created) => (
+            // La création agentique conserve le reçu d'action ; le PATCH
+            // enrichit ensuite la fiche avec sa position exacte dans la grille.
+            updateOpsRecord(created.id, payload)
+          ));
       setPlannedTasks((current) => [{
         id: saved.id,
         title: slotDraft.title,
@@ -2292,7 +2330,7 @@ function PlanningPage({ openAgent }: { openAgent: OpenAgent }) {
           </div>
           <div className="planning-grid">
             <div className="planning-corner">Projet / équipe</div>
-            {visibleDays.map((day, index) => <div className={`planning-day ${weekOffset === 0 && index === 2 ? "today" : ""}`} key={day}>{day}<small>{weekOffset === 0 && index === 2 ? "Aujourd’hui" : ""}</small></div>)}
+            {visibleDays.map((day, index) => <div className={`planning-day ${weekOffset === 0 && index === 4 ? "today" : ""}`} key={day}>{day}<small>{weekOffset === 0 && index === 4 ? "Aujourd’hui" : ""}</small></div>)}
             {visiblePlanningRows.map((row) => (
               <div className="planning-row" key={row.project}>
                 <button className="planning-project" onClick={() => openAgent(`Résume le planning, les risques et les prochaines étapes du projet ${row.project}.`)}><strong>{row.project}</strong><small>{row.owner}</small></button>
@@ -2336,22 +2374,26 @@ function PlanningPage({ openAgent }: { openAgent: OpenAgent }) {
   );
 }
 
-function CRMPage({ openAgent }: { openAgent: OpenAgent }) {
+function CRMPage({ openAgent, createRequest = 0 }: {
+  openAgent: OpenAgent;
+  createRequest?: number;
+}) {
   const stages = ["Qualification", "Découverte", "Proposition", "Négociation"] as const;
-  const [cards, setCards] = usePersistedOpportunities();
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [status, setStatus] = useState("");
-  const [draft, setDraft] = useState({
+  const emptyOpportunity = (stage: OpportunityView["stage"] = "Qualification") => ({
     name: "",
     amount: "25000",
-    stage: "Qualification" as OpportunityView["stage"],
+    stage,
     probability: "45",
     owner: "Camille",
     source: "Recommandation",
     next: "Appel de qualification",
   });
+  const [cards, setCards] = usePersistedOpportunities();
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState("");
+  const [draft, setDraft] = useState(emptyOpportunity);
 
   const pipeline = cards.reduce((sum, item) => sum + item.amount, 0);
   const openOpportunityModal = (
@@ -2370,21 +2412,32 @@ function CRMPage({ openAgent }: { openAgent: OpenAgent }) {
         next: opportunity.next,
       });
     } else {
-      setDraft((current) => ({ ...current, stage }));
+      setDraft(emptyOpportunity(stage));
     }
     setStatus("");
     setModalOpen(true);
   };
+
+  useEffect(() => {
+    if (!createRequest) return;
+    setEditingId(null);
+    setDraft(emptyOpportunity());
+    setStatus("");
+    setModalOpen(true);
+  }, [createRequest]);
+
   const saveOpportunity = async () => {
     setSaving(true);
     setStatus("");
     try {
+      const amount = safeNumber(draft.amount, 0, 0, 100_000_000);
+      const probability = safeNumber(draft.probability, 0, 0, 100);
       const payload = {
         kind: "opportunity",
         name: draft.name,
-        amount: Number(draft.amount),
+        amount,
         stage: draft.stage,
-        probability: Number(draft.probability),
+        probability,
         owner: draft.owner,
         source: draft.source,
         next: draft.next,
@@ -2396,14 +2449,14 @@ function CRMPage({ openAgent }: { openAgent: OpenAgent }) {
       setCards((current) => [{
         id: saved.id,
         name: draft.name,
-        amount: Number(draft.amount),
+        amount,
         stage: draft.stage,
-        probability: Number(draft.probability),
+        probability,
         owner: draft.owner,
         source: draft.source,
         next: draft.next,
       }, ...current.filter((item) => item.id !== saved.id)]);
-      setDraft({ name: "", amount: "25000", stage: "Qualification", probability: "45", owner: "Camille", source: "Recommandation", next: "Appel de qualification" });
+      setDraft(emptyOpportunity());
       setEditingId(null);
       setModalOpen(false);
     } catch {
@@ -2587,6 +2640,7 @@ export function OpsApp() {
   const [commandOpen, setCommandOpen] = useState(false);
   const [generatedDocuments, setGeneratedDocuments] = useState<OpsDocument[]>([]);
   const [preferredDocumentId, setPreferredDocumentId] = useState<string>();
+  const [crmCreateRequest, setCrmCreateRequest] = useState(0);
 
   const openAgent: OpenAgent = useCallback((prompt = "") => {
     setPage("agent");
@@ -2605,6 +2659,11 @@ export function OpsApp() {
   const openDocuments = useCallback((documentId?: string) => {
     if (documentId) setPreferredDocumentId(documentId);
     setPage("documents");
+  }, []);
+
+  const openNewOpportunity = useCallback(() => {
+    setPage("crm");
+    setCrmCreateRequest((current) => current + 1);
   }, []);
 
   useEffect(() => {
@@ -2652,16 +2711,16 @@ export function OpsApp() {
     switch (page) {
       case "today": return <TodayPage setPage={setPage} openAgent={openAgent} />;
       case "agent": return null;
-      case "cycle": return <CyclePage openAgent={openAgent} />;
+      case "cycle": return <CyclePage openAgent={openAgent} openNewOpportunity={openNewOpportunity} />;
       case "emails": return <EmailsPage openAgent={openAgent} />;
       case "documents": return <DocumentsPage openAgent={openAgent} generatedDocuments={generatedDocuments} preferredDocumentId={preferredDocumentId} onDocumentImported={addGeneratedDocument} />;
       case "clients": return <ClientsPage openAgent={openAgent} />;
       case "planning": return <PlanningPage openAgent={openAgent} />;
-      case "crm": return <CRMPage openAgent={openAgent} />;
+      case "crm": return <CRMPage openAgent={openAgent} createRequest={crmCreateRequest} />;
       case "numbers": return <NumbersPage openAgent={openAgent} />;
       case "brain": return <BrainPage openAgent={openAgent} />;
     }
-  }, [addGeneratedDocument, generatedDocuments, openAgent, page, preferredDocumentId]);
+  }, [addGeneratedDocument, crmCreateRequest, generatedDocuments, openAgent, openNewOpportunity, page, preferredDocumentId]);
 
   return (
     <div className={`ops-app ${collapsed ? "sidebar-is-collapsed" : ""}`}>
@@ -2681,7 +2740,6 @@ export function OpsApp() {
         </main>
       </div>
       <CommandMenu open={commandOpen} setOpen={setCommandOpen} setPage={setPage} openAgent={openAgent} />
-      <div className="demo-watermark">Données de démonstration</div>
     </div>
   );
 }

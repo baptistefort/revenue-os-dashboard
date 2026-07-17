@@ -26,7 +26,8 @@ import {
 } from "@/lib/opencode-reliability";
 import { buildDocumentPlanFromAgent } from "@/lib/ops-document-plan";
 import type { OpsDocumentPlan } from "@/lib/ops-document";
-import { buildOpsMemoryContext } from "@/lib/ops-retrieval";
+import { buildUnifiedOpsMemoryContext } from "@/lib/ops-memory-context";
+import { verifyAgentSourceList } from "@/lib/central-memory/source-verification";
 import { persistSourcedAgentAnalysis } from "@/lib/ops-analysis-memory";
 import {
   opsAgentActionEnvelopesSchema,
@@ -90,10 +91,10 @@ function sanitizeOpenCodeOutput(output: OpenCodeOutput): OpenCodeOutput {
   };
 }
 
-const OPEN_CODE_SYSTEM = `Tu es le cerveau privé de l'application OPS, un copilote de direction pour l'entreprise fictive Atelier Beaumarchais.
+const OPEN_CODE_SYSTEM = `Tu es le cerveau privé de l'application OPS, un copilote de direction pour l'entreprise Atelier Beaumarchais.
 
 Tu disposes exclusivement des outils read-only OPS. Pour toute question métier, utilise les outils avant d'affirmer un fait. Pour une salutation, une correction conversationnelle ou une question sociale, réponds naturellement sans recherche inutile.
-Lorsqu'un bloc « CONTEXTE MÉMOIRE OBSIDIAN PRÉCHARGÉ » est fourni, la recherche a déjà été effectuée par OPS : lis réellement les champs content, facts et attributes des notes retenues, puis analyse directement ces preuves sans demander d'outil.
+Lorsqu'un bloc « CONTEXTE MÉMOIRE CENTRALE OPS PRÉCHARGÉ » ou « CONTEXTE MÉMOIRE OBSIDIAN PRÉCHARGÉ » est fourni, la recherche a déjà été effectuée par OPS : lis réellement les champs data, content, facts et attributes des enregistrements retenus, puis analyse directement ces preuves sans demander d'outil.
 
 BUDGET DE RECHERCHE
 - Un résultat de recherche contient déjà les faits complets utiles : ne relis pas chaque source séparément.
@@ -127,17 +128,17 @@ RÈGLES DE QUALITÉ
 
 ACTIONS AGENTIQUES BORNÉES
 - actions contient au maximum trois actions et vaut [] lorsqu'aucune action structurée n'est utile.
-- Les seuls types autorisés sont create_opportunity, create_task, create_client, prepare_email et send_demo_email.
+- Les seuls types autorisés sont create_opportunity, create_task, create_client, prepare_email et send_email.
 - Chaque élément contient type, execution, reason et payload. payload est une chaîne JSON valide représentant uniquement les champs métier de l'action, sans type, execution ni reason et sans bloc de code.
 - Payload create_opportunity : name, amount, stage, probability, owner, source, next, company nullable, linked.
-- Payload create_task : title, owner, due, description, project nullable, linked.
+- Payload create_task : title, owner, due, description, project nullable, status nullable, dayIndex nullable, weekOffset nullable, linked.
 - Payload create_client : name, status, owner, revenue, margin, health, last, opportunity, email nullable, linked.
-- Payload prepare_email ou send_demo_email : subject, to, body, company nullable, threadId nullable, linked.
+- Payload prepare_email ou send_email : subject, to, body, company nullable, threadId nullable, linked.
 - Utilise execution="execute" uniquement si la demande actuelle de Marie ordonne explicitement cette action. Une idée, une analyse, une question ou une suggestion utilise execution="propose".
 - N'invente jamais un destinataire, un montant, un responsable ou une date manquante. Si un champ indispensable manque, n'émets pas l'action et pose une question courte dans answer.
 - linked contient uniquement les identifiants de preuves effectivement reliées à l'action, sinon [].
 - prepare_email crée seulement un brouillon dans la mémoire OPS.
-- send_demo_email simule uniquement l'envoi dans la démonstration et l'inscrit dans Obsidian. Il ne contacte aucun fournisseur d'email. Dis-le clairement dans answer et ne prétends jamais qu'un email réel est parti.
+- Tant que le connecteur d'envoi contrôlé n'a pas retourné de reçu, un email reste un brouillon ou une action en attente de validation. Ne prétends jamais qu'un message est parti sans reçu d'exécution.
 - Les actions proposées ou non explicitement ordonnées restent soumises à validation. Le serveur OPS applique lui-même ce garde-fou et la persistance.
 
 SORTIE STRUCTURÉE
@@ -261,16 +262,15 @@ async function verificationIndex() {
   return buildObsidianVaultIndex(root);
 }
 
-function sourceLookupValue(source: string) {
-  return source.trim().replace(/#.+$/, "");
-}
-
 async function verifiedSourceList(sources: string[]) {
-  const index = await verificationIndex();
-  if (!index) return [];
-  return [...new Set(sources)]
-    .filter((source) => !source.includes("\0"))
-    .filter((source) => Boolean(findObsidianMemoryRecord(index, sourceLookupValue(source))));
+  let indexPromise: ReturnType<typeof verificationIndex> | undefined;
+  return verifyAgentSourceList(sources, {
+    hasObsidianSource: async (source) => {
+      indexPromise ??= verificationIndex();
+      const index = await indexPromise;
+      return Boolean(index && findObsidianMemoryRecord(index, source));
+    },
+  });
 }
 
 async function verifiedSources(output: OpenCodeOutput) {
@@ -489,7 +489,7 @@ async function openCodeResponse(
       let streamedAnswer = "";
       try {
         const memoryContext = researchRequired
-          ? await buildOpsMemoryContext(message, history)
+          ? await buildUnifiedOpsMemoryContext(message, history)
           : null;
         const retrievalFinishedAt = performance.now();
         const promptMessage = [

@@ -3,14 +3,15 @@ set -Eeuo pipefail
 
 APP_DIR="${APP_DIR:-/srv/ops}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
-SEED_DEMO="${SEED_DEMO:-auto}"
+SEED_MEMORY="${SEED_MEMORY:-${SEED_DEMO:-auto}}"
 APP_UID="${APP_UID:-1001}"
 APP_GID="${APP_GID:-1001}"
 OPENCODE_GID="${OPENCODE_GID:-1002}"
 DEPLOY_STATE_DIR="${DEPLOY_STATE_DIR:-$(dirname "$APP_DIR")/ops-deploy-state}"
 BACKUP_ROOT="${BACKUP_ROOT:-$(dirname "$APP_DIR")/ops-backups}"
 RELEASE_ID="${RELEASE_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-EXPECTED_VAULT_ROOT_NAME="${EXPECTED_VAULT_ROOT_NAME:-OPS Demo — Atelier Beaumarchais}"
+EXPECTED_VAULT_ROOT_NAME="${EXPECTED_VAULT_ROOT_NAME:-OPS — Atelier Beaumarchais}"
+LEGACY_VAULT_ROOT_NAME="${LEGACY_VAULT_ROOT_NAME:-OPS Demo — Atelier Beaumarchais}"
 VAULT_MIGRATION_MODE="${VAULT_MIGRATION_MODE:-reject}"
 APP_IMAGE="${APP_IMAGE:-ops-web:latest}"
 OPENCODE_IMAGE="${OPENCODE_IMAGE:-ops-opencode:1.18.2}"
@@ -27,8 +28,8 @@ if [[ ! "$RELEASE_ID" =~ ^[A-Za-z0-9._-]{8,80}$ ]]; then
   exit 1
 fi
 
-if [[ ! "$SEED_DEMO" =~ ^(auto|always|never)$ ]]; then
-  echo "SEED_DEMO must be auto, always or never." >&2
+if [[ ! "$SEED_MEMORY" =~ ^(auto|always|never)$ ]]; then
+  echo "SEED_MEMORY must be auto, always or never." >&2
   exit 1
 fi
 
@@ -111,6 +112,19 @@ fi
 # deliberately allowed to be a plain uploaded directory.
 tar -C "$APP_DIR" -czf "$BACKUP_DIR/data.tar.gz" data
 chmod 600 "$BACKUP_DIR/data.tar.gz"
+
+# PostgreSQL lives in a named volume and is therefore not included in data.tar.gz.
+# If a database already exists, take a transactionally consistent logical dump
+# before applying any forward migration. First installation has no container yet.
+database_container="$(docker compose -f "$COMPOSE_FILE" ps -q database 2>/dev/null || true)"
+if [[ -n "$database_container" ]] \
+  && [[ "$(docker inspect --format '{{.State.Running}}' "$database_container" 2>/dev/null || true)" == "true" ]]; then
+  docker compose -f "$COMPOSE_FILE" exec -T database sh -eu -c \
+    'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner --no-privileges' \
+    > "$BACKUP_DIR/database.dump"
+  chmod 600 "$BACKUP_DIR/database.dump"
+fi
+
 cp -p .env.production "$BACKUP_DIR/.env.production"
 cp -p "$COMPOSE_FILE" "$BACKUP_DIR/$COMPOSE_FILE"
 chmod 600 "$BACKUP_DIR/.env.production" "$BACKUP_DIR/$COMPOSE_FILE"
@@ -171,7 +185,7 @@ validate_vault_layout() {
     ! -path "$expected/*" -print -quit)"
   if [[ -n "$unexpected_file" && "$VAULT_MIGRATION_MODE" != "allow-existing" ]]; then
     cat >&2 <<EOF
-Refusing to mix an existing vault with the expected demo vault.
+Refusing to mix an existing vault with the expected OPS memory vault.
 Unexpected Markdown file: $unexpected_file
 Expected vault root: $expected
 The untouched pre-deploy data is archived in: $BACKUP_DIR/data.tar.gz
@@ -184,17 +198,38 @@ EOF
   fi
 }
 
+migrate_legacy_vault_root() {
+  [[ -z "$EXPECTED_VAULT_ROOT_NAME" || -z "$LEGACY_VAULT_ROOT_NAME" ]] && return 0
+  local legacy="data/obsidian/$LEGACY_VAULT_ROOT_NAME"
+  local expected="data/obsidian/$EXPECTED_VAULT_ROOT_NAME"
+  if [[ -d "$legacy" && ! -e "$expected" ]]; then
+    mv "$legacy" "$expected"
+  fi
+}
+
+migrate_legacy_vault_root
 validate_vault_layout
 chmod 750 data
 normalize_writable_data_permissions
 
 docker compose -f "$COMPOSE_FILE" build --pull
 
-if [[ "$SEED_DEMO" == "always" ]] \
-  || { [[ "$SEED_DEMO" == "auto" ]] && ! find data/obsidian -type f -name '*.md' -print -quit | grep -q .; }; then
+if [[ "$SEED_MEMORY" == "always" ]] \
+  || { [[ "$SEED_MEMORY" == "auto" ]] && ! find data/obsidian -type f -name '*.md' -print -quit | grep -q .; }; then
   docker compose -f "$COMPOSE_FILE" --profile tools run --rm vault-seed
 fi
 
+normalize_writable_data_permissions
+
+# The central universe is deterministic and the loader is idempotent. Running it
+# at every release repairs an interrupted first install without duplicating data.
+docker compose -f "$COMPOSE_FILE" --profile tools run --rm central-memory-seed
+
+# Obsidian is a human-readable projection of PostgreSQL, not a second source of
+# truth. Project only after the authoritative seed has committed and before the
+# new app image is allowed to cut over. Each Markdown file is replaced
+# atomically; the pre-deploy data archive remains the rollback boundary.
+docker compose -f "$COMPOSE_FILE" --profile tools run --rm central-memory-project
 normalize_writable_data_permissions
 
 docker compose -f "$COMPOSE_FILE" up -d --remove-orphans

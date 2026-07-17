@@ -7,6 +7,8 @@ import {
 } from "@/lib/obsidian-vault-memory";
 import { resolveOpsDemoVaultRoot } from "@/lib/obsidian-write";
 import type { OpsCompanyState } from "@/lib/ops-company-state";
+import { buildCentralCompanyState } from "@/lib/central-memory/company-state";
+import { centralMemoryConfigured } from "@/lib/central-memory/search";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -160,6 +162,25 @@ function latestInstagramRecord(index: ObsidianVaultIndex) {
 }
 
 export async function GET() {
+  if (centralMemoryConfigured()) {
+    try {
+      const centralState = await buildCentralCompanyState({
+        businessDate: businessDate(),
+      });
+      if (centralState) {
+        return NextResponse.json(
+          centralState,
+          { headers: NO_STORE_HEADERS },
+        );
+      }
+    } catch (error) {
+      console.warn(
+        "[company-state] Central memory unavailable, falling back to the Obsidian projection.",
+        error,
+      );
+    }
+  }
+
   try {
     const date = businessDate();
     const root = await resolveOpsDemoVaultRoot();

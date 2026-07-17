@@ -183,7 +183,7 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
   const [hovered, setHovered] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<BrainNode["type"] | "all">("all");
-  const [liveSource, setLiveSource] = useState("Démo Obsidian");
+  const [liveSource, setLiveSource] = useState("Mémoire Obsidian");
   const [showEvidence, setShowEvidence] = useState(false);
   const [zoomLabel, setZoomLabel] = useState(100);
 
@@ -235,7 +235,13 @@ export function BrainGraph({ onAsk }: { onAsk: (prompt: string) => void }) {
             : null
         ));
       }
-      setLiveSource(payload.source === "obsidian" ? "Obsidian · en direct" : "Démo Obsidian");
+      setLiveSource(
+        payload.source === "central"
+          ? "Mémoire centrale · en direct"
+          : payload.source === "obsidian"
+            ? "Obsidian · synchronisé"
+            : "Mémoire de l’entreprise",
+      );
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
         // Le graphe déjà affiché reste disponible si la synchronisation échoue.

@@ -16,12 +16,20 @@ test("readiness checks authenticated OpenCode and non-mutating directory access"
   try {
     const result = await getOpsReadiness({
       env: {
+        DATABASE_URL: "postgresql://ops:secret@database.internal:5432/ops",
         OBSIDIAN_VAULT_PATH: vault,
         OPS_DOCUMENTS_PATH: documents,
         OPENCODE_BASE_URL: "http://opencode.internal:4096",
         OPENCODE_SERVER_USERNAME: "ops-health",
         OPENCODE_SERVER_PASSWORD: secret,
       },
+      databaseCheck: async () => ({
+        status: "ok",
+        connected: true,
+        migrated: true,
+        vector: true,
+        latencyMs: 1,
+      }),
       fetchImpl: async (input, init) => {
         assert.equal(String(input), "http://opencode.internal:4096/global/health");
         observedAuthorization = new Headers(init?.headers).get("authorization") ?? "";
@@ -36,6 +44,7 @@ test("readiness checks authenticated OpenCode and non-mutating directory access"
     assert.equal(result.checks.vault.writable, true);
     assert.equal(result.checks.documents.readable, true);
     assert.equal(result.checks.documents.writable, true);
+    assert.equal(result.checks.database.migrated, true);
     assert.equal(
       observedAuthorization,
       `Basic ${Buffer.from(`ops-health:${secret}`).toString("base64")}`,
@@ -60,10 +69,19 @@ test("readiness degrades without credentials or writable storage", async () => {
     fetchImpl: async () => {
       throw new Error("must not be called without credentials");
     },
+    databaseCheck: async () => ({
+      status: "error",
+      connected: false,
+      migrated: false,
+      vector: false,
+      latencyMs: 0,
+      detail: "not_configured",
+    }),
   });
 
   assert.equal(result.status, "degraded");
   assert.equal(result.checks.opencode.detail, "not_configured");
   assert.equal(result.checks.vault.detail, "inaccessible");
   assert.equal(result.checks.documents.detail, "inaccessible");
+  assert.equal(result.checks.database.detail, "not_configured");
 });

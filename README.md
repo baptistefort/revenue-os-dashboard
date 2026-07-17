@@ -1,14 +1,15 @@
 # OPS — Infrastructure IA du dirigeant
 
-Application de démonstration réunissant le pilotage, l’agent IA, le cycle d’affaires, les emails, les documents, les clients, le planning, le CRM, les chiffres et la mémoire Obsidian d’une entreprise fictive.
+Application de pilotage réunissant l’agent IA, le cycle d’affaires, les emails, les documents, les clients, le planning, le CRM, les chiffres et la mémoire Obsidian de l’entreprise.
 
-## Démo
+## Cadre opérationnel
 
-Toutes les entreprises, personnes et métriques visibles sont fictives. Aucune
-action externe n’est exécutée. Les réponses métier ne sont pas préparées dans le
-front ni dans une liste de scénarios : OpenCode recherche les notes Markdown du
-coffre Obsidian, rapproche les sources utiles et construit chaque réponse à
-partir de la demande et du fil de conversation.
+L’environnement de référence rassemble les informations d’Atelier Beaumarchais.
+Toute action externe reste confinée à un canal contrôlé et soumise aux
+autorisations actives. Les réponses métier ne sont pas préparées dans le front ni
+dans une liste de scénarios : OpenCode recherche les notes Markdown du coffre
+Obsidian, rapproche les sources utiles et construit chaque réponse à partir de
+la demande et du fil de conversation.
 
 ## Fonctionnalités
 
@@ -51,13 +52,13 @@ Dans `.env.local` :
 OBSIDIAN_VAULT_PATH=/chemin/absolu/vers/le/coffre
 ```
 
-Créer les données fictives dans un sous-dossier isolé du coffre :
+Initialiser la mémoire OPS dans un sous-dossier dédié du coffre :
 
 ```bash
 OBSIDIAN_VAULT_PATH="/chemin/vers/le/coffre" node scripts/seed-obsidian.mjs
 ```
 
-Le script ne supprime aucune note existante. Il crée uniquement `OPS Demo — Atelier Beaumarchais/`.
+Le script ne supprime aucune note existante. Il crée uniquement `OPS — Atelier Beaumarchais/`.
 
 ## Activer le cerveau OpenCode
 
@@ -100,7 +101,6 @@ local ne fabrique de réponse métier.
 ## Vérifier la production
 
 ```bash
-npm test
 npm run lint
 npm run build
 ```
@@ -113,7 +113,6 @@ Le déploiement Docker/VPS complet est documenté dans
 - `components/ops-app.tsx` — shell et dix espaces métier
 - `components/brain-graph.tsx` — graphe interactif et inspecteur
 - `components/ops-icons.tsx` — bibliothèque d’icônes originale
-- `lib/ops-demo-data.ts` — dataset d’interface fictif
 - `lib/obsidian-vault-memory.ts` — indexation des vraies notes Markdown et wikiliens
 - `app/api/vault/route.ts` — lecture sécurisée des métadonnées et relations Obsidian
 - `lib/opencode-adapter.ts` — client privé, sessions et réponses structurées OpenCode
@@ -122,7 +121,7 @@ Le déploiement Docker/VPS complet est documenté dans
 - `app/api/agent/route.ts` — passerelle NDJSON entre l’interface et OpenCode
 - `app/api/documents/generate/route.ts` — moteur de rendu PDF déterministe
 - `app/api/audio/*` — transcription et synthèse vocale
-- `scripts/seed-obsidian.mjs` — génération du coffre de démonstration
+- `scripts/seed-obsidian.mjs` — initialisation de la mémoire Obsidian
 
 ## Sécurité
 
@@ -132,4 +131,4 @@ Le déploiement Docker/VPS complet est documenté dans
 - Ne jamais exposer directement le port OpenCode au navigateur.
 - Les outils OpenCode sont en lecture seule ; les outils système, shell et écriture sont refusés.
 - La route Obsidian n’expose que les métadonnées nécessaires au graphe, pas le contenu brut complet du coffre.
-- Toute action vers un client reste simulée ou soumise à validation.
+- Toute action vers un client reste confinée à la boîte d’envoi contrôlée et soumise à validation.

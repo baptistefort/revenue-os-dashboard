@@ -8,8 +8,13 @@
     "build": "next build",
     "start": "next start",
     "lint": "tsc --noEmit",
-    "test": "tsx --test lib/*.test.ts",
-    "memory:lint": "node scripts/lint-obsidian.mjs"
+    "test": "tsx --test lib/*.test.ts lib/**/*.test.ts",
+    "memory:lint": "node scripts/lint-obsidian.mjs",
+    "memory:seed-central": "tsx scripts/seed-central-memory.ts",
+    "memory:project-central": "tsx scripts/project-central-memory.ts",
+    "db:migrate": "MIGRATIONS_DIR=database/migrations sh scripts/migrate-database.sh",
+    "db:seed": "SEEDS_DIR=database/seeds sh scripts/seed-database.sh",
+    "db:verify": "sh scripts/verify-database.sh"
   },
   "dependencies": {
     "@openai/agents": "^0.13.4",
@@ -20,6 +25,7 @@
     "next": "16.2.6",
     "openai": "^6.47.0",
     "pdf-lib": "^1.17.1",
+    "pg": "^8.22.0",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "unpdf": "^1.6.2",
@@ -28,6 +34,7 @@
   "devDependencies": {
     "@types/d3-force": "^3.0.10",
     "@types/node": "^22.10.2",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19.0.3",
     "@types/react-dom": "^19.0.2",
     "opencode-ai": "1.18.2",

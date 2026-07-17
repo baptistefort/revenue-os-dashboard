@@ -90,7 +90,7 @@ export const navGroups: Array<{
 export const pageMeta: Record<PageId, { title: string; eyebrow: string; description: string }> = {
   today: {
     title: "Bonjour Marie.",
-    eyebrow: "Mardi 15 juillet · 08:03",
+    eyebrow: "Vendredi 17 juillet · 08:03",
     description: "Voici ce qui mérite votre attention aujourd’hui.",
   },
   agent: {
@@ -307,7 +307,7 @@ export const agentScenarios: AgentScenario[] = [
     body: [
       "Le contrôle qualité Rivoli peut être repris par Hugo avec la procédure PROC-003.",
       "Le choix de finition Nova est documenté dans EXP-THOMAS-01 et ne présente pas de blocage immédiat.",
-      "La calibration CNC reste le point de risque : la procédure est incomplète. Je recommande une session de transfert de 45 minutes et l’enregistrement d’une démonstration.",
+      "La calibration CNC reste le point de risque : la procédure est incomplète. Je recommande une session de transfert de 45 minutes et l’enregistrement d’un pas-à-pas vidéo.",
     ],
     sources: ["PER-003", "EXP-THOMAS-01", "PROC-003", "PROC-007", "TASK-642"],
     followups: ["Planifie le transfert", "Ouvre la procédure CNC", "Montre les autres dépendances humaines"],
@@ -460,7 +460,7 @@ export type BrainEdge = {
 };
 
 export const brainNodes: BrainNode[] = [
-  { id: "ORG-001", label: "Atelier Beaumarchais", type: "company", x: 500, y: 330, size: 34, summary: "La mémoire centrale de l’entreprise : 286 éléments reliés dans la démo." },
+  { id: "ORG-001", label: "Atelier Beaumarchais", type: "company", x: 500, y: 330, size: 34, summary: "La mémoire centrale de l’entreprise : 286 éléments reliés." },
   { id: "PER-001", label: "Marie Delmas", type: "person", x: 390, y: 210, size: 20, summary: "Direction · arbitre les décisions sensibles et la stratégie." },
   { id: "PER-002", label: "Camille Laurent", type: "person", x: 565, y: 175, size: 19, summary: "Responsable commerciale · 4 affaires signées ce mois." },
   { id: "PER-003", label: "Thomas Renaud", type: "person", x: 660, y: 290, size: 21, summary: "Chef d’atelier · détenteur de plusieurs savoirs critiques." },
@@ -524,8 +524,8 @@ export const brainEdges: BrainEdge[] = [
 ];
 
 export const companyContext = `
-Entreprise fictive de démonstration : Atelier Beaumarchais, menuiserie et agencement sur mesure, Paris 11, 18 personnes. Dirigeante : Marie Delmas.
-Chiffres au 15 juillet 2026 : pipeline 184 000 €, CA du mois 42 800 €, marge 29 % (−2,1 points), visibilité de trésorerie 67 jours, créances en retard 24 300 €.
+Contexte d’entreprise : Atelier Beaumarchais, menuiserie et agencement sur mesure, Paris 11, 18 personnes. Dirigeante : Marie Delmas.
+Chiffres au 17 juillet 2026 : pipeline 184 000 €, CA du mois 42 800 €, marge 29 % (−2,1 points), visibilité de trésorerie 67 jours, créances en retard 24 300 €.
 Pipeline : Hôtel Orsay 58 000 € (Google Ads), Maison Lenoir 34 000 € (architecte), Studio Cime 20 000 € (Instagram), extension Nova Hôtels 72 000 €.
 Rivoli : projet 120 000 €, avancement 62 %, marge prévue 31 %, projetée 28,9 %. 14 heures non facturées coûtent 630 €. Achat de placage : budget 8 202 €, réel 9 640 €, écart 1 438 €. Ces deux causes expliquent 82 % de l’écart.
 Factures en retard : Atelier Sud 12 400 € / 28 jours ; Nova 7 800 € / 12 jours ; Maison Cobalt 4 100 € / 8 jours mais son dernier email demande d’attendre lundi.

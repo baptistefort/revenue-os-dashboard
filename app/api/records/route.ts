@@ -10,8 +10,26 @@ import {
   resolveOpsDemoVaultRoot,
   updateObsidianRecord,
   writeObsidianRecord,
+  type ObsidianWriteInput,
   type ObsidianWriteResult,
 } from "@/lib/obsidian-write";
+import {
+  ControlledActionError,
+  executeControlledOpsAction,
+  markControlledRecordMutationProjection,
+  mirrorControlledRecordMutation,
+} from "@/lib/ops-action-executor";
+import {
+  projectOpsAgentActionToObsidian,
+  type OpsAgentAction,
+} from "@/lib/ops-agent-actions";
+import {
+  mergeCentralAndProjectedRecords,
+  readCentralUiRecordById,
+  readCentralUiRecords,
+  type CentralUiRecord,
+  type CentralUiRecordKind,
+} from "@/lib/central-memory/records";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -163,9 +181,35 @@ function inferRecordKind(record: ObsidianMemoryRecord) {
   if (readableKinds.has(explicit)) return explicit;
   if (/^EMAIL-/i.test(record.id)) return "email";
   if (/^OPP-/i.test(record.id)) return "opportunity";
-  if (/^TASK-/i.test(record.id)) return "task";
-  if (/^(?:CLI|CLIENT)-/i.test(record.id)) return "client";
+  if (/^(?:TASK|TSK)-/i.test(record.id)) return "task";
+  if (/^(?:CLI|CLIENT|CLT)-/i.test(record.id)) return "client";
   return "";
+}
+
+function centralRecordAsObsidian(record: CentralUiRecord): ObsidianMemoryRecord {
+  return {
+    id: record.id,
+    type: record.type,
+    title: record.title,
+    summary: record.summary,
+    facts: [],
+    relations: record.relations,
+    aliases: [],
+    updatedAt: record.createdAt,
+    source: "OPS central memory",
+    path: record.path,
+    attributes: record.attributes,
+    content: record.content,
+  };
+}
+
+async function persistRecordProjection(
+  hasExistingProjection: boolean,
+  input: ObsidianWriteInput & { id: string },
+) {
+  return hasExistingProjection
+    ? updateObsidianRecord(input)
+    : writeObsidianRecord(input);
 }
 
 function currentEmailBody(record: ObsidianMemoryRecord) {
@@ -182,22 +226,45 @@ export async function GET(request: Request) {
     );
   }
 
+  let centralRecords: CentralUiRecord[] | null = null;
+  if (process.env.DATABASE_URL?.trim()) {
+    try {
+      centralRecords = await readCentralUiRecords({
+        kind: kind ? kind as CentralUiRecordKind : undefined,
+      });
+    } catch (error) {
+      // A connector or a migration may briefly be unavailable. Obsidian is a
+      // read-compatible projection, so the executive UI can remain usable.
+      console.error("[records] Unable to read the central memory.", error);
+    }
+  }
+
+  let projectedRecords: CentralUiRecord[] | null = null;
   try {
     const root = await resolveOpsDemoVaultRoot();
     const index = await buildObsidianVaultIndex(root);
-    const records = index.records
+    projectedRecords = index.records
       .filter((record) => !kind || inferRecordKind(record) === kind)
       .filter((record) => !isArchivedRecord(record))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-      .map(recordPayload);
-    return NextResponse.json({ records }, { headers: noStoreHeaders });
+      .map((record) => recordPayload(record) as CentralUiRecord);
   } catch (error) {
-    console.error("[records] Unable to read the Obsidian vault.", error);
-    return NextResponse.json(
-      { error: "vault_read_failed" },
-      { status: 503, headers: noStoreHeaders },
-    );
+    console.error("[records] Unable to read the Obsidian projection.", error);
   }
+
+  if (centralRecords !== null) {
+    const records = projectedRecords
+      ? mergeCentralAndProjectedRecords(centralRecords, projectedRecords)
+      : centralRecords;
+    return NextResponse.json({ records }, { headers: noStoreHeaders });
+  }
+  if (projectedRecords !== null) {
+    return NextResponse.json({ records: projectedRecords }, { headers: noStoreHeaders });
+  }
+  return NextResponse.json(
+    { error: "records_read_failed" },
+    { status: 503, headers: noStoreHeaders },
+  );
 }
 
 export async function PATCH(request: Request) {
@@ -221,10 +288,34 @@ export async function PATCH(request: Request) {
   }
 
   try {
-    const root = await resolveOpsDemoVaultRoot();
-    const index = await buildObsidianVaultIndex(root);
-    const record = findObsidianMemoryRecord(index, parsed.id);
-    if (!record || record.id.toLocaleUpperCase("fr") !== parsed.id.toLocaleUpperCase("fr")) {
+    let projectedRecord: ObsidianMemoryRecord | null = null;
+    try {
+      const root = await resolveOpsDemoVaultRoot();
+      const index = await buildObsidianVaultIndex(root);
+      const candidate = findObsidianMemoryRecord(index, parsed.id);
+      if (candidate?.id.toLocaleUpperCase("fr") === parsed.id.toLocaleUpperCase("fr")) {
+        projectedRecord = candidate;
+      }
+    } catch (error) {
+      console.error("[records] Unable to resolve the existing Obsidian projection.", error);
+    }
+
+    let centralRecord: CentralUiRecord | null = null;
+    if (process.env.DATABASE_URL?.trim()) {
+      try {
+        centralRecord = await readCentralUiRecordById({
+          id: parsed.id,
+          kind: parsed.kind,
+        });
+      } catch (error) {
+        console.error("[records] Unable to resolve the central record for mutation.", error);
+      }
+    }
+
+    const record = centralRecord
+      ? centralRecordAsObsidian(centralRecord)
+      : projectedRecord;
+    if (!record) {
       return NextResponse.json(
         { error: "record_not_found" },
         { status: 404, headers: noStoreHeaders },
@@ -240,35 +331,41 @@ export async function PATCH(request: Request) {
     // Archiving is monotonic through this API. A later partial PATCH must not
     // accidentally resurrect a record because it omitted (or reset) the flag.
     const archived = isArchivedRecord(record) || parsed.archived === true;
-    let result: ObsidianWriteResult;
+    const hasExistingProjection = Boolean(projectedRecord);
+    let projectionInput: ObsidianWriteInput & { id: string };
+    let centralPatch = parsed as unknown as Record<string, unknown>;
 
     if (parsed.kind === "email") {
-      const status = parsed.status ?? stringAttribute(record, "status", "draft") as "draft" | "to_process" | "sent_demo";
+      const existingReceipt = stringAttribute(record, "delivery_receipt");
+      const requestedLegacySend = parsed.status === "sent_demo";
+      const status = requestedLegacySend
+        ? "sent"
+        : parsed.status ?? stringAttribute(record, "status", "draft");
       const validated = parsed.validated ?? booleanAttribute(record, "validated");
-      if (status === "sent_demo" && !validated) {
+      if (status === "sent" && (!validated || !existingReceipt)) {
         return NextResponse.json(
-          { error: "validation_required" },
+          { error: existingReceipt ? "validation_required" : "controlled_receipt_required" },
           { status: 409, headers: noStoreHeaders },
         );
       }
       const to = parsed.to ?? stringAttribute(record, "recipient", "destinataire@exemple.fr");
       const from = parsed.from ?? stringAttribute(record, "sender", "Marie Delmas <marie@atelier-beaumarchais.fr>");
       const body = parsed.body ?? currentEmailBody(record);
-      result = await updateObsidianRecord({
+      projectionInput = {
         id: record.id,
         idPrefix: "EMAIL",
         folder: "04_Conversations/Emails",
         type: "document",
         title: parsed.subject ?? record.title,
-        summary: status === "sent_demo"
-          ? `Email de démonstration envoyé à ${to}.`
+        summary: status === "sent"
+          ? `Email remis à la boîte d'envoi contrôlée pour ${to}.`
           : `Email à traiter avec ${to}.`,
         body: `## Message\n\nDe : ${from}\n\nÀ : ${to}\n\n${body}`,
         relations: parsed.linked ?? record.relations,
         attributes: {
           record_kind: "email",
           direction: stringAttribute(record, "direction", "outbound"),
-          mailbox: parsed.mailbox ?? stringAttribute(record, "mailbox", status === "sent_demo" ? "sent" : "inbox"),
+          mailbox: parsed.mailbox ?? stringAttribute(record, "mailbox", status === "sent" ? "sent" : "inbox"),
           classification: parsed.classification ?? stringAttribute(record, "classification", "neutral"),
           status,
           recipient: to,
@@ -277,9 +374,31 @@ export async function PATCH(request: Request) {
           thread_id: parsed.threadId ?? stringAttribute(record, "thread_id"),
           sent_at: stringAttribute(record, "sent_at"),
           validated,
+          delivery_mode: status === "sent" ? "controlled_internal_outbox" : "draft_only",
+          delivery_receipt: existingReceipt,
+          network_delivery: false,
           archived,
         },
-      });
+      };
+      centralPatch = {
+        subject: parsed.subject ?? record.title,
+        to,
+        recipients: [to],
+        from,
+        sender: from,
+        company: parsed.company ?? stringAttribute(record, "company"),
+        body,
+        text: body,
+        threadId: parsed.threadId ?? stringAttribute(record, "thread_id"),
+        linked: parsed.linked ?? record.relations,
+        mailbox: parsed.mailbox ?? stringAttribute(record, "mailbox", status === "sent" ? "sent" : "inbox"),
+        classification: parsed.classification ?? stringAttribute(record, "classification", "neutral"),
+        direction: stringAttribute(record, "direction", "outbound"),
+        status,
+        validated,
+        archived,
+        network_delivery: false,
+      };
     } else if (parsed.kind === "opportunity") {
       const amount = parsed.amount ?? numberAttribute(record, "amount");
       const stage = parsed.stage ?? stringAttribute(record, "stage", "Qualification");
@@ -288,7 +407,7 @@ export async function PATCH(request: Request) {
       const source = parsed.source ?? stringAttribute(record, "source_channel", "OPS");
       const next = parsed.next ?? stringAttribute(record, "next_action", "À définir");
       const title = parsed.name ?? record.title;
-      result = await updateObsidianRecord({
+      projectionInput = {
         id: record.id,
         idPrefix: "OPP",
         folder: "03_CRM/Opportunites",
@@ -309,7 +428,20 @@ export async function PATCH(request: Request) {
           status: archived ? "archived" : stringAttribute(record, "status", "open"),
           archived,
         },
-      });
+      };
+      centralPatch = {
+        name: title,
+        amount,
+        stage,
+        probability,
+        owner,
+        source,
+        next,
+        company: parsed.company ?? stringAttribute(record, "company"),
+        linked: parsed.linked ?? record.relations,
+        status: archived ? "archived" : stringAttribute(record, "status", "open"),
+        archived,
+      };
     } else if (parsed.kind === "task") {
       const title = parsed.title ?? record.title;
       const owner = parsed.owner ?? stringAttribute(record, "owner", "Marie");
@@ -319,7 +451,7 @@ export async function PATCH(request: Request) {
       const project = parsed.project ?? stringAttribute(record, "project");
       const dayIndex = parsed.dayIndex ?? numberAttribute(record, "day_index");
       const weekOffset = parsed.weekOffset ?? numberAttribute(record, "week_offset");
-      result = await updateObsidianRecord({
+      projectionInput = {
         id: record.id,
         idPrefix: "TASK",
         folder: "06_Operations/Taches",
@@ -338,7 +470,19 @@ export async function PATCH(request: Request) {
           week_offset: weekOffset,
           archived,
         },
-      });
+      };
+      centralPatch = {
+        title,
+        owner,
+        due,
+        status,
+        description,
+        project,
+        dayIndex,
+        weekOffset,
+        linked: parsed.linked ?? record.relations,
+        archived,
+      };
     } else {
       const title = parsed.name ?? record.title;
       const status = parsed.status ?? stringAttribute(record, "status", "Prospect");
@@ -349,7 +493,7 @@ export async function PATCH(request: Request) {
       const last = parsed.last ?? stringAttribute(record, "last_interaction", "Aujourd’hui");
       const opportunity = parsed.opportunity ?? stringAttribute(record, "next_opportunity", "À qualifier");
       const email = parsed.email ?? stringAttribute(record, "email");
-      result = await updateObsidianRecord({
+      projectionInput = {
         id: record.id,
         idPrefix: "CLI",
         folder: "03_CRM/Clients",
@@ -370,14 +514,81 @@ export async function PATCH(request: Request) {
           email,
           archived,
         },
-      });
+      };
+      centralPatch = {
+        name: title,
+        status,
+        owner,
+        revenue,
+        margin,
+        health,
+        last,
+        opportunity,
+        email,
+        linked: parsed.linked ?? record.relations,
+        archived,
+      };
+    }
+
+    const centralMutation = await mirrorControlledRecordMutation({
+      id: record.id,
+      kind: parsed.kind,
+      title: projectionInput.title,
+      patch: centralPatch,
+    }, {
+      idempotencyKey: request.headers.get("idempotency-key")?.trim() || undefined,
+      requestedBy: "marie-delmas",
+    });
+    let result: ObsidianWriteResult;
+    try {
+      result = await persistRecordProjection(hasExistingProjection, projectionInput);
+    } catch (projectionError) {
+      if (centralMutation.centralMemory) {
+        try {
+          await markControlledRecordMutationProjection({
+            recordId: record.id,
+            projection: null,
+            error: projectionError,
+          });
+        } catch (markError) {
+          console.error("[records] Unable to mark the failed Obsidian projection.", markError);
+        }
+        return NextResponse.json({
+          record: {
+            id: record.id,
+            title: projectionInput.title,
+            path: record.path,
+            createdAt: new Date().toISOString(),
+          },
+          centralMemory: true,
+          projection: "pending_retry",
+        }, { status: 202, headers: noStoreHeaders });
+      }
+      throw projectionError;
+    }
+    if (centralMutation.centralMemory) {
+      await markControlledRecordMutationProjection({ recordId: record.id, projection: result });
     }
 
     return NextResponse.json(
-      { record: createdRecordPayload(result) },
+      {
+        record: createdRecordPayload(result),
+        centralMemory: centralMutation.centralMemory,
+        projection: "projected",
+      },
       { headers: noStoreHeaders },
     );
   } catch (error) {
+    if (error instanceof ControlledActionError) {
+      const status = error.code === "validation_required"
+        || error.code === "unsafe_email_recipient"
+        ? 409
+        : 503;
+      return NextResponse.json(
+        { error: error.code },
+        { status, headers: noStoreHeaders },
+      );
+    }
     console.error("[records] Unable to update the Obsidian record.", error);
     return NextResponse.json(
       { error: "record_update_failed" },
@@ -407,151 +618,107 @@ export async function POST(request: Request) {
   }
 
   try {
+    if (parsed.kind === "email" && parsed.status === "sent_demo" && !parsed.validated) {
+      return NextResponse.json(
+        { error: "validation_required" },
+        { status: 409, headers: noStoreHeaders },
+      );
+    }
+
+    let action: OpsAgentAction;
     if (parsed.kind === "email") {
-      if (parsed.status === "sent_demo" && !parsed.validated) {
-        return NextResponse.json(
-          { error: "validation_required" },
-          { status: 409, headers: noStoreHeaders },
-        );
-      }
-      const result = await writeObsidianRecord({
-        idPrefix: parsed.status === "sent_demo" ? "EMAIL-SENT" : "EMAIL-DRAFT",
-        folder: parsed.status === "sent_demo"
-          ? "04_Conversations/Emails/Envoyes"
-          : "04_Conversations/Emails/Brouillons",
-        type: "document",
-        title: parsed.subject,
-        summary: parsed.status === "sent_demo"
-          ? `Email de démonstration envoyé à ${parsed.to}.`
-          : `Brouillon d'email préparé pour ${parsed.to}.`,
-        body: `## Message
-
-De : ${parsed.from}
-
-À : ${parsed.to}
-
-${parsed.body}`,
-        relations: [parsed.threadId ?? "", ...parsed.linked].filter(Boolean),
-        attributes: {
-          record_kind: "email",
-          direction: "outbound",
-          mailbox: parsed.status === "sent_demo" ? "sent" : parsed.mailbox,
-          classification: parsed.classification,
-          status: parsed.status,
-          recipient: parsed.to,
-          sender: parsed.from,
-          company: parsed.company ?? "",
-          thread_id: parsed.threadId ?? "",
-          sent_at: parsed.status === "sent_demo" ? new Date().toISOString() : "",
-          validated: parsed.validated,
-        },
-      });
-      return NextResponse.json(
-        { record: createdRecordPayload(result) },
-        { status: 201, headers: noStoreHeaders },
-      );
-    }
-
-    if (parsed.kind === "opportunity") {
-      const result = await writeObsidianRecord({
-        idPrefix: "OPP",
-        folder: "03_CRM/Opportunites",
-        type: "project",
-        title: parsed.name,
-        summary: `Opportunité de ${parsed.amount.toLocaleString("fr-FR")} € au stade ${parsed.stage}, origine ${parsed.source}.`,
-        body: `## Données commerciales
-
-- Montant : ${parsed.amount.toLocaleString("fr-FR")} €.
-- Étape : ${parsed.stage}.
-- Probabilité : ${parsed.probability} %.
-- Responsable : ${parsed.owner}.
-- Source : ${parsed.source}.
-- Prochaine action : ${parsed.next}.`,
-        relations: parsed.linked,
-        attributes: {
-          record_kind: "opportunity",
-          amount: parsed.amount,
-          stage: parsed.stage,
-          probability: parsed.probability,
-          owner: parsed.owner,
-          source_channel: parsed.source,
-          next_action: parsed.next,
-          company: parsed.company ?? "",
-          status: "open",
-        },
-      });
-      return NextResponse.json(
-        { record: createdRecordPayload(result) },
-        { status: 201, headers: noStoreHeaders },
-      );
-    }
-
-    if (parsed.kind === "task") {
-      const result = await writeObsidianRecord({
-        idPrefix: "TASK",
-        folder: "06_Operations/Taches",
-        type: "project",
+      action = {
+        type: parsed.status === "sent_demo" ? "send_demo_email" : "prepare_email",
+        execution: "execute",
+        reason: parsed.status === "sent_demo"
+          ? "Envoi explicitement validé depuis la boîte email OPS."
+          : "Création d'un brouillon depuis la boîte email OPS.",
+        subject: parsed.subject,
+        to: parsed.to,
+        body: parsed.body,
+        company: parsed.company ?? null,
+        threadId: parsed.threadId ?? null,
+        linked: parsed.linked,
+      };
+    } else if (parsed.kind === "opportunity") {
+      action = {
+        type: "create_opportunity",
+        execution: "execute",
+        reason: "Création explicitement demandée depuis le pipeline OPS.",
+        name: parsed.name,
+        amount: parsed.amount,
+        stage: parsed.stage,
+        probability: parsed.probability,
+        owner: parsed.owner,
+        source: parsed.source,
+        next: parsed.next,
+        company: parsed.company ?? null,
+        linked: parsed.linked,
+      };
+    } else if (parsed.kind === "task") {
+      action = {
+        type: "create_task",
+        execution: "execute",
+        reason: "Création explicitement demandée depuis le planning OPS.",
         title: parsed.title,
-        summary: parsed.description,
-        body: `## Exécution
-
-- Responsable : ${parsed.owner}.
-- Échéance : ${parsed.due}.
-- Statut : ${parsed.status}.
-${parsed.project ? `- Projet : ${parsed.project}.` : ""}
-- Semaine relative : ${parsed.weekOffset}.
-${typeof parsed.dayIndex === "number" ? `- Jour ouvré : ${parsed.dayIndex + 1}.` : ""}`,
-        relations: parsed.linked,
-        attributes: {
-          record_kind: "task",
-          owner: parsed.owner,
-          due: parsed.due,
-          status: parsed.status,
-          project: parsed.project ?? "",
-          day_index: parsed.dayIndex ?? null,
-          week_offset: parsed.weekOffset,
-        },
-      });
-      return NextResponse.json(
-        { record: createdRecordPayload(result) },
-        { status: 201, headers: noStoreHeaders },
-      );
-    }
-
-    const result = await writeObsidianRecord({
-      idPrefix: "CLI",
-      folder: "03_CRM/Clients",
-      type: "client",
-      title: parsed.name,
-      summary: `${parsed.name} est un compte ${parsed.status.toLocaleLowerCase("fr")} suivi par ${parsed.owner}.`,
-      body: `## Situation du compte
-
-- Statut : ${parsed.status}.
-- Responsable : ${parsed.owner}.
-- Chiffre d'affaires sur 12 mois : ${parsed.revenue.toLocaleString("fr-FR")} €.
-- Marge moyenne : ${parsed.margin.toLocaleString("fr-FR")} %.
-- Santé du compte : ${parsed.health} / 100.
-- Dernier échange : ${parsed.last}.
-- Prochaine opportunité ou action : ${parsed.opportunity}.
-${parsed.email ? `- Email principal : ${parsed.email}.` : ""}`,
-      relations: parsed.linked,
-      attributes: {
-        record_kind: "client",
+        owner: parsed.owner,
+        due: parsed.due,
+        description: parsed.description,
+        project: parsed.project ?? null,
+        status: parsed.status,
+        dayIndex: parsed.dayIndex,
+        weekOffset: parsed.weekOffset,
+        linked: parsed.linked,
+      };
+    } else {
+      action = {
+        type: "create_client",
+        execution: "execute",
+        reason: "Création explicitement demandée depuis le CRM OPS.",
+        name: parsed.name,
         status: parsed.status,
         owner: parsed.owner,
-        revenue_12m: parsed.revenue,
-        margin_percent: parsed.margin,
-        health_score: parsed.health,
-        last_interaction: parsed.last,
-        next_opportunity: parsed.opportunity,
-        email: parsed.email ?? "",
-      },
+        revenue: parsed.revenue,
+        margin: parsed.margin,
+        health: parsed.health,
+        last: parsed.last,
+        opportunity: parsed.opportunity,
+        email: parsed.email ?? null,
+        linked: parsed.linked,
+      };
+    }
+
+    const result = await executeControlledOpsAction(action, {
+      idempotencyKey: request.headers.get("idempotency-key")?.trim() || undefined,
+      requestedBy: "marie-delmas",
+      approvedBy: "Marie Delmas",
+      projectToObsidian: (candidate, context) => (
+        projectOpsAgentActionToObsidian(candidate as OpsAgentAction, context)
+      ),
     });
     return NextResponse.json(
-      { record: createdRecordPayload(result) },
+      {
+        record: createdRecordPayload(result.projection),
+        action: {
+          id: result.actionRunId,
+          status: result.status,
+          idempotencyKey: result.idempotencyKey,
+          receipt: result.receipt ?? null,
+        },
+      },
       { status: 201, headers: noStoreHeaders },
     );
-  } catch {
+  } catch (error) {
+    if (error instanceof ControlledActionError) {
+      const status = error.code === "unsafe_email_recipient"
+        || error.code === "validation_required"
+        ? 409
+        : 503;
+      return NextResponse.json(
+        { error: error.code },
+        { status, headers: noStoreHeaders },
+      );
+    }
     return NextResponse.json(
       { error: "record_write_failed" },
       { status: 503, headers: noStoreHeaders },

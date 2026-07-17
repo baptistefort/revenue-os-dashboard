@@ -11,6 +11,12 @@ import {
   type ObsidianMemoryRecord,
   type ObsidianVaultIndex,
 } from "../../lib/obsidian-vault-memory.ts";
+import {
+  centralMemoryConfigured,
+  getCentralMemoryRecord,
+  getRelatedCentralMemory,
+  searchCentralMemory,
+} from "../../lib/central-memory/search.ts";
 
 const MAX_MEMORY_RESULTS = 12;
 const MAX_VAULT_RESULTS = 12;
@@ -116,7 +122,7 @@ function indexMeta(index: ObsidianVaultIndex) {
 
 export const memory_search = tool({
   description:
-    "Recherche read-only dans la vraie mémoire Obsidian de l'entreprise. Les résultats proviennent exclusivement des notes Markdown indexées et contiennent leurs identifiants, chemins, faits et relations.",
+    "Recherche read-only dans la mémoire centrale versionnée de l'entreprise. PostgreSQL contient les événements et objets bruts ; Obsidian reste le repli visuel lorsque la mémoire centrale n'est pas configurée.",
   args: {
     query: tool.schema.string().min(2).max(500).describe(
       "Question, sujet, client, projet, période ou identifiant à rechercher dans la mémoire Obsidian.",
@@ -126,9 +132,26 @@ export const memory_search = tool({
     ),
   },
   async execute({ query, limit }) {
+    const cappedLimit = clampInteger(limit, 8, MAX_MEMORY_RESULTS);
+    if (centralMemoryConfigured()) {
+      try {
+        const records = await searchCentralMemory({ query, limit: cappedLimit });
+        if (records.length) {
+          return json({
+            ok: true,
+            memory: "central",
+            authority: "postgresql",
+            query,
+            count: records.length,
+            records,
+          });
+        }
+      } catch (error) {
+        console.error("Central memory tool search failed; using Obsidian.", error);
+      }
+    }
     const index = await loadIndex();
     if (!index) return json({ ok: false, error: "vault_not_configured" });
-    const cappedLimit = clampInteger(limit, 8, MAX_MEMORY_RESULTS);
     const matches = searchObsidianMemory(index, query, cappedLimit);
     return json({
       ok: true,
@@ -146,13 +169,28 @@ export const memory_search = tool({
 
 export const memory_get = tool({
   description:
-    "Lit une note précise de la mémoire Obsidian à partir de son identifiant, de son alias ou de son chemin. N'invente jamais un enregistrement absent.",
+    "Lit un enregistrement précis de la mémoire centrale à partir de son identifiant métier ou source. Se replie sur la projection Obsidian si nécessaire. N'invente jamais un enregistrement absent.",
   args: {
     id: tool.schema.string().min(2).max(1_000).describe(
       "Identifiant exact ou chemin de note, par exemple VAL-061, PROJET-241 ou 07_Finance/Factures/....md.",
     ),
   },
   async execute({ id }) {
+    if (centralMemoryConfigured()) {
+      try {
+        const record = await getCentralMemoryRecord({ id: id.trim() });
+        if (record) {
+          return json({
+            ok: true,
+            memory: "central",
+            authority: "postgresql",
+            record,
+          });
+        }
+      } catch (error) {
+        console.error("Central memory tool get failed; using Obsidian.", error);
+      }
+    }
     const index = await loadIndex();
     if (!index) return json({ ok: false, error: "vault_not_configured" });
     const record = findObsidianMemoryRecord(index, id.trim());
@@ -175,7 +213,7 @@ export const memory_get = tool({
 
 export const memory_related = tool({
   description:
-    "Suit les wikilinks et backlinks réels d'une note Obsidian. Retourne les relations sortantes et entrantes avec leur contenu sourcé.",
+    "Suit les identifiants et relations d'un objet dans la mémoire centrale. Retourne les preuves connexes ; se replie sur les wikilinks Obsidian si nécessaire.",
   args: {
     id: tool.schema.string().min(2).max(1_000).describe(
       "Identifiant, alias ou chemin de la note source.",
@@ -185,6 +223,27 @@ export const memory_related = tool({
     ),
   },
   async execute({ id, limit }) {
+    const cappedLimit = clampInteger(limit, MAX_MEMORY_RESULTS, MAX_MEMORY_RESULTS);
+    if (centralMemoryConfigured()) {
+      try {
+        const related = await getRelatedCentralMemory({
+          id: id.trim(),
+          limit: cappedLimit,
+        });
+        if (related.source) {
+          return json({
+            ok: true,
+            memory: "central",
+            authority: "postgresql",
+            source: related.source,
+            count: related.records.length,
+            records: related.records,
+          });
+        }
+      } catch (error) {
+        console.error("Central memory related lookup failed; using Obsidian.", error);
+      }
+    }
     const index = await loadIndex();
     if (!index) return json({ ok: false, error: "vault_not_configured" });
     const source = findObsidianMemoryRecord(index, id.trim());
@@ -196,7 +255,6 @@ export const memory_related = tool({
         ...indexMeta(index),
       });
     }
-    const cappedLimit = clampInteger(limit, MAX_MEMORY_RESULTS, MAX_MEMORY_RESULTS);
     const related = getRelatedObsidianMemory(index, source, cappedLimit);
     return json({
       ok: true,

@@ -4,10 +4,10 @@ import path from "node:path";
 const vault = process.env.OBSIDIAN_VAULT_PATH;
 if (!vault) throw new Error("OBSIDIAN_VAULT_PATH is required");
 
-const demoRootName = "OPS Demo — Atelier Beaumarchais";
-const root = path.basename(path.resolve(vault)) === demoRootName
+const memoryRootName = "OPS — Atelier Beaumarchais";
+const root = path.basename(path.resolve(vault)) === memoryRootName
   ? path.resolve(vault)
-  : path.join(vault, demoRootName);
+  : path.join(vault, memoryRootName);
 const org = "ORG-001 — Atelier Beaumarchais";
 
 const records = [];
@@ -57,14 +57,14 @@ async function preservedOperationalContent(filePath, id) {
 }
 
 add("00_System", "ORG-001", "company", "Atelier Beaumarchais", "Menuiserie et agencement sur mesure à Paris 11. Dix-huit personnes, une mémoire OPS et un système de validation humaine.", [], { status: "active", employees: 18, city: "Paris 11" });
-add("00_System", "MANIFEST", "knowledge", "Manifest de la démo OPS", "Ce coffre contient uniquement des données fictives destinées à la démonstration visuelle d’OPS.", [org], { demo: true, resettable: true });
+add("00_System", "MANIFEST", "knowledge", "Manifest de la mémoire OPS", "Ce coffre expose les connaissances durables de l’entreprise et leur provenance.", [org], { managed: true, resettable: false });
 add(
   "00_System",
   "SCHEMA",
   "knowledge",
   "Contrat de mémoire OPS",
   "Contrat structurel qui sépare les preuves brutes, les synthèses maintenues et les écritures opérationnelles de l’application.",
-  [org, "INDEX — Index de la mémoire OPS", "LOG — Journal de la mémoire OPS", "MANIFEST — Manifest de la démo OPS"],
+  [org, "INDEX — Index de la mémoire OPS", "LOG — Journal de la mémoire OPS", "MANIFEST — Manifest de la mémoire OPS"],
   { schema_version: 2, status: "maintained" },
   `## Trois couches
 
@@ -171,7 +171,7 @@ add("06_Operations/Achats", "ACHAT-109", "finance", "Placage chêne", "Budget 8 
   ["DEV-317", "Devis Hôtel Orsay v3", "Chiffrage de 58 K€ soumis au plan technique final.", ["OPP-401 — Hôtel Orsay", "PER-002 — Camille Laurent"]],
   ["PROC-003", "Contrôle qualité atelier", "Procédure suffisamment documentée pour être reprise par Hugo.", ["PER-003 — Thomas Renaud", "PER-005 — Hugo Bernard"]],
   ["PROC-007", "Calibration CNC", "Procédure encore incomplète : elle ne couvre pas les réglages de finition.", ["PER-003 — Thomas Renaud", "EXP-THOMAS-01 — Réglages CNC et finitions"]],
-  ["EXP-THOMAS-01", "Réglages CNC et finitions", "Savoir documenté partiellement lors d’une démonstration atelier.", ["PER-003 — Thomas Renaud", "PROC-007 — Calibration CNC"]],
+  ["EXP-THOMAS-01", "Réglages CNC et finitions", "Savoir documenté partiellement lors d’un transfert en atelier.", ["PER-003 — Thomas Renaud", "PROC-007 — Calibration CNC"]],
 ].forEach(([id, title, summary, links]) => add("08_Documents", id, id.startsWith("EXP") ? "knowledge" : "document", title, summary, [org, ...links]));
 
 const seededEmailContacts = {
@@ -562,12 +562,12 @@ add(
   "GEO-SNAPSHOT-20260716",
   "marketing",
   "Visibilité dans les moteurs IA du 16 juillet",
-  "Atelier Beaumarchais est cité dans 5 réponses sur 12 requêtes tests, contre 3 sur 12 lors du contrôle précédent.",
+  "Atelier Beaumarchais est cité dans 5 réponses sur 12 requêtes de référence, contre 3 sur 12 lors du contrôle précédent.",
   [org, "SEO-LOCAL-20260716 — SEO local et Google Business Profile du 16 juillet", "SEO-CONTENT-20260716 — Analyse de contenu SEO du 16 juillet"],
   { period: "2026-07-16", tested_prompts: 12, citations: 5, previous_citations: 3, citation_rate_percent: 41.7 },
   `## Audit de citation
 
-- 12 requêtes testées dans trois moteurs génératifs.
+- 12 requêtes évaluées dans trois moteurs génératifs.
 - 5 réponses citent Atelier Beaumarchais, contre 3 au précédent contrôle.
 - Présence forte sur « menuisier sur mesure Paris 11 ».
 - Absence sur « spécialiste agencement hôtel Île-de-France » et « entreprise agencement boutique premium Paris ».
@@ -809,7 +809,7 @@ add(
   `## Progression
 
 - Contrôle qualité standard : transmis à Hugo, mise en situation validée.
-- Réglages de finition : démonstration enregistrée, procédure à compléter.
+- Réglages de finition : transfert enregistré, procédure à compléter.
 - Calibration CNC : une session sur deux réalisée.
 - Diagnostic de panne : non démarré.
 
@@ -1197,7 +1197,7 @@ add(
   "LOG",
   "knowledge",
   "Journal de la mémoire OPS",
-  "Journal chronologique append-only des ingestions, synthèses et actions de démonstration.",
+  "Journal chronologique append-only des ingestions, synthèses et actions contrôlées.",
   [org, "INDEX — Index de la mémoire OPS"],
   { status: "append_only", schema_version: 2 },
   `## [2026-07-16 08:00] ingest | Snapshots quotidiens
@@ -1241,10 +1241,10 @@ for (const record of records) {
     ? `${record.extra.period}T08:00:00+02:00`
     : "2026-07-15T08:00:00+02:00";
   const preserved = await preservedOperationalContent(filePath, record.id);
-  const markdown = `---\nid: ${record.id}\ntype: ${record.type}\ntitle: ${JSON.stringify(record.title)}\ndemo: true\norganization: "[[${org}]]"\ncreated_at: ${recordDate}\nupdated_at: ${recordDate}\nconfidence: 1.0\nsource: OPS Demo Seed\n${extras}\n---\n\n# ${record.title}\n\n${record.summary}\n\n${record.body ? `${record.body.trim()}\n\n` : ""}## Relations\n\n${normalizedLinks.map((link) => `- [[${link}]]`).join("\n") || `- [[${org}]]`}\n\n## Provenance\n\nDonnée fictive créée pour la démonstration OPS. Aucune action externe autorisée.${preserved ? `\n\n${preserved}` : ""}\n`;
+  const markdown = `---\nid: ${record.id}\ntype: ${record.type}\ntitle: ${JSON.stringify(record.title)}\nmanaged_by: ops-memory\norganization: "[[${org}]]"\ncreated_at: ${recordDate}\nupdated_at: ${recordDate}\nconfidence: 1.0\nsource: OPS Memory\n${extras}\n---\n\n# ${record.title}\n\n${record.summary}\n\n${record.body ? `${record.body.trim()}\n\n` : ""}## Relations\n\n${normalizedLinks.map((link) => `- [[${link}]]`).join("\n") || `- [[${org}]]`}\n\n## Provenance\n\nConnaissance structurée par OPS à partir des sources citées. Toute action externe reste soumise aux autorisations actives.${preserved ? `\n\n${preserved}` : ""}\n`;
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
   await fs.writeFile(temporaryPath, markdown, "utf8");
   await fs.rename(temporaryPath, filePath);
 }
 
-console.log(`OPS Demo Vault seeded: ${records.length} notes in ${root}`);
+console.log(`OPS memory seeded: ${records.length} notes in ${root}`);

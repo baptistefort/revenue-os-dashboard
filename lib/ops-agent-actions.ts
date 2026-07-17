@@ -4,6 +4,10 @@ import {
   writeObsidianRecord,
   type ObsidianWriteResult,
 } from "@/lib/obsidian-write";
+import {
+  executeControlledOpsAction,
+  type ControlledActionProjectionContext,
+} from "@/lib/ops-action-executor";
 
 const linkedSchema = z.array(z.string().trim().min(1).max(180)).max(12);
 const actionControlFields = {
@@ -41,6 +45,9 @@ export const opsAgentActionSchema = z.discriminatedUnion("type", [
     due: z.string().trim().min(1).max(120),
     description: z.string().trim().min(1).max(8_000),
     project: z.string().trim().max(180).nullable(),
+    status: z.enum(["open", "in_progress", "done"]).optional(),
+    dayIndex: z.number().int().min(0).max(4).optional(),
+    weekOffset: z.number().int().min(-52).max(52).optional(),
     linked: linkedSchema,
   }),
   z.object({
@@ -83,6 +90,7 @@ export const opsAgentActionEnvelopeSchema = z.object({
     "create_task",
     "create_client",
     "prepare_email",
+    "send_email",
     "send_demo_email",
   ]),
   execution: z.enum(["propose", "execute"]),
@@ -137,7 +145,9 @@ export function parseOpsAgentActionEnvelopes(
     }
     const parsed = opsAgentActionSchema.safeParse({
       ...((payload && typeof payload === "object") ? payload : {}),
-      type: envelope.type,
+      // `send_demo_email` remains the public UI alias until every consumer has
+      // migrated. The executor always persists the canonical `send_email`.
+      type: envelope.type === "send_email" ? "send_demo_email" : envelope.type,
       execution: envelope.execution,
       reason: envelope.reason,
     });
@@ -155,11 +165,13 @@ function formatEuro(value: number) {
  * This intentionally never calls the application's own HTTP routes and never
  * contacts an email provider, CRM or other external service.
  */
-export async function persistOpsAgentAction(
+export async function projectOpsAgentActionToObsidian(
   action: OpsAgentAction,
+  context?: ControlledActionProjectionContext,
 ): Promise<ObsidianWriteResult> {
   if (action.type === "create_opportunity") {
     return writeObsidianRecord({
+      id: context?.recordId,
       idPrefix: "OPP",
       folder: "03_CRM/Opportunites",
       type: "project",
@@ -192,7 +204,9 @@ export async function persistOpsAgentAction(
   }
 
   if (action.type === "create_task") {
+    const status = action.status ?? "open";
     return writeObsidianRecord({
+      id: context?.recordId,
       idPrefix: "TASK",
       folder: "06_Operations/Taches",
       type: "project",
@@ -202,15 +216,17 @@ export async function persistOpsAgentAction(
 
 - Responsable : ${action.owner}.
 - Échéance : ${action.due}.
-- Statut : open.
+- Statut : ${status}.
 ${action.project ? `- Projet : ${action.project}.` : ""}`,
       relations: action.linked,
       attributes: {
         record_kind: "task",
         owner: action.owner,
         due: action.due,
-        status: "open",
+        status,
         project: action.project ?? "",
+        day_index: action.dayIndex ?? null,
+        week_offset: action.weekOffset ?? 0,
         agent_created: true,
       },
       source: "OPS Agent — OpenCode",
@@ -220,6 +236,7 @@ ${action.project ? `- Projet : ${action.project}.` : ""}`,
 
   if (action.type === "create_client") {
     return writeObsidianRecord({
+      id: context?.recordId,
       idPrefix: "CLI",
       folder: "03_CRM/Clients",
       type: "entity",
@@ -255,6 +272,7 @@ ${action.email ? `- Email principal : ${action.email}.` : ""}`,
 
   const sent = action.type === "send_demo_email";
   return writeObsidianRecord({
+    id: context?.recordId,
     idPrefix: sent ? "EMAIL-SENT" : "EMAIL-DRAFT",
     folder: sent
       ? "04_Conversations/Emails/Envoyes"
@@ -262,7 +280,7 @@ ${action.email ? `- Email principal : ${action.email}.` : ""}`,
     type: "document",
     title: action.subject,
     summary: sent
-      ? `Email de démonstration envoyé à ${action.to}.`
+      ? `Email remis à la boîte d'envoi contrôlée pour ${action.to}.`
       : `Brouillon d'email préparé pour ${action.to}.`,
     body: `## Message
 
@@ -277,19 +295,39 @@ ${action.body}`,
       direction: "outbound",
       mailbox: sent ? "sent" : "draft",
       classification: "neutral",
-      status: sent ? "sent_demo" : "draft",
+      status: sent ? "sent" : "draft",
       recipient: action.to,
       sender: "Marie Delmas <marie@atelier-beaumarchais.fr>",
       company: action.company ?? "",
       thread_id: action.threadId ?? "",
-      sent_at: sent ? new Date().toISOString() : "",
+      sent_at: sent ? context?.receipt?.acceptedAt ?? new Date().toISOString() : "",
       validated: sent,
       agent_created: true,
-      delivery_mode: "demo_internal_only",
+      delivery_mode: sent ? "controlled_internal_outbox" : "draft_only",
+      delivery_receipt: context?.receipt?.receiptId ?? "",
+      network_delivery: false,
     },
     source: "OPS Agent — OpenCode",
     actor: "OPS Agent — validation Marie Delmas",
   });
+}
+
+/**
+ * Persists the action in the central PostgreSQL memory before projecting the
+ * resulting durable record to Obsidian. Without DATABASE_URL the same API
+ * keeps the local Obsidian-only development fallback.
+ */
+export async function persistOpsAgentAction(
+  action: OpsAgentAction,
+): Promise<ObsidianWriteResult> {
+  const result = await executeControlledOpsAction(action, {
+    requestedBy: "marie-delmas",
+    approvedBy: "Marie Delmas",
+    projectToObsidian: (candidate, context) => (
+      projectOpsAgentActionToObsidian(candidate as OpsAgentAction, context)
+    ),
+  });
+  return result.projection;
 }
 
 function currentRequestIsNegated(normalized: string, type: OpsAgentActionType) {

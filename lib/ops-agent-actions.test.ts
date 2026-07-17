@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   isExplicitAgentActionRequest,
+  opsAgentActionSchema,
   opsAgentActionsSchema,
   parseOpsAgentActionEnvelopes,
+  projectOpsAgentActionToObsidian,
   resolveOpsAgentActions,
   type OpsAgentAction,
 } from "@/lib/ops-agent-actions";
+import {
+  buildObsidianVaultIndex,
+  findObsidianMemoryRecord,
+} from "@/lib/obsidian-vault-memory";
 
 const opportunity: OpsAgentAction = {
   type: "create_opportunity",
@@ -48,6 +56,9 @@ test("le schéma borne les cinq actions agentiques et refuse les formes libres",
       due: "2026-07-18",
       description: "Comparer le réalisé au budget validé.",
       project: "Rivoli",
+      status: "in_progress",
+      dayIndex: 3,
+      weekOffset: 2,
       linked: ["PROJET-241"],
     },
     {
@@ -63,6 +74,9 @@ test("le schéma borne les cinq actions agentiques et refuse les formes libres",
     },
   ]);
   assert.equal(actions.length, 3);
+  assert.equal(actions[1].type === "create_task" && actions[1].project, "Rivoli");
+  assert.equal(actions[1].type === "create_task" && actions[1].dayIndex, 3);
+  assert.equal(actions[1].type === "create_task" && actions[1].weekOffset, 2);
 
   assert.equal(opsAgentActionsSchema.safeParse([
     ...actions,
@@ -210,4 +224,45 @@ test("la persistance agentique écrit directement dans Obsidian sans fetch inter
   assert.match(source, /writeObsidianRecord/);
   assert.doesNotMatch(source, /\bfetch\s*\(/);
   assert.doesNotMatch(source, /\/api\/records/);
+});
+
+test("une tâche projetée retrouve sa position exacte après relecture du vault", async () => {
+  const temporaryVault = await mkdtemp(path.join(tmpdir(), "ops-planning-refresh-"));
+  const previousVault = process.env.OBSIDIAN_VAULT_PATH;
+  process.env.OBSIDIAN_VAULT_PATH = temporaryVault;
+  try {
+    const action = opsAgentActionSchema.parse({
+      type: "create_task",
+      execution: "execute",
+      reason: "Créneau confirmé depuis le planning.",
+      title: "Contrôle qualité Rivoli",
+      owner: "Thomas Renaud",
+      due: "Jeu. 16 · semaine du 13 juillet",
+      description: "Contrôle qualité avant réception.",
+      project: "Rivoli · atelier",
+      status: "in_progress",
+      dayIndex: 3,
+      weekOffset: 1,
+      linked: ["PROJET-241"],
+    });
+    const written = await projectOpsAgentActionToObsidian(action, {
+      actionRunId: "run-planning-001",
+      actionType: "create_task",
+      recordId: "TASK-PLANNING-REFRESH-001",
+      idempotencyKey: "planning-refresh-001",
+    });
+    const index = await buildObsidianVaultIndex(
+      path.dirname(path.dirname(path.dirname(written.absolutePath))),
+    );
+    const reloaded = findObsidianMemoryRecord(index, written.id);
+    assert.ok(reloaded);
+    assert.equal(reloaded.attributes.project, "Rivoli · atelier");
+    assert.equal(reloaded.attributes.status, "in_progress");
+    assert.equal(reloaded.attributes.day_index, 3);
+    assert.equal(reloaded.attributes.week_offset, 1);
+  } finally {
+    if (previousVault === undefined) delete process.env.OBSIDIAN_VAULT_PATH;
+    else process.env.OBSIDIAN_VAULT_PATH = previousVault;
+    await rm(temporaryVault, { recursive: true, force: true });
+  }
 });

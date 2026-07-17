@@ -2,6 +2,8 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import type { BrainEdge, BrainNode } from "@/lib/ops-demo-data";
+import { buildCentralMemoryGraph } from "@/lib/central-memory/graph";
+import { centralMemoryConfigured } from "@/lib/central-memory/search";
 
 export const dynamic = "force-dynamic";
 const GRAPH_NODE_LIMIT = 1_200;
@@ -63,8 +65,16 @@ function deterministicPosition(index: number, total: number, type: BrainNode["ty
 }
 
 export async function GET() {
+  if (centralMemoryConfigured()) {
+    try {
+      const central = await buildCentralMemoryGraph();
+      if (central.available) return NextResponse.json(central);
+    } catch (error) {
+      console.error("Central memory graph unavailable; using Obsidian projection.", error);
+    }
+  }
   const vaultPath = process.env.OBSIDIAN_VAULT_PATH;
-  if (!vaultPath) return NextResponse.json({ available: false, source: "demo" });
+  if (!vaultPath) return NextResponse.json({ available: false, source: "memory" });
 
   try {
     const allFiles = await walk(vaultPath);
@@ -148,6 +158,6 @@ export async function GET() {
 
     return NextResponse.json({ available: nodes.length > 3 && edges.length > 2, source: "obsidian", nodes, edges });
   } catch {
-    return NextResponse.json({ available: false, source: "demo" });
+    return NextResponse.json({ available: false, source: "memory" });
   }
 }

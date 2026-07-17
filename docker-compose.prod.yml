@@ -7,6 +7,77 @@ x-common-logging: &common-logging
     max-file: "3"
 
 services:
+  database:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.production
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ops}
+      POSTGRES_USER: ${POSTGRES_USER:-ops}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    expose:
+      - "5432"
+    volumes:
+      - ops_postgres_data:/var/lib/postgresql/data
+    networks:
+      - ops_private
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: 256
+    cpus: "0.75"
+    mem_limit: 1536m
+    shm_size: 256m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER:-ops}" -d "$${POSTGRES_DB:-ops}"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: *common-logging
+
+  database-migrate:
+    image: pgvector/pgvector:pg17
+    restart: "no"
+    init: true
+    read_only: true
+    depends_on:
+      database:
+        condition: service_healthy
+    env_file:
+      - .env.production
+    environment:
+      MIGRATIONS_DIR: /migrations
+    command:
+      - sh
+      - /scripts/migrate-database.sh
+    volumes:
+      - ./database/migrations:/migrations:ro
+      - ./scripts/migrate-database.sh:/scripts/migrate-database.sh:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    networks:
+      - ops_private
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    cpus: "0.25"
+    mem_limit: 256m
+    logging: *common-logging
+
   opencode:
     image: ops-opencode:1.18.2
     build:
@@ -64,6 +135,8 @@ services:
     init: true
     read_only: true
     depends_on:
+      database-migrate:
+        condition: service_completed_successfully
       opencode:
         condition: service_healthy
     env_file:
@@ -76,7 +149,7 @@ services:
       OPENCODE_DIRECTORY: /workspace/ops
       OBSIDIAN_VAULT_PATH: /data/obsidian
       OPS_DOCUMENTS_PATH: /data/documents
-      OPS_BUSINESS_DATE: ${OPS_BUSINESS_DATE:-2026-07-16}
+      OPS_BUSINESS_DATE: ${OPS_BUSINESS_DATE:-2026-07-17}
     expose:
       - "3000"
     command:
@@ -139,6 +212,105 @@ services:
     pids_limit: 128
     logging: *common-logging
 
+  database-seed:
+    image: pgvector/pgvector:pg17
+    profiles:
+      - tools
+    init: true
+    read_only: true
+    depends_on:
+      database-migrate:
+        condition: service_completed_successfully
+    env_file:
+      - .env.production
+    environment:
+      OPS_SEED_DATABASE: allow
+      SEEDS_DIR: /seeds
+    command:
+      - sh
+      - /scripts/seed-database.sh
+    volumes:
+      - ./database/seeds:/seeds:ro
+      - ./scripts/seed-database.sh:/scripts/seed-database.sh:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    networks:
+      - ops_private
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 256m
+    logging: *common-logging
+
+  central-memory-seed:
+    image: ops-opencode:1.18.2
+    build:
+      context: .
+      dockerfile: deploy/opencode/Dockerfile
+    profiles:
+      - tools
+    init: true
+    read_only: true
+    depends_on:
+      database-migrate:
+        condition: service_completed_successfully
+    env_file:
+      - .env.production
+    environment:
+      OPS_ORGANIZATION_SLUG: ${OPS_ORGANIZATION_SLUG:-atelier-beaumarchais}
+      OPS_UNIVERSE_AS_OF: ${OPS_UNIVERSE_AS_OF:-2026-07-17T08:00:00.000Z}
+    command:
+      - ./node_modules/.bin/tsx
+      - scripts/seed-central-memory.ts
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    networks:
+      - ops_private
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    pids_limit: 160
+    logging: *common-logging
+
+  central-memory-project:
+    image: ops-opencode:1.18.2
+    build:
+      context: .
+      dockerfile: deploy/opencode/Dockerfile
+    profiles:
+      - tools
+    user: "1001:1002"
+    init: true
+    read_only: true
+    depends_on:
+      database-migrate:
+        condition: service_completed_successfully
+    env_file:
+      - .env.production
+    environment:
+      OPS_ORGANIZATION_SLUG: ${OPS_ORGANIZATION_SLUG:-atelier-beaumarchais}
+      OBSIDIAN_VAULT_PATH: /data/obsidian
+    command:
+      - ./node_modules/.bin/tsx
+      - scripts/project-central-memory.ts
+    volumes:
+      - ./data/obsidian:/data/obsidian
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    networks:
+      - ops_private
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    pids_limit: 160
+    logging: *common-logging
+
 networks:
   ops_private:
     name: ops_private
@@ -151,3 +323,4 @@ volumes:
   opencode_config:
   opencode_data:
   opencode_state:
+  ops_postgres_data:

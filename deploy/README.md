@@ -1,9 +1,11 @@
 # Déploiement VPS privé
 
-Cette configuration déploie deux conteneurs séparés :
+Cette configuration déploie les services persistants séparément :
 
 - `app` : l’interface Next.js OPS, visible uniquement par le Caddy existant ;
 - `opencode` : le cerveau OpenCode `1.18.2`, sans port publié, joignable seulement sur le réseau Docker privé `ops_private`.
+- `database` : la mémoire PostgreSQL autoritaire ;
+- `central-memory-project` : outil éphémère qui projette les entités durables dans Obsidian avant le cutover.
 
 OpenCode conserve un accès Internet sortant pour appeler OpenAI, mais aucun port de son serveur n’est publié sur l’hôte ni relié à Caddy.
 
@@ -38,6 +40,14 @@ Renseigner au minimum :
 - `FISH_AUDIO_REFERENCE_ID` pour le modèle vocal Fish Audio choisi ;
 - `OPENCODE_SERVER_PASSWORD` avec un secret long et aléatoire ;
 - `OPENCODE_SESSION_SECRET` avec un autre secret d’au moins 64 octets.
+
+Pour activer les futurs connecteurs entrants, ajouter aussi un
+`OPS_INGESTION_TOKEN` aléatoire. Gmail, Notion, Slack, Drive, Calendar, CRM,
+SEO/Ads et finance poussent ensuite leurs événements côté serveur vers
+`POST /api/connectors/ingest` avec `Authorization: Bearer …` et
+`X-OPS-Tenant: atelier-beaumarchais`. Le contrat complet est dans
+`database/CONNECTOR_INGESTION.md`; ce secret ne doit jamais être placé dans une
+variable `NEXT_PUBLIC_*`.
 
 Ne jamais exposer le port `4096` dans le pare-feu, dans `ports:` ou dans Caddy.
 
@@ -85,41 +95,49 @@ Avant toute mutation, le script :
 4. tague les images courantes avec `rollback-<release>` ;
 5. écrit une fiche sans secret dans `/srv/ops-deploy-state/releases/<release>.env`.
 
-Après construction, il normalise les droits, démarre les services, puis exige un succès de `/api/readiness`. Cette sonde profonde vérifie :
+Après construction, il charge la mémoire centrale de façon idempotente, projette
+ses entités et relations dans `data/obsidian/Central/`, normalise les droits,
+démarre les services, puis exige un succès de `/api/readiness`. La projection
+est terminée avant le cutover : une erreur interrompt la release sans remplacer
+les conteneurs applicatifs en cours. Cette sonde profonde vérifie :
 
 - OpenCode via `/global/health` et une authentification Basic interne ;
 - lecture **et** écriture du coffre par l’identité effective de l’application ;
-- lecture **et** écriture du stockage de documents, sans créer de fichier de test.
+- lecture **et** écriture du stockage de documents, sans laisser de fichier temporaire.
 
 La liveness `/api/health` reste volontairement superficielle pour que Docker distingue un processus vivant d’une dépendance momentanément indisponible.
 
 ### Options de seed
 
-Le premier lancement crée le coffre fictif si `data/obsidian` ne contient encore aucune note Markdown :
+Le premier lancement initialise la mémoire OPS si `data/obsidian` ne contient encore aucune note Markdown :
 
 ```bash
-SEED_DEMO=auto APP_DIR=/srv/ops deploy/vps/deploy.sh
+SEED_MEMORY=auto APP_DIR=/srv/ops deploy/vps/deploy.sh
 ```
 
 Pour ne jamais lancer le seed :
 
 ```bash
-SEED_DEMO=never APP_DIR=/srv/ops deploy/vps/deploy.sh
+SEED_MEMORY=never APP_DIR=/srv/ops deploy/vps/deploy.sh
 ```
 
-`SEED_DEMO=always` met à jour la démo attendue sans supprimer les écritures opérationnelles préservées par le seed.
+`SEED_MEMORY=always` met à jour la mémoire attendue sans supprimer les écritures opérationnelles préservées par l’initialisation.
 
 ## 5. Empêcher le mélange de deux coffres
 
-La démo attend par défaut le sous-dossier exact :
+La mémoire attend par défaut le sous-dossier exact :
 
 ```text
-data/obsidian/OPS Demo — Atelier Beaumarchais
+data/obsidian/OPS — Atelier Beaumarchais
 ```
 
-Si des notes Markdown existent ailleurs (par exemple un ancien `data/obsidian/OPS`), le déploiement s’arrête **avant le build**. L’archive de pré-déploiement est déjà disponible, mais rien n’est déplacé ni supprimé automatiquement.
+Le script peut renommer automatiquement l’ancienne racine reconnue vers ce nom
+canonique, sans modifier son contenu. Si des notes Markdown existent dans une
+autre racine non reconnue (par exemple `data/obsidian/OPS`), le déploiement
+s’arrête **avant le build**. L’archive de pré-déploiement est déjà disponible ;
+aucune autre racine n’est déplacée ni supprimée automatiquement.
 
-Pour remplacer explicitement un ancien coffre de démonstration :
+Pour remplacer explicitement un ancien coffre :
 
 ```bash
 cd /srv/ops
@@ -128,13 +146,13 @@ mkdir -p /srv/ops-vault-legacy
 tar -czf /srv/ops-vault-legacy/obsidian-"$STAMP".tar.gz data/obsidian
 mv data/obsidian /srv/ops-vault-legacy/obsidian-"$STAMP"
 mkdir -p data/obsidian data/documents
-RELEASE_ID="$STAMP" SEED_DEMO=always APP_DIR=/srv/ops deploy/vps/deploy.sh
+RELEASE_ID="$STAMP" SEED_MEMORY=always APP_DIR=/srv/ops deploy/vps/deploy.sh
 ```
 
 `VAULT_MIGRATION_MODE=allow-existing` désactive ce garde-fou uniquement lorsqu’il est réellement intentionnel d’indexer plusieurs racines. Cette option ne migre rien. Pour un coffre client dont le nom est différent, définir explicitement `EXPECTED_VAULT_ROOT_NAME` ou le laisser vide après audit :
 
 ```bash
-EXPECTED_VAULT_ROOT_NAME="Mon coffre validé" SEED_DEMO=never APP_DIR=/srv/ops deploy/vps/deploy.sh
+EXPECTED_VAULT_ROOT_NAME="Mon coffre validé" SEED_MEMORY=never APP_DIR=/srv/ops deploy/vps/deploy.sh
 ```
 
 ## 6. Relier le Caddy déjà installé
@@ -164,12 +182,13 @@ Pour utiliser `ops.visionia-france.com`, créer d’abord un enregistrement DNS 
 cd /srv/ops
 docker compose -f docker-compose.prod.yml ps
 docker compose -f docker-compose.prod.yml logs --tail=100 app opencode
+[[ -s data/obsidian/Central/.ops-central-memory-manifest.json ]]
 curl -fsS https://ops.72.61.111.77.sslip.io/api/health
 curl -fsS https://ops.72.61.111.77.sslip.io/api/readiness
 cat /srv/ops-deploy-state/last-successful-release
 ```
 
-La réponse de readiness ne contient ni chemin interne, ni URL OpenCode, ni identifiant, ni secret. Le service OpenCode doit être `healthy`, sans être accessible depuis Internet. Le test suivant doit échouer depuis une machine externe :
+La réponse de readiness ne contient ni chemin interne, ni URL OpenCode, ni identifiant, ni secret. Le service OpenCode doit être `healthy`, sans être accessible depuis Internet. La requête suivante doit échouer depuis une machine externe :
 
 ```bash
 curl --connect-timeout 3 http://72.61.111.77:4096/global/health

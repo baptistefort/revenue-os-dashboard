@@ -2,12 +2,17 @@ import { constants, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Buffer } from "node:buffer";
+import {
+  checkCentralMemoryDatabase,
+  type CentralMemoryDatabaseCheck,
+} from "@/lib/central-memory/database";
 
 const DEFAULT_OPENCODE_BASE_URL = "http://127.0.0.1:4096";
 const DEFAULT_OPENCODE_USERNAME = "opencode";
 const DEFAULT_TIMEOUT_MS = 3_000;
 
 type ReadinessEnvironment = {
+  DATABASE_URL?: string;
   OBSIDIAN_VAULT_PATH?: string;
   OPS_DOCUMENTS_PATH?: string;
   OPENCODE_BASE_URL?: string;
@@ -44,6 +49,7 @@ export type OpsReadiness = {
     opencode: OpenCodeCheck;
     vault: DirectoryCheck;
     documents: DirectoryCheck;
+    database: CentralMemoryDatabaseCheck;
   };
 };
 
@@ -52,6 +58,7 @@ export type OpsReadinessOptions = {
   fetchImpl?: ReadinessFetch;
   timeoutMs?: number;
   now?: () => Date;
+  databaseCheck?: () => Promise<CentralMemoryDatabaseCheck>;
 };
 
 function elapsed(startedAt: number) {
@@ -187,6 +194,7 @@ export async function getOpsReadiness(options: OpsReadinessOptions = {}): Promis
   const startedAt = performance.now();
   const sourceEnv = options.env ?? process.env;
   const env: ReadinessEnvironment = {
+    DATABASE_URL: sourceEnv.DATABASE_URL,
     OBSIDIAN_VAULT_PATH: sourceEnv.OBSIDIAN_VAULT_PATH,
     OPS_DOCUMENTS_PATH: sourceEnv.OPS_DOCUMENTS_PATH,
     OPENCODE_BASE_URL: sourceEnv.OPENCODE_BASE_URL,
@@ -195,18 +203,20 @@ export async function getOpsReadiness(options: OpsReadinessOptions = {}): Promis
   };
   const documentsPath = env.OPS_DOCUMENTS_PATH?.trim()
     || path.join(os.tmpdir(), "ops-generated-documents");
-  const [opencode, vault, documents] = await Promise.all([
+  const [opencode, vault, documents, database] = await Promise.all([
     checkOpenCode(env, options.fetchImpl ?? fetch, options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
     checkDirectory(env.OBSIDIAN_VAULT_PATH),
     checkDirectory(documentsPath),
+    options.databaseCheck?.() ?? checkCentralMemoryDatabase({ env }),
   ]);
-  const ready = [opencode, vault, documents].every((check) => check.status === "ok");
+  const ready = [opencode, vault, documents, database]
+    .every((check) => check.status === "ok");
 
   return {
     status: ready ? "ready" : "degraded",
     service: "ops-web",
     timestamp: (options.now ?? (() => new Date()))().toISOString(),
     latencyMs: elapsed(startedAt),
-    checks: { opencode, vault, documents },
+    checks: { opencode, vault, documents, database },
   };
 }

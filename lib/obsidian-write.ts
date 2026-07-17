@@ -8,7 +8,8 @@ import {
   resolveObsidianVaultRoot,
 } from "@/lib/obsidian-vault-memory";
 
-const DEMO_ROOT = "OPS Demo — Atelier Beaumarchais";
+const MEMORY_ROOT = "OPS — Atelier Beaumarchais";
+const LEGACY_MEMORY_ROOT = "OPS Demo — Atelier Beaumarchais";
 const ORG_LINK = "ORG-001 — Atelier Beaumarchais";
 const RELATION_ALIASES = new Map([
   ["direction", "WIKI-DIRECTION-20260716"],
@@ -33,6 +34,7 @@ const RESERVED_FRONTMATTER_KEYS = new Set([
   "type",
   "title",
   "demo",
+  "managed_by",
   "organization",
   "created_at",
   "updated_at",
@@ -124,7 +126,21 @@ function createId(prefix: string) {
 export async function resolveOpsDemoVaultRoot() {
   const vault = await resolveObsidianVaultRoot();
   if (!vault) throw new Error("obsidian_vault_unavailable");
-  const root = path.basename(vault) === DEMO_ROOT ? vault : path.join(vault, DEMO_ROOT);
+  const baseName = path.basename(vault);
+  if (baseName === MEMORY_ROOT || baseName === LEGACY_MEMORY_ROOT) return vault;
+  const preferred = path.join(vault, MEMORY_ROOT);
+  const legacy = path.join(vault, LEGACY_MEMORY_ROOT);
+  let root = preferred;
+  try {
+    await fs.access(preferred);
+  } catch {
+    try {
+      await fs.access(legacy);
+      root = legacy;
+    } catch {
+      root = preferred;
+    }
+  }
   await fs.mkdir(root, { recursive: true });
   return root;
 }
@@ -151,7 +167,7 @@ async function ensureOperationalFile(
 id: ${id}
 type: knowledge
 title: ${JSON.stringify(title)}
-demo: true
+managed_by: ops-memory
 organization: "[[${ORG_LINK}]]"
 created_at: ${createdAt}
 updated_at: ${createdAt}
@@ -184,7 +200,7 @@ async function updateOperationalFiles(
     logPath,
     "LOG",
     "Journal de la mémoire OPS",
-    "Journal chronologique append-only des ingestions et actions de démonstration.\n",
+    "Journal chronologique append-only des ingestions et actions contrôlées.\n",
   );
   await ensureOperationalFile(
     indexPath,
@@ -289,7 +305,7 @@ export async function writeObsidianRecord(
 id: ${id}
 type: ${JSON.stringify(type)}
 title: ${JSON.stringify(title)}
-demo: true
+managed_by: ops-memory
 organization: "[[${ORG_LINK}]]"
 created_at: ${createdAt}
 updated_at: ${createdAt}
@@ -397,7 +413,7 @@ export async function updateObsidianRecord(
 id: ${id}
 type: ${JSON.stringify(type)}
 title: ${JSON.stringify(title)}
-demo: true
+managed_by: ops-memory
 organization: "[[${ORG_LINK}]]"
 created_at: ${createdAt}
 updated_at: ${updatedAt}
