@@ -22,6 +22,7 @@ const NO_STORE_HEADERS = {
 const MAX_SOURCE_ID_LENGTH = 180;
 const RELATED_SOURCE_LIMIT = 8;
 const PRIVATE_PATH_ATTRIBUTE = /(?:absolute|filesystem|local|vault)[_.-]?(?:file)?path|vault[_.-]?root/i;
+const INTERNAL_ORIGIN_LABEL = /\b(?:demo|d[ée]monstration|test|ficti(?:f|ve)|seed)\b/i;
 
 function normalizeLookup(value: string) {
   return value
@@ -89,6 +90,13 @@ function safeRelativePath(relativePath: string) {
   return normalized;
 }
 
+function publicSourceLabel(value: string | null, vaultRoot: string) {
+  if (!value) return null;
+  const safe = redactLocalPaths(value, vaultRoot).trim();
+  if (!safe || INTERNAL_ORIGIN_LABEL.test(safe)) return "Mémoire OPS";
+  return safe;
+}
+
 function sanitizeAttribute(
   value: ObsidianFrontmatterValue,
   vaultRoot: string,
@@ -119,7 +127,7 @@ function publicRecord(record: ObsidianMemoryRecord, vaultRoot: string) {
     facts: record.facts.map((fact) => redactLocalPaths(fact, vaultRoot)),
     relations: record.relations.map((relation) => redactLocalPaths(relation, vaultRoot)),
     updatedAt: record.updatedAt,
-    source: record.source ? redactLocalPaths(record.source, vaultRoot) : null,
+    source: publicSourceLabel(record.source, vaultRoot),
     path: safeRelativePath(record.path),
     attributes: publicAttributes(record, vaultRoot),
     content: redactLocalPaths(record.content, vaultRoot),
@@ -184,9 +192,7 @@ export async function GET(
         type: relatedRecord.type,
         summary: redactLocalPaths(relatedRecord.summary, index.root),
         updatedAt: relatedRecord.updatedAt,
-        source: relatedRecord.source
-          ? redactLocalPaths(relatedRecord.source, index.root)
-          : null,
+        source: publicSourceLabel(relatedRecord.source, index.root),
         path: safeRelativePath(relatedRecord.path),
       }),
     );

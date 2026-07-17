@@ -17,7 +17,7 @@ id: FIN-001
 type: snapshot
 title: "Situation financière"
 updated_at: 2026-07-17T08:00:00+02:00
-source: ERP
+source: OPS Demo Seed
 margin: 29
 local_path: "${root}/secret/source.json"
 ---
@@ -87,11 +87,14 @@ test("retourne une source exacte, ses attributs sûrs et ses relations résolues
     path: string;
     attributes: Record<string, unknown>;
     content: string;
+    source: string | null;
     related: Array<{ id: string; relation: string; path: string }>;
   };
   assert.equal(payload.id, "FIN-001");
   assert.equal(payload.title, "Situation financière");
   assert.equal(payload.type, "snapshot");
+  assert.equal(payload.source, "Mémoire OPS");
+  assert.doesNotMatch(JSON.stringify(payload), /d[ée]mo|démonstration|ficti/i);
   assert.ok(payload.facts.some((fact) => fact.includes("24,3 K€")));
   assert.equal(payload.path, "Finance/FIN-001 — Situation.md");
   assert.equal(payload.attributes.margin, 29);
