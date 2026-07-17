@@ -63,6 +63,24 @@ function wrapText(text: string, font: PDFFont, size: number, maxWidth: number) {
     const words = rawParagraph.trim().split(/\s+/).filter(Boolean);
     let current = "";
     for (const word of words) {
+      if (font.widthOfTextAtSize(word, size) > maxWidth) {
+        if (current) {
+          lines.push(current);
+          current = "";
+        }
+        let fragment = "";
+        for (const character of word) {
+          const candidate = `${fragment}${character}`;
+          if (fragment && font.widthOfTextAtSize(candidate, size) > maxWidth) {
+            lines.push(fragment);
+            fragment = character;
+          } else {
+            fragment = candidate;
+          }
+        }
+        current = fragment;
+        continue;
+      }
       const candidate = current ? `${current} ${word}` : word;
       if (!current || font.widthOfTextAtSize(candidate, size) <= maxWidth) {
         current = candidate;
@@ -234,39 +252,39 @@ export async function POST(request: Request) {
     color: MUTED,
   });
 
-  const summary = pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-  drawPageChrome(summary, regular, bold, "Synthèse exécutive", 2);
-  summary.drawText("Ce qu’il faut retenir", {
+  const summaryLines = wrapText(plan.executiveSummary, regular, 11, CONTENT_WIDTH);
+  const firstSummaryPage = pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
+  drawPageChrome(firstSummaryPage, regular, bold, "Synthèse exécutive", 2);
+  firstSummaryPage.drawText("Ce qu’il faut retenir", {
     x: MARGIN,
     y: 730,
     size: 25,
     font: bold,
     color: NAVY,
   });
-  let summaryY = drawLines(
-    summary,
-    wrapText(plan.executiveSummary, regular, 11, CONTENT_WIDTH),
+  drawLines(
+    firstSummaryPage,
+    summaryLines.slice(0, 23),
     { x: MARGIN, y: 688, font: regular, size: 11, lineHeight: 17, color: INK },
   );
-  summaryY -= 24;
-  summary.drawRectangle({
+  firstSummaryPage.drawRectangle({
     x: MARGIN,
-    y: Math.max(90, summaryY - 128),
+    y: 90,
     width: CONTENT_WIDTH,
     height: 128,
     color: SOFT,
     borderColor: LINE,
     borderWidth: 0.5,
   });
-  summary.drawText("TRACE DE LA MÉMOIRE", {
+  firstSummaryPage.drawText("TRACE DE LA MÉMOIRE", {
     x: MARGIN + 18,
-    y: summaryY - 28,
+    y: 186,
     size: 7.5,
     font: bold,
     color: GREEN,
   });
   drawLines(
-    summary,
+    firstSummaryPage,
     wrapText(
       sourceIds.length
         ? `${sourceIds.length} sources ont été retenues par OPS pour construire ce document. Elles sont listées dans le registre final.`
@@ -275,10 +293,33 @@ export async function POST(request: Request) {
       9,
       CONTENT_WIDTH - 36,
     ),
-    { x: MARGIN + 18, y: summaryY - 55, font: regular, size: 9, lineHeight: 14, color: MUTED },
+    { x: MARGIN + 18, y: 159, font: regular, size: 9, lineHeight: 14, color: MUTED },
   );
 
+  let summaryOffset = 23;
   let pageNumber = 3;
+  while (summaryOffset < summaryLines.length) {
+    const summaryPage = pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
+    drawPageChrome(summaryPage, regular, bold, "Synthèse exécutive", pageNumber++);
+    summaryPage.drawText("Synthèse exécutive — suite", {
+      x: MARGIN,
+      y: 730,
+      size: 22,
+      font: bold,
+      color: NAVY,
+    });
+    const chunk = summaryLines.slice(summaryOffset, summaryOffset + 36);
+    drawLines(summaryPage, chunk, {
+      x: MARGIN,
+      y: 688,
+      font: regular,
+      size: 11,
+      lineHeight: 17,
+      color: INK,
+    });
+    summaryOffset += chunk.length;
+  }
+
   let contentPage: PDFPage | null = null;
   let y = 0;
   const newContentPage = (label: string) => {

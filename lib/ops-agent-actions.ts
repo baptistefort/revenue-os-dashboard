@@ -1,9 +1,11 @@
 import { z } from "zod";
 import { normalizeMemoryQuery } from "@/lib/ops-memory";
 import {
+  resolveOpsDemoVaultRoot,
   writeObsidianRecord,
   type ObsidianWriteResult,
 } from "@/lib/obsidian-write";
+import { projectCentralMemoryRecordToObsidian } from "@/lib/central-memory/obsidian-projection";
 import {
   executeControlledOpsAction,
   type ControlledActionProjectionContext,
@@ -325,6 +327,12 @@ export async function persistOpsAgentAction(
     approvedBy: "Marie Delmas",
     projectToObsidian: (candidate, context) => (
       projectOpsAgentActionToObsidian(candidate as OpsAgentAction, context)
+    ),
+    projectCentralRecordToObsidian: async (context) => (
+      projectCentralMemoryRecordToObsidian({
+        vaultRoot: await resolveOpsDemoVaultRoot(),
+        recordKey: context.recordId,
+      })
     ),
   });
   return result.projection;

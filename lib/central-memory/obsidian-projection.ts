@@ -72,6 +72,29 @@ export type CentralObsidianProjectionOptions = {
   organizationSlug?: string;
 };
 
+export type CentralObsidianRecordProjectionOptions = CentralObsidianProjectionOptions & {
+  /** Public OPS identifier (for example OPP-…, TASK-… or EMAIL-SENT-…). */
+  recordKey: string;
+};
+
+export type CentralObsidianRecordProjectionResult = {
+  organizationId: string;
+  organizationSlug: string;
+  root: string;
+  recordKey: string;
+  entityKey: string;
+  relativePath: string;
+  created: boolean;
+  updated: boolean;
+  unchanged: boolean;
+  deleted: string[];
+};
+
+// UI mutations can arrive concurrently (for example an email and a planning
+// task created from the same agent turn). Serialising the tiny manifest update
+// avoids losing one of the two paths without forcing a global reprojection.
+let incrementalProjectionQueue = Promise.resolve();
+
 function sha256(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -403,6 +426,229 @@ async function fetchRelations(queryable: SqlQueryable, organizationId: string, e
       AND object.id = ANY($2::uuid[])
     ORDER BY subject.canonical_key, relations.predicate, object.canonical_key
   `, [organizationId, entityIds]);
+}
+
+async function fetchProjectionEntityByRecordKey(
+  queryable: SqlQueryable,
+  organizationId: string,
+  recordKey: string,
+) {
+  return queryable.query<ProjectionEntityRow>(`
+    SELECT
+      entities.id,
+      entities.canonical_key,
+      entities.entity_type,
+      entities.display_name,
+      entities.summary,
+      entities.attributes,
+      entities.confidence,
+      entities.status,
+      entities.first_seen_at,
+      entities.last_seen_at,
+      COALESCE(source_objects.source_type, source_events.source_type) AS source_type,
+      COALESCE(source_objects.source_id, source_events.source_id) AS source_id,
+      source_objects.version AS source_version,
+      COALESCE(source_objects.source_updated_at, source_events.occurred_at, entities.last_seen_at) AS source_updated_at
+    FROM ops_memory.entities
+    LEFT JOIN ops_memory.source_objects ON source_objects.id = entities.source_object_id
+    LEFT JOIN ops_memory.source_events ON source_events.id = entities.source_event_id
+    WHERE entities.organization_id = $1
+      AND entities.deleted_at IS NULL
+      AND (
+        lower(entities.canonical_key) = lower($2)
+        OR upper(COALESCE(entities.attributes ->> 'central_record_id', '')) = upper($2)
+        OR upper(COALESCE(entities.attributes ->> 'id', '')) = upper($2)
+        OR upper(COALESCE(source_objects.source_id, '')) = upper($2)
+      )
+    ORDER BY
+      CASE entities.entity_type
+        WHEN 'organization' THEN 0
+        WHEN 'client' THEN 1
+        WHEN 'opportunity' THEN 2
+        WHEN 'project' THEN 3
+        WHEN 'task' THEN 4
+        WHEN 'email-thread' THEN 5
+        ELSE 6
+      END,
+      entities.last_seen_at DESC
+    LIMIT 1
+  `, [organizationId, recordKey]);
+}
+
+async function fetchRelationsForEntity(
+  queryable: SqlQueryable,
+  organizationId: string,
+  entityId: string,
+) {
+  return queryable.query<ProjectionRelationRow>(`
+    SELECT
+      relations.id,
+      subject.id AS subject_id,
+      subject.canonical_key AS subject_key,
+      subject.display_name AS subject_name,
+      relations.predicate,
+      object.id AS object_id,
+      object.canonical_key AS object_key,
+      object.display_name AS object_name,
+      relations.confidence,
+      relations.properties,
+      relations.observed_at
+    FROM ops_memory.relations
+    JOIN ops_memory.entities subject ON subject.id = relations.subject_entity_id
+    JOIN ops_memory.entities object ON object.id = relations.object_entity_id
+    WHERE relations.organization_id = $1
+      AND relations.deleted_at IS NULL
+      AND subject.deleted_at IS NULL
+      AND object.deleted_at IS NULL
+      AND (relations.subject_entity_id = $2 OR relations.object_entity_id = $2)
+    ORDER BY relations.observed_at DESC, relations.id
+  `, [organizationId, entityId]);
+}
+
+async function fetchProjectionEntitiesById(
+  queryable: SqlQueryable,
+  organizationId: string,
+  entityIds: string[],
+) {
+  if (!entityIds.length) return { rows: [] as ProjectionEntityRow[] };
+  return queryable.query<ProjectionEntityRow>(`
+    SELECT
+      entities.id,
+      entities.canonical_key,
+      entities.entity_type,
+      entities.display_name,
+      entities.summary,
+      entities.attributes,
+      entities.confidence,
+      entities.status,
+      entities.first_seen_at,
+      entities.last_seen_at,
+      COALESCE(source_objects.source_type, source_events.source_type) AS source_type,
+      COALESCE(source_objects.source_id, source_events.source_id) AS source_id,
+      source_objects.version AS source_version,
+      COALESCE(source_objects.source_updated_at, source_events.occurred_at, entities.last_seen_at) AS source_updated_at
+    FROM ops_memory.entities
+    LEFT JOIN ops_memory.source_objects ON source_objects.id = entities.source_object_id
+    LEFT JOIN ops_memory.source_events ON source_events.id = entities.source_event_id
+    WHERE entities.organization_id = $1
+      AND entities.deleted_at IS NULL
+      AND entities.id = ANY($2::uuid[])
+    ORDER BY entities.canonical_key
+  `, [organizationId, entityIds]);
+}
+
+function targetIdentitySuffix(entity: ProjectionEntityRow) {
+  return `-${sha256(`${entity.entity_type}:${entity.canonical_key}`).slice(0, 8)}.md`;
+}
+
+/**
+ * Projects one freshly mutated central entity into the managed `Central/`
+ * vault. It reads only that entity, its direct relations and their labels,
+ * then atomically extends the existing manifest. This is the hot-path used by
+ * UI/agent mutations; the full projector remains the deployment/recovery path.
+ */
+export async function projectCentralMemoryRecordToObsidian(
+  options: CentralObsidianRecordProjectionOptions,
+): Promise<CentralObsidianRecordProjectionResult> {
+  const queued = incrementalProjectionQueue.then(async () => {
+    const recordKey = options.recordKey.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9-]{5,79}$/.test(recordKey)) {
+      throw new Error("Invalid central-memory record key.");
+    }
+    const requestedVaultRoot = path.resolve(options.vaultRoot);
+    if (requestedVaultRoot === path.parse(requestedVaultRoot).root) {
+      throw new Error("Refusing to project central memory into a filesystem root.");
+    }
+    await fs.mkdir(requestedVaultRoot, { recursive: true });
+    const vaultRoot = await fs.realpath(requestedVaultRoot);
+    const managedRoot = path.resolve(vaultRoot, MANAGED_DIRECTORY);
+    if (!inside(vaultRoot, managedRoot) || managedRoot === vaultRoot) {
+      throw new Error("Invalid Obsidian central-memory projection root.");
+    }
+    await ensureSafeDirectory(vaultRoot, managedRoot);
+
+    const queryable = options.queryable ?? getCentralMemoryPool();
+    const organization = await resolveCentralMemoryOrganization(queryable, options.organizationSlug);
+    if (!organization) throw new Error("Central memory organization was not found.");
+    const entityResult = await fetchProjectionEntityByRecordKey(queryable, organization.id, recordKey);
+    const entity = entityResult.rows[0];
+    if (!entity || TRANSIENT_ENTITY_TYPES.has(entity.entity_type)) {
+      throw new Error(`No durable central-memory entity found for ${recordKey}.`);
+    }
+
+    const relationResult = await fetchRelationsForEntity(queryable, organization.id, entity.id);
+    const relatedIds = [...new Set(relationResult.rows.flatMap((relation) => (
+      [relation.subject_id, relation.object_id]
+    )))];
+    const relatedResult = await fetchProjectionEntitiesById(queryable, organization.id, relatedIds);
+    const paths = new Map(relatedResult.rows.map((candidate) => [candidate.id, entityFile(candidate)]));
+    paths.set(entity.id, entityFile(entity));
+    const relativePath = paths.get(entity.id)!;
+    const content = renderEntityNote({
+      entity,
+      organization,
+      paths,
+      relations: relationResult.rows,
+    });
+    const projectionResult: CentralObsidianProjectionResult = {
+      organizationId: organization.id,
+      organizationSlug: organization.slug,
+      root: managedRoot,
+      entities: 1,
+      relations: relationResult.rows.length,
+      excludedTransientEntities: 0,
+      created: [],
+      updated: [],
+      unchanged: [],
+      deleted: [],
+    };
+    await writeIfChanged(managedRoot, relativePath, content, projectionResult);
+
+    const previousManifest = await readManifest(managedRoot);
+    const files = new Set(
+      previousManifest?.organizationId === organization.id
+        ? previousManifest.files.map(normalizeRelativeFile)
+        : [],
+    );
+    const identitySuffix = targetIdentitySuffix(entity);
+    for (const previousFile of [...files]) {
+      if (previousFile === relativePath || !previousFile.endsWith(identitySuffix)) continue;
+      const safe = managedTarget(managedRoot, previousFile);
+      if (await isManagedProjectionFile(safe.target)) {
+        await fs.unlink(safe.target).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+        projectionResult.deleted.push(safe.relative);
+      }
+      files.delete(previousFile);
+    }
+    files.add(relativePath);
+    const manifest: ProjectionManifest = {
+      schemaVersion: MANIFEST_SCHEMA_VERSION,
+      projector: PROJECTOR_NAME,
+      organizationId: organization.id,
+      organizationSlug: organization.slug,
+      files: [...files].sort(),
+    };
+    await atomicWrite(
+      path.join(managedRoot, MANIFEST_NAME),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+    );
+    return {
+      organizationId: organization.id,
+      organizationSlug: organization.slug,
+      root: managedRoot,
+      recordKey,
+      entityKey: entity.canonical_key,
+      relativePath,
+      created: projectionResult.created.includes(relativePath),
+      updated: projectionResult.updated.includes(relativePath),
+      unchanged: projectionResult.unchanged.includes(relativePath),
+      deleted: projectionResult.deleted,
+    };
+  });
+  incrementalProjectionQueue = queued.then(() => undefined, () => undefined);
+  return queued;
 }
 
 export async function projectCentralMemoryToObsidian(

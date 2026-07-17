@@ -740,6 +740,33 @@ export function generateAtelierBeaumarchaisUniverse(options: UniverseOptions = {
         metric(`${prefix}-PIPE-${month}`, domain, "pipeline", month, pipeline, "EUR", source, seed, {}, asOf.slice(0, 10)),
         metric(`${prefix}-CONV-${month}`, domain, "conversions", month, Math.max(0, Math.round(leads * 0.32)), "count", source, seed, {}, asOf.slice(0, 10)),
       );
+
+      // Les canaux ne partagent pas tous le même entonnoir. Ces observations
+      // spécifiques évitent d'inventer des valeurs dans l'API de pilotage et
+      // conservent une preuve source distincte pour chaque métrique affichée.
+      if (domain === "google-ads") {
+        metrics.push(
+          metric(
+            `GOOGLE-ADS-CLICKS-${month}`,
+            domain,
+            "clicks",
+            month,
+            241 + monthIndex * 17,
+            "count",
+            source,
+            seed,
+            { network: "search" },
+            asOf.slice(0, 10),
+          ),
+        );
+      }
+      if (domain === "instagram") {
+        metrics.push(
+          metric(`INSTAGRAM-VIEWS-${month}`, domain, "views", month, 8_500 + monthIndex * 900, "count", source, seed, { format: "organic-content" }, asOf.slice(0, 10)),
+          metric(`INSTAGRAM-SAVES-${month}`, domain, "saves", month, 238 + monthIndex * 34, "count", source, seed, { format: "organic-content" }, asOf.slice(0, 10)),
+          metric(`INSTAGRAM-OPPORTUNITIES-${month}`, domain, "opportunities", month, monthIndex < 5 ? 0 : 1, "count", source, seed, { attribution: "crm-confirmed" }, asOf.slice(0, 10)),
+        );
+      }
     });
 
     const progress = monthIndex / 11;

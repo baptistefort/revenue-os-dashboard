@@ -1688,7 +1688,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
                   ? "priority"
                   : "to_process";
             const tag = sent
-              ? "Envoyé"
+              ? "En boîte d’envoi"
               : classificationValue === "priority"
                 ? "Prioritaire"
                 : classificationValue === "question"
@@ -1725,7 +1725,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
           ]);
         })
         .catch(() => {
-          // La boîte de démonstration locale reste utilisable.
+          // La boîte contrôlée locale reste utilisable.
         });
     };
     const refresh = (event: Event) => {
@@ -1745,10 +1745,11 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
     const classificationMatches = !classification || thread.classification === classification;
     return folderMatches && classificationMatches;
   });
-  const selected = threads.find((thread) => thread.id === selectedId)
-    ?? filteredThreads[0]
-    ?? threads[0];
-  const reply = `Bonjour ${selected.sender.split(" ")[0]}, merci pour votre retour. Je note le traitement cette semaine et reste disponible si votre équipe a besoin d’un document complémentaire.`;
+  const selected = filteredThreads.find((thread) => thread.id === selectedId)
+    ?? filteredThreads[0];
+  const reply = selected
+    ? `Bonjour ${selected.sender.split(" ")[0]}, merci pour votre retour. Je note le traitement cette semaine et reste disponible si votre équipe a besoin d’un document complémentaire.`
+    : "";
 
   useEffect(() => {
     if (filteredThreads.length && !filteredThreads.some((thread) => thread.id === selectedId)) {
@@ -1782,7 +1783,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
         subject: payload.subject,
         preview: payload.body.replace(/\s+/g, " ").slice(0, 92),
         time: "À l’instant",
-        tag: "Envoyé",
+        tag: "En boîte d’envoi",
         unread: false,
         linked: payload.linked?.[0] ?? payload.threadId ?? "ORG-001",
         folder: "sent",
@@ -1794,7 +1795,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
       setSelectedId(outgoing.id);
       setFolder("sent");
       setClassification(null);
-      setSendStatus("Envoyé et ajouté à la mémoire Obsidian.");
+      setSendStatus("Remis à la boîte d’envoi contrôlée et ajouté à la mémoire centrale.");
       return true;
     } catch {
       setSendStatus("Le message n’a pas pu être remis à la boîte d’envoi.");
@@ -1808,7 +1809,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
     { id: "to_process" as const, label: "À traiter", icon: "mail" as IconName },
     { id: "priority" as const, label: "Prioritaires", icon: "target" as IconName },
     { id: "waiting" as const, label: "En attente", icon: "clock" as IconName },
-    { id: "sent" as const, label: "Envoyés", icon: "send" as IconName },
+    { id: "sent" as const, label: "Boîte d’envoi", icon: "send" as IconName },
     { id: "all" as const, label: "Tous les emails", icon: "document" as IconName },
   ];
   const classifications: Array<{ id: EmailThreadView["classification"]; label: string }> = [
@@ -1866,7 +1867,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
               <button aria-label="Analyser et filtrer cette boîte" onClick={() => openAgent(`Analyse et filtre les emails de la vue ${folder}`)}><OpsIcon name="filter" size={15} /></button>
             </div>
             {filteredThreads.map((thread) => (
-              <button key={thread.id} onClick={() => selectThread(thread.id)} className={`mail-thread ${selected.id === thread.id ? "active" : ""}`}>
+              <button key={thread.id} onClick={() => selectThread(thread.id)} className={`mail-thread ${selected?.id === thread.id ? "active" : ""}`}>
                 <span className="contact-avatar">{thread.sender.split(" ").map((part) => part[0]).join("").slice(0, 2)}</span>
                 <span><strong>{thread.sender}</strong><small>{thread.company}</small><b>{thread.subject}</b><p>{thread.preview}</p><em>{thread.tag}</em></span>
                 <time>{thread.time}</time>{thread.unread && <i className="unread-dot" />}
@@ -1874,7 +1875,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
             ))}
             {!filteredThreads.length ? <div className="mail-empty">Aucun message dans cette vue.</div> : null}
           </div>
-          <article className="mail-reader">
+          {selected ? <article className="mail-reader">
             <header>
               <div><span>{selected.tag}</span><h2>{selected.subject}</h2><p>{selected.sender} · {selected.company}</p></div>
               <div>
@@ -1896,7 +1897,7 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
                     className="dark"
                     disabled={sending}
                     onClick={() => void sendEmail({
-                      to: selected.recipient || `${selected.sender.split(" ")[0].toLocaleLowerCase("fr")}@exemple.fr`,
+                      to: selected.recipient || `${selected.sender.split(" ")[0].toLocaleLowerCase("fr")}@client.example`,
                       company: selected.company,
                       subject: /^re\s*:/i.test(selected.subject) ? selected.subject : `Re: ${selected.subject}`,
                       body: reply,
@@ -1904,18 +1905,18 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
                       linked: [selected.id, selected.linked],
                     })}
                   >
-                    {sending ? "Envoi…" : "Valider et envoyer"}
+                    {sending ? "Placement…" : "Placer en boîte d’envoi"}
                   </button>
                 </footer>
               </div>
-            ) : <div className="mail-sent-state"><OpsIcon name="check" size={15} /> Message envoyé et archivé dans Obsidian.</div>}
-          </article>
+            ) : <div className="mail-sent-state"><OpsIcon name="check" size={15} /> Message remis à la boîte d’envoi et archivé dans la mémoire.</div>}
+          </article> : <article className="mail-reader mail-reader-empty"><div><OpsIcon name="mail" size={24} /><strong>Aucun message dans cette vue</strong><p>Choisissez une autre boîte ou une autre classification.</p></div></article>}
         </section>
       </div>
       <OpsModal
         open={composeOpen}
         title="Nouveau message"
-        description="Le message est remis à la boîte d’envoi puis inscrit dans la mémoire de l’entreprise."
+        description="Le message est préparé dans une boîte d’envoi contrôlée et inscrit dans la mémoire. Cette version ne l’expédie pas hors d’OPS."
         onClose={() => setComposeOpen(false)}
       >
         <form
@@ -1929,11 +1930,11 @@ function EmailsPage({ openAgent }: { openAgent: OpenAgent }) {
             });
           }}
         >
-          <label><span>Destinataire</span><input required value={compose.to} onChange={(event) => setCompose((current) => ({ ...current, to: event.target.value }))} placeholder="nom@entreprise.fr" /></label>
+          <label><span>Destinataire</span><input required value={compose.to} onChange={(event) => setCompose((current) => ({ ...current, to: event.target.value }))} placeholder="nom@client.example" /></label>
           <label><span>Entreprise</span><input value={compose.company} onChange={(event) => setCompose((current) => ({ ...current, company: event.target.value }))} placeholder="Entreprise liée" /></label>
           <label className="full"><span>Objet</span><input required value={compose.subject} onChange={(event) => setCompose((current) => ({ ...current, subject: event.target.value }))} placeholder="Objet du message" /></label>
           <label className="full"><span>Message</span><textarea required rows={8} value={compose.body} onChange={(event) => setCompose((current) => ({ ...current, body: event.target.value }))} placeholder="Écrivez votre message…" /></label>
-          <footer className="full"><span>{sendStatus}</span><button type="button" onClick={() => openAgent(`Aide-moi à rédiger un email avec cet objet : ${compose.subject}`)}><OpsIcon name="spark" size={15} /> Rédiger avec OPS</button><button className="primary-button" disabled={sending} type="submit">{sending ? "Envoi…" : "Valider et envoyer"}</button></footer>
+          <footer className="full"><span>{sendStatus}</span><button type="button" onClick={() => openAgent(`Aide-moi à rédiger un email avec cet objet : ${compose.subject}`)}><OpsIcon name="spark" size={15} /> Rédiger avec OPS</button><button className="primary-button" disabled={sending} type="submit">{sending ? "Placement…" : "Placer en boîte d’envoi"}</button></footer>
         </form>
       </OpsModal>
     </>
@@ -1995,7 +1996,7 @@ function DocumentsPage({ openAgent, generatedDocuments, preferredDocumentId, onD
       const imported = storedDocumentToUi(payload.document);
       onDocumentImported?.(imported);
       setSelectedId(imported.id);
-      setImportStatus(`${file.name} est archivé dans Documents et relié à Obsidian.`);
+      setImportStatus(`${file.name} est archivé dans Documents et relié à la mémoire.`);
     } catch {
       setImportStatus("Le PDF n’a pas pu être importé. Vérifiez qu’il est valide et inférieur à 15 Mo.");
     } finally {
@@ -2009,7 +2010,7 @@ function DocumentsPage({ openAgent, generatedDocuments, preferredDocumentId, onD
       <PageHeading page="documents" action={<><input ref={fileInputRef} hidden accept="application/pdf,.pdf" type="file" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importPdf(file); }} /><button className="primary-button" disabled={importing} onClick={() => fileInputRef.current?.click()}><OpsIcon name="plus" size={16} /> {importing ? "Import…" : "Importer"}</button></>} />
       <div className="documents-layout">
         <section className="panel documents-panel">
-          <div className="panel-title"><div><span>{allDocuments.length} documents disponibles</span><small>{importStatus || `${allDocuments.length} éléments indexés dans Obsidian · ${pdfCount} PDF ouvrables`}</small></div><div className="table-actions"><button className={searchOpen ? "active" : ""} onClick={() => setSearchOpen((current) => !current)}><OpsIcon name="search" size={15} /> Rechercher</button><button onClick={cycleType}><OpsIcon name="filter" size={15} /> {typeFilter === "Tous" ? "Filtrer" : typeFilter}</button></div></div>
+          <div className="panel-title"><div><span>{allDocuments.length} documents disponibles</span><small>{importStatus || `${allDocuments.length} éléments indexés dans la mémoire · ${pdfCount} PDF ouvrables`}</small></div><div className="table-actions"><button className={searchOpen ? "active" : ""} onClick={() => setSearchOpen((current) => !current)}><OpsIcon name="search" size={15} /> Rechercher</button><button onClick={cycleType}><OpsIcon name="filter" size={15} /> {typeFilter === "Tous" ? "Filtrer" : typeFilter}</button></div></div>
           {searchOpen ? <div className="entity-search"><OpsIcon name="search" size={15} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Titre, identifiant, client ou responsable…" /></div> : null}
           <div className="entity-table documents-table"><div className="table-head"><span>Document</span><span>Type</span><span>Lié à</span><span>Responsable</span><span>Mise à jour</span><span>État OPS</span></div>{visibleDocuments.map((document) => <button className={`table-row ${selected?.id === document.id ? "selected" : ""}`} onClick={() => setSelectedId(document.id)} key={document.id}><span><i className="doc-type"><OpsIcon name={document.generated ? "download" : "document"} size={16} /></i><span><strong>{document.name}</strong><small>{document.id}</small></span></span><span>{document.type}</span><span>{document.linked}</span><span>{document.owner}</span><span>{document.updated}</span><span className={`doc-status status-${document.status.toLocaleLowerCase("fr").replace("à ", "").replaceAll(" ", "-")}`}>{document.status}</span></button>)}{!visibleDocuments.length ? <div className="entity-empty">Aucun document ne correspond à cette vue.</div> : null}</div>
         </section>
@@ -2142,7 +2143,7 @@ function ClientsPage({ openAgent }: { openAgent: OpenAgent }) {
       setEditingId(null);
       setModalOpen(false);
     } catch {
-      setStatus("Le client n’a pas pu être inscrit dans Obsidian.");
+      setStatus("Le client n’a pas pu être inscrit dans la mémoire centrale.");
     } finally {
       setSaving(false);
     }
@@ -2178,7 +2179,7 @@ function ClientsPage({ openAgent }: { openAgent: OpenAgent }) {
           </aside> : null}
         </div>
       </div>
-      <OpsModal open={modalOpen} title={editingId ? "Modifier le client" : "Nouveau client"} description="Le compte est écrit immédiatement dans la mémoire Obsidian et devient interrogeable par OPS." onClose={() => { setModalOpen(false); setEditingId(null); }}>
+      <OpsModal open={modalOpen} title={editingId ? "Modifier le client" : "Nouveau client"} description="Le compte est écrit immédiatement dans la mémoire centrale et devient interrogeable par OPS." onClose={() => { setModalOpen(false); setEditingId(null); }}>
         <form className="ops-form" onSubmit={(event) => { event.preventDefault(); void saveClient(); }}>
           <label className="full"><span>Entreprise</span><input required value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} placeholder="Ex. Hôtel Voltaire" /></label>
           <label><span>Statut</span><select value={draft.status} onChange={(event) => setDraft((current) => ({ ...current, status: event.target.value as ClientView["status"] }))}>{segments.slice(1).map((value) => <option key={value}>{value}</option>)}</select></label>
@@ -2303,7 +2304,7 @@ function PlanningPage({ openAgent }: { openAgent: OpenAgent }) {
       }, ...current.filter((task) => task.id !== saved.id)]);
       setSlotDraft(null);
     } catch {
-      setStatus("Le créneau n’a pas pu être inscrit dans Obsidian.");
+      setStatus("Le créneau n’a pas pu être inscrit dans la mémoire centrale.");
     } finally {
       setSaving(false);
     }
@@ -2359,7 +2360,7 @@ function PlanningPage({ openAgent }: { openAgent: OpenAgent }) {
           <div className="planning-alert"><span><OpsIcon name="spark" size={17} /></span><div><strong>Risque détecté jeudi après-midi</strong><p>Thomas est affecté simultanément à Rivoli et à la calibration CNC. Hugo peut reprendre le contrôle qualité avec la procédure existante.</p></div><button onClick={() => openAgent("Que se passe-t-il si Thomas est absent ?")}>Examiner</button></div>
         </section>
       </div>
-      <OpsModal open={Boolean(slotDraft)} title={slotDraft?.id ? "Modifier le créneau" : "Planifier un créneau"} description="L’affectation est écrite dans Obsidian et devient immédiatement visible par OPS." onClose={() => setSlotDraft(null)}>
+      <OpsModal open={Boolean(slotDraft)} title={slotDraft?.id ? "Modifier le créneau" : "Planifier un créneau"} description="L’affectation est écrite dans la mémoire centrale et devient immédiatement visible par OPS." onClose={() => setSlotDraft(null)}>
         {slotDraft ? <form className="ops-form" onSubmit={(event) => { event.preventDefault(); void saveSlot(); }}>
           <label className="full"><span>Intervention</span><input required value={slotDraft.title} onChange={(event) => setSlotDraft((current) => current ? ({ ...current, title: event.target.value }) : current)} /></label>
           <label><span>Projet</span><input disabled value={slotDraft.project} /></label>
@@ -2460,7 +2461,7 @@ function CRMPage({ openAgent, createRequest = 0 }: {
       setEditingId(null);
       setModalOpen(false);
     } catch {
-      setStatus("L’opportunité n’a pas pu être inscrite dans Obsidian.");
+      setStatus("L’opportunité n’a pas pu être inscrite dans la mémoire centrale.");
     } finally {
       setSaving(false);
     }
@@ -2505,7 +2506,7 @@ function CRMPage({ openAgent, createRequest = 0 }: {
           })}
         </section>
       </div>
-      <OpsModal open={modalOpen} title={editingId ? "Modifier l’opportunité" : "Nouvelle opportunité"} description="La fiche est immédiatement écrite dans le vault Obsidian et devient interrogeable par OPS." onClose={() => { setModalOpen(false); setEditingId(null); }}>
+      <OpsModal open={modalOpen} title={editingId ? "Modifier l’opportunité" : "Nouvelle opportunité"} description="La fiche est immédiatement écrite dans la mémoire centrale et devient interrogeable par OPS." onClose={() => { setModalOpen(false); setEditingId(null); }}>
         <form className="ops-form" onSubmit={(event) => { event.preventDefault(); void saveOpportunity(); }}>
           <label className="full"><span>Affaire</span><input required value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} placeholder="Ex. Rénovation Hôtel Voltaire" /></label>
           <label><span>Montant (€)</span><input min="0" required type="number" value={draft.amount} onChange={(event) => setDraft((current) => ({ ...current, amount: event.target.value }))} /></label>

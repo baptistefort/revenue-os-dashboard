@@ -67,6 +67,16 @@ test("l'univers couvre douze mois et tous les volumes métier", () => {
   assert.ok(slackDocuments.length >= 60, "synthèses Slack client et direction");
   assert.ok(universe.documents.some((item) => item.id === "NTN-STRAT-SEO-Q3" && /4 790/.test(item.summary)));
   assert.ok(universe.documents.some((item) => item.id === "SLK-FINANCE-20260716" && /12 400/.test(item.summary)));
+
+  const currentAcquisition = new Map(
+    universe.metrics
+      .filter((item) => item.periodStart === "2026-07-01")
+      .map((item) => [`${item.domain}.${item.metric}`, item.value]),
+  );
+  assert.equal(currentAcquisition.get("google-ads.clicks"), 428);
+  assert.equal(currentAcquisition.get("instagram.views"), 18_400);
+  assert.equal(currentAcquisition.get("instagram.saves"), 612);
+  assert.equal(currentAcquisition.get("instagram.opportunities"), 1);
 });
 
 test("les agrégats métier correspondent exactement aux écrans OPS", () => {

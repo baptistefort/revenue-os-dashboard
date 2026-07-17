@@ -108,6 +108,16 @@ npm run build
 Le déploiement Docker/VPS complet est documenté dans
 [`deploy/README.md`](deploy/README.md).
 
+Le cockpit et toutes les API coûteuses ou mutantes sont fermés par
+authentification HTTP serveur. Les deux valeurs suivantes sont obligatoires dans
+le fichier `.env.production` du VPS ; leur absence fait volontairement échouer
+les accès protégés en production :
+
+```bash
+OPS_ACCESS_USERNAME=ops
+OPS_ACCESS_PASSWORD=mot_de_passe_long_et_aleatoire
+```
+
 ## Architecture
 
 - `components/ops-app.tsx` — shell et dix espaces métier
@@ -129,6 +139,7 @@ Le déploiement Docker/VPS complet est documenté dans
 - Ne jamais préfixer la clé Fish Audio avec `NEXT_PUBLIC_`.
 - Ne jamais committer `.env.local`.
 - Ne jamais exposer directement le port OpenCode au navigateur.
+- Protéger `/dashboard` et `/api/*` avec `OPS_ACCESS_USERNAME` et `OPS_ACCESS_PASSWORD`.
 - Les outils OpenCode sont en lecture seule ; les outils système, shell et écriture sont refusés.
 - La route Obsidian n’expose que les métadonnées nécessaires au graphe, pas le contenu brut complet du coffre.
 - Toute action vers un client reste confinée à la boîte d’envoi contrôlée et soumise à validation.

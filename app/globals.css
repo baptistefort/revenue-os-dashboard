@@ -541,6 +541,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button
 button:disabled { cursor: wait; opacity: .55; }
 
 .mail-empty { min-height: 180px; padding: 28px; display: grid; place-items: center; color: #8a9198; font-size: 10px; text-align: center; }
+.mail-reader-empty { display: grid; place-items: center; padding: 32px; color: var(--muted); text-align: center; }
+.mail-reader-empty > div { display: grid; justify-items: center; gap: 10px; max-width: 260px; }
+.mail-reader-empty strong { color: var(--ink); font-size: 14px; font-weight: 620; }
+.mail-reader-empty p { margin: 0; font-size: 10px; line-height: 1.55; }
 .mail-preserved-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .mail-sent-state { margin: 0 22px 24px; padding: 13px 14px; display: flex; align-items: center; gap: 7px; color: #47705e; background: #f3f8f5; border: 1px solid #dce9e1; border-radius: 11px; font-size: 9px; }
 

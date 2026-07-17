@@ -132,12 +132,16 @@ export function centralMemoryRequestedDays(message: string) {
   const days = new Set<string>();
   let hasExplicitNamedDay = false;
   const withoutBeforeYesterday = normalized.replace(/\bavant[- ]hier\b/g, " ");
-  if (/\bavant[- ]hier\b/.test(normalized)) days.add(shiftedDay(-2));
-  if (/\b(?:hier|veille|jour d avant)\b/.test(withoutBeforeYesterday)) days.add(shiftedDay(-1));
-  if (/\b(?:aujourd ?hui|ce jour|du jour)\b/.test(normalized)) days.add(shiftedDay(0));
+  const asksBeforeYesterday = /\bavant[- ]hier\b/.test(normalized);
+  const asksPreviousDay = /\b(?:hier|veille|jour d avant)\b/.test(withoutBeforeYesterday);
+  const asksCurrentDay = /\b(?:aujourd ?hui|ce jour|du jour)\b/.test(normalized);
+  const explicitDays: string[] = [];
   for (const match of message.matchAll(/\b(20\d{2})-(\d{2})-(\d{2})\b/g)) {
     const candidate = `${match[1]}-${match[2]}-${match[3]}`;
-    if (!Number.isNaN(Date.parse(`${candidate}T12:00:00Z`))) days.add(candidate);
+    if (!Number.isNaN(Date.parse(`${candidate}T12:00:00Z`))) {
+      days.add(candidate);
+      explicitDays.push(candidate);
+    }
   }
   const fallbackYear = businessDate().slice(0, 4);
   for (const match of normalized.matchAll(/\b(\d{1,2})\s+(janvier|fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|novembre|decembre)(?:\s+(20\d{2}))?\b/g)) {
@@ -148,6 +152,7 @@ export function centralMemoryRequestedDays(message: string) {
     const candidate = `${year}-${month}-${String(day).padStart(2, "0")}`;
     if (!Number.isNaN(Date.parse(`${candidate}T12:00:00Z`))) {
       days.add(candidate);
+      explicitDays.push(candidate);
       hasExplicitNamedDay = true;
     }
   }
@@ -157,7 +162,21 @@ export function centralMemoryRequestedDays(message: string) {
       if (month) days.add(`${match[2] || fallbackYear}-${month}`);
     }
   }
-  return [...days];
+
+  // Dans « compare le 16 juillet à la veille », « la veille » désigne le
+  // 15 juillet, et non la veille de la date système. Une date explicite est
+  // donc l'ancre prioritaire des expressions relatives de comparaison.
+  const anchor = explicitDays.at(-1);
+  const relativeTo = (offset: number) => {
+    if (!anchor) return shiftedDay(offset);
+    const [year, month, day] = anchor.split("-").map(Number);
+    return new Date(Date.UTC(year, month - 1, day + offset, 12)).toISOString().slice(0, 10);
+  };
+  if (asksBeforeYesterday) days.add(relativeTo(-2));
+  if (asksPreviousDay) days.add(relativeTo(-1));
+  if (asksCurrentDay) days.add(shiftedDay(0));
+
+  return [...days].sort();
 }
 
 function preferredSources(message: string) {

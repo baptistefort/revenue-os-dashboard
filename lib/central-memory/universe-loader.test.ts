@@ -76,6 +76,7 @@ test("le loader importe atomiquement toutes les couches sans créer d'entité pa
   assert.equal(result.counts.sourceEvents, universe.sourceEvents.length);
   assert.equal(result.counts.sourceObjects, universe.sourceEvents.length);
   assert.equal(result.counts.relations, universe.relations.length);
+  assert.ok(result.counts.facts > 150);
   assert.equal(result.counts.metricObservations, universe.metrics.length);
   assert.equal(result.counts.commitments, universe.commitments.length);
   assert.equal(result.counts.decisions, universe.decisions.length);
@@ -87,16 +88,30 @@ test("le loader importe atomiquement toutes les couches sans créer d'entité pa
   assert.ok(sourceObjects.every((row) => row.source_account_id === "atelier-primary"));
 
   const entities = jsonRows(pool.client.queries, "entities");
+  const entityUpsertSql = pool.client.queries.find((query) => (
+    query.sql.includes("INSERT INTO ops_memory.entities")
+  ))?.sql || "";
   assert.ok(entities.some((row) => row.entity_type === "organization"));
   assert.equal(entities.filter((row) => row.entity_type === "team-member").length, universe.team.length);
   assert.equal(entities.filter((row) => row.entity_type === "email-message").length, 0);
   assert.equal(entities.filter((row) => row.entity_type === "metric").length, 0);
   assert.equal(entities.length, result.counts.entities);
+  assert.match(entityUpsertSql, /controlled_source\.source_type = 'ops_action'/);
+  assert.match(entityUpsertSql, /EXCLUDED\.attributes \|\| current_entity\.attributes/);
 
   const metrics = jsonRows(pool.client.queries, "metric_observations");
   assert.ok(metrics.some((row) => row.metric_key === "seo.impressions"));
   assert.ok(metrics.some((row) => row.metric_key === "finance.gross_margin"));
   assert.ok(metrics.every((row) => typeof row.dimensions_hash === "string" && String(row.dimensions_hash).length === 64));
+
+  const facts = jsonRows(pool.client.queries, "facts");
+  assert.equal(facts.length, result.counts.facts);
+  assert.ok(facts.some((row) => row.fact_key === "client.health_score" && row.value_number !== null));
+  assert.ok(facts.some((row) => row.fact_key === "opportunity.next_step" && typeof row.value_text === "string"));
+  assert.ok(facts.some((row) => row.fact_key === "metric.google-ads.clicks.2026-07-01" && row.value_number === 428));
+  assert.ok(facts.some((row) => row.fact_key === "metric.instagram.views.2026-07-01" && row.value_number === 18_400));
+  assert.ok(facts.every((row) => typeof row.source_id === "string" && String(row.source_id).length > 0));
+  assert.ok(facts.every((row) => [row.value_text, row.value_number, row.value_boolean].filter((value) => value !== null).length === 1));
 });
 
 test("deux chargements identiques produisent exactement les mêmes clés et payloads", async () => {

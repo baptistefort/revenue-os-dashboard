@@ -18,8 +18,8 @@ export function guardPostRequest(request: Request, scope: string, limit: number,
 
   // A browser includes Origin on state-changing fetch requests. Rejecting an
   // absent Origin in production closes the common curl/script bypass while
-  // preserving local tooling during development. Caddy authentication remains
-  // the outer protection for the public demo.
+  // preserving local tooling during development. The application proxy keeps
+  // mutating and costly public routes behind server-side authentication.
   if (!origin && (process.env.NODE_ENV === "production" || process.env.OPS_REQUIRE_ORIGIN === "true")) {
     return Response.json({ error: "origin_required" }, { status: 403 });
   }

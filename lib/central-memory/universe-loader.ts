@@ -47,6 +47,7 @@ export type UniverseLoadCounts = {
   sourceObjects: number;
   entities: number;
   relations: number;
+  facts: number;
   metricObservations: number;
   commitments: number;
   decisions: number;
@@ -231,6 +232,107 @@ function sourceReference(record: MemoryRecord) {
   };
 }
 
+type DeterministicSeedFact = {
+  id: string;
+  subjectKey: string;
+  factType: "attribute" | "commercial" | "operational" | "metric" | "source-summary" | "decision";
+  factKey: string;
+  value: string | number | boolean;
+  unit: string | null;
+  confidence: number;
+  observedAt: string;
+  validFrom: string | null;
+  validTo: string | null;
+  source: BusinessRecord;
+};
+
+/**
+ * Materialises the most useful, atomic assertions from the deterministic
+ * universe. Source objects stay authoritative; each fact keeps the exact
+ * source object/event used to assert it and can therefore be cited by OPS.
+ */
+function deterministicSeedFacts(universe: CompanyMemoryUniverse): DeterministicSeedFact[] {
+  const facts: DeterministicSeedFact[] = [];
+  const push = (
+    source: BusinessRecord,
+    subjectKey: string,
+    factType: DeterministicSeedFact["factType"],
+    key: string,
+    value: DeterministicSeedFact["value"],
+    unit: string | null = null,
+    confidence = 1,
+    validFrom: string | null = source.createdAt,
+    validTo: string | null = null,
+  ) => {
+    facts.push({
+      id: `FACT-${sha256(`${subjectKey}:${key}:${source.id}`).slice(0, 20).toUpperCase()}`,
+      subjectKey,
+      factType,
+      factKey: key,
+      value,
+      unit,
+      confidence,
+      observedAt: source.updatedAt,
+      validFrom,
+      validTo,
+      source,
+    });
+  };
+
+  universe.clients.forEach((client) => {
+    push(client, client.id, "attribute", "client.status", client.status);
+    push(client, client.id, "attribute", "client.health_score", client.healthScore, "score/100");
+  });
+
+  universe.opportunities.forEach((opportunity) => {
+    push(opportunity, opportunity.id, "commercial", "opportunity.stage", opportunity.stage);
+    push(opportunity, opportunity.id, "commercial", "opportunity.amount", opportunity.amountCents / 100, "EUR");
+    push(opportunity, opportunity.id, "commercial", "opportunity.probability", opportunity.probability, "percent");
+    push(opportunity, opportunity.id, "commercial", "opportunity.next_step", opportunity.nextStep);
+  });
+
+  universe.projects.forEach((project) => {
+    push(project, project.id, "operational", "project.status", project.status);
+    push(project, project.id, "operational", "project.progress", project.progressPercent, "percent");
+    push(project, project.id, "operational", "project.budget", project.budgetCents / 100, "EUR");
+    if (project.riskSummary) {
+      push(project, project.id, "operational", "project.risk_summary", project.riskSummary);
+    }
+  });
+
+  const currentMonth = universe.generatedAt.slice(0, 7);
+  universe.metrics
+    .filter((item) => item.periodStart.startsWith(currentMonth) || item.periodStart === item.periodEnd)
+    .forEach((item) => {
+      push(
+        item,
+        universe.tenant.id,
+        "metric",
+        `metric.${item.domain}.${item.metric}.${item.periodStart}`,
+        item.value,
+        item.unit,
+        1,
+        item.periodStart,
+        item.periodEnd,
+      );
+    });
+
+  universe.documents
+    .filter((document) => /^(?:ALERT-|SEO-SNAPSHOT-|FIN-SNAPSHOT-|CRM-SNAPSHOT-|GADS-|NTN-STRAT-)/.test(document.id))
+    .forEach((document) => {
+      push(document, document.id, "source-summary", `document.summary.${document.id}`, document.summary);
+    });
+
+  universe.decisions
+    .filter((decision) => decision.status === "active")
+    .forEach((decision) => {
+      push(decision, decision.id, "decision", "decision.rationale", decision.rationale);
+      push(decision, decision.id, "decision", "decision.outcome", decision.outcome);
+    });
+
+  return facts;
+}
+
 function decisionStatus(status: DecisionRecord["status"]) {
   if (status === "completed") return "implemented";
   if (status === "superseded") return "expired";
@@ -329,7 +431,7 @@ const UPSERT_ENTITIES_SQL = `
       source_type text, source_account_id text, source_id text
     )
   )
-  INSERT INTO ops_memory.entities (
+  INSERT INTO ops_memory.entities AS current_entity (
     id, organization_id, entity_type, canonical_key, display_name, summary,
     attributes, confidence, source_object_id, source_event_id, first_seen_at,
     last_seen_at, valid_from
@@ -345,14 +447,46 @@ const UPSERT_ENTITIES_SQL = `
     AND so.source_id = i.source_id
   ON CONFLICT (organization_id, entity_type, canonical_key) WHERE deleted_at IS NULL
   DO UPDATE SET
-    display_name = EXCLUDED.display_name,
-    summary = EXCLUDED.summary,
-    attributes = EXCLUDED.attributes,
-    confidence = EXCLUDED.confidence,
-    source_object_id = EXCLUDED.source_object_id,
-    source_event_id = EXCLUDED.source_event_id,
-    last_seen_at = EXCLUDED.last_seen_at,
-    valid_from = EXCLUDED.valid_from,
+    display_name = CASE WHEN EXISTS (
+      SELECT 1 FROM ops_memory.source_objects controlled_source
+      WHERE controlled_source.id = current_entity.source_object_id
+        AND controlled_source.source_type = 'ops_action'
+    ) THEN current_entity.display_name ELSE EXCLUDED.display_name END,
+    summary = CASE WHEN EXISTS (
+      SELECT 1 FROM ops_memory.source_objects controlled_source
+      WHERE controlled_source.id = current_entity.source_object_id
+        AND controlled_source.source_type = 'ops_action'
+    ) THEN current_entity.summary ELSE EXCLUDED.summary END,
+    attributes = CASE WHEN EXISTS (
+      SELECT 1 FROM ops_memory.source_objects controlled_source
+      WHERE controlled_source.id = current_entity.source_object_id
+        AND controlled_source.source_type = 'ops_action'
+    ) THEN EXCLUDED.attributes || current_entity.attributes ELSE EXCLUDED.attributes END,
+    confidence = CASE WHEN EXISTS (
+      SELECT 1 FROM ops_memory.source_objects controlled_source
+      WHERE controlled_source.id = current_entity.source_object_id
+        AND controlled_source.source_type = 'ops_action'
+    ) THEN current_entity.confidence ELSE EXCLUDED.confidence END,
+    source_object_id = CASE WHEN EXISTS (
+      SELECT 1 FROM ops_memory.source_objects controlled_source
+      WHERE controlled_source.id = current_entity.source_object_id
+        AND controlled_source.source_type = 'ops_action'
+    ) THEN current_entity.source_object_id ELSE EXCLUDED.source_object_id END,
+    source_event_id = CASE WHEN EXISTS (
+      SELECT 1 FROM ops_memory.source_objects controlled_source
+      WHERE controlled_source.id = current_entity.source_object_id
+        AND controlled_source.source_type = 'ops_action'
+    ) THEN current_entity.source_event_id ELSE EXCLUDED.source_event_id END,
+    last_seen_at = CASE WHEN EXISTS (
+      SELECT 1 FROM ops_memory.source_objects controlled_source
+      WHERE controlled_source.id = current_entity.source_object_id
+        AND controlled_source.source_type = 'ops_action'
+    ) THEN GREATEST(current_entity.last_seen_at, EXCLUDED.last_seen_at) ELSE EXCLUDED.last_seen_at END,
+    valid_from = CASE WHEN EXISTS (
+      SELECT 1 FROM ops_memory.source_objects controlled_source
+      WHERE controlled_source.id = current_entity.source_object_id
+        AND controlled_source.source_type = 'ops_action'
+    ) THEN current_entity.valid_from ELSE EXCLUDED.valid_from END,
     deleted_at = NULL,
     updated_at = now()
 `;
@@ -397,6 +531,60 @@ const UPSERT_RELATIONS_SQL = `
     observed_at = EXCLUDED.observed_at,
     valid_from = EXCLUDED.valid_from,
     valid_to = EXCLUDED.valid_to,
+    deleted_at = NULL,
+    updated_at = now()
+`;
+
+const UPSERT_FACTS_SQL = `
+  WITH incoming AS (
+    SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(
+      id uuid, organization_id uuid, subject_key text, fact_type text,
+      fact_key text, value_text text, value_number numeric, value_boolean boolean,
+      value_date timestamptz, value_json jsonb, unit text, confidence numeric,
+      status text, observed_at timestamptz, valid_from timestamptz,
+      valid_to timestamptz, source_type text, source_account_id text,
+      source_id text, confidentiality text
+    )
+  )
+  INSERT INTO ops_memory.facts (
+    id, organization_id, subject_entity_id, fact_type, fact_key,
+    value_text, value_number, value_boolean, value_date, value_json, unit,
+    confidence, status, observed_at, valid_from, valid_to, source_event_id,
+    source_object_id, confidentiality
+  )
+  SELECT i.id, i.organization_id, subject.id, i.fact_type, i.fact_key,
+    i.value_text, i.value_number, i.value_boolean, i.value_date, i.value_json,
+    i.unit, i.confidence, i.status, i.observed_at, i.valid_from, i.valid_to,
+    source.last_event_id, source.id, i.confidentiality
+  FROM incoming i
+  JOIN ops_memory.entities subject
+    ON subject.organization_id = i.organization_id
+    AND subject.canonical_key = i.subject_key
+    AND subject.deleted_at IS NULL
+  JOIN ops_memory.source_objects source
+    ON source.organization_id = i.organization_id
+    AND source.source_type = i.source_type
+    AND source.source_account_id = i.source_account_id
+    AND source.source_id = i.source_id
+    AND source.deleted_at IS NULL
+  ON CONFLICT (id) DO UPDATE SET
+    subject_entity_id = EXCLUDED.subject_entity_id,
+    fact_type = EXCLUDED.fact_type,
+    fact_key = EXCLUDED.fact_key,
+    value_text = EXCLUDED.value_text,
+    value_number = EXCLUDED.value_number,
+    value_boolean = EXCLUDED.value_boolean,
+    value_date = EXCLUDED.value_date,
+    value_json = EXCLUDED.value_json,
+    unit = EXCLUDED.unit,
+    confidence = EXCLUDED.confidence,
+    status = EXCLUDED.status,
+    observed_at = EXCLUDED.observed_at,
+    valid_from = EXCLUDED.valid_from,
+    valid_to = EXCLUDED.valid_to,
+    source_event_id = EXCLUDED.source_event_id,
+    source_object_id = EXCLUDED.source_object_id,
+    confidentiality = EXCLUDED.confidentiality,
     deleted_at = NULL,
     updated_at = now()
 `;
@@ -766,6 +954,30 @@ export async function loadAtelierUniverseToCentralMemory(
     });
     await batchJson(client, UPSERT_RELATIONS_SQL, relationRows, batchSize);
 
+    const factRows = deterministicSeedFacts(universe).map((fact) => ({
+      id: deterministicMemoryUuid(`${organizationId}:fact:${fact.id}`),
+      organization_id: organizationId,
+      subject_key: fact.subjectKey,
+      fact_type: fact.factType,
+      fact_key: fact.factKey,
+      value_text: typeof fact.value === "string" ? fact.value : null,
+      value_number: typeof fact.value === "number" ? fact.value : null,
+      value_boolean: typeof fact.value === "boolean" ? fact.value : null,
+      value_date: null,
+      value_json: null,
+      unit: fact.unit,
+      confidence: fact.confidence,
+      status: "asserted",
+      observed_at: fact.observedAt,
+      valid_from: fact.validFrom,
+      valid_to: fact.validTo,
+      source_type: fact.source.trace.source,
+      source_account_id: sourceAccountId,
+      source_id: fact.source.trace.sourceId,
+      confidentiality: fact.source.confidentiality,
+    }));
+    await batchJson(client, UPSERT_FACTS_SQL, factRows, batchSize);
+
     const metricRows = universe.metrics.map((metric) => {
       const dimensions = {
         ...metric.dimensions,
@@ -879,6 +1091,7 @@ export async function loadAtelierUniverseToCentralMemory(
       sourceObjects: sourceObjectRows.length,
       entities: entityRows.length,
       relations: relationRows.length,
+      facts: factRows.length,
       metricObservations: metricRows.length,
       commitments: commitmentRows.length,
       decisions: decisionRows.length,

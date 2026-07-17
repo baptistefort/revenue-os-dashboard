@@ -67,12 +67,16 @@ class CompanyStateQueryable implements SqlQueryable {
         metric("seo.keyword_clicks_menuiserie_paris", 50, "SEO-DAY-20260716-KEYWORD", "2026-07-16"),
         metric("seo.conversions", 7, "SEO-CONV-2026-07"),
         metric("google-ads.spend", 685, "GOOGLE-ADS-SPEND-2026-07"),
+        metric("google-ads.clicks", 428, "GOOGLE-ADS-CLICKS-2026-07"),
         metric("google-ads.qualified_leads", 12, "GOOGLE-ADS-LEADS-2026-07"),
         metric("google-ads.pipeline", 57_950, "GOOGLE-ADS-PIPE-2026-07"),
         metric("meta-ads.spend", 304, "META-ADS-SPEND-2026-07"),
         metric("meta-ads.qualified_leads", 4, "META-ADS-LEADS-2026-07"),
         metric("meta-ads.pipeline", 9_720, "META-ADS-PIPE-2026-07"),
         metric("instagram.spend", 0, "INSTAGRAM-SPEND-2026-07"),
+        metric("instagram.views", 18_400, "INSTAGRAM-VIEWS-2026-07"),
+        metric("instagram.saves", 612, "INSTAGRAM-SAVES-2026-07"),
+        metric("instagram.opportunities", 1, "INSTAGRAM-OPPORTUNITIES-2026-07"),
         metric("instagram.qualified_leads", 7, "INSTAGRAM-LEADS-2026-07"),
         metric("instagram.pipeline", 20_100, "INSTAGRAM-PIPE-2026-07"),
         metric("linkedin.spend", 123, "LINKEDIN-SPEND-2026-07"),
@@ -131,6 +135,9 @@ test("buildCentralCompanyState exposes the tenant-scoped operational truth", asy
   assert.equal(state.acquisition.attributedPipeline, 100_800);
   assert.equal(state.acquisition.qualifiedLeads, 27);
   assert.equal(state.googleAds.spend, 685);
+  assert.equal(state.googleAds.clicks, 428);
+  assert.equal(state.instagram.views, 18_400);
+  assert.equal(state.instagram.saves, 612);
   assert.equal(state.instagram.opportunities, 1);
   assert.equal(state.meta.attributedPipeline, 9_720);
   assert.equal(state.vault.recordCount, 1_399);

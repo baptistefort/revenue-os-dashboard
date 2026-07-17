@@ -17,6 +17,14 @@ test("relative date extraction follows the configured business date", () => {
       "2026-07-17",
     ]);
     assert.deepEqual(centralMemoryRequestedDays("Analyse avant-hier"), ["2026-07-15"]);
+    assert.deepEqual(
+      centralMemoryRequestedDays("Compare le SEO du 16 juillet 2026 à la veille"),
+      ["2026-07-15", "2026-07-16"],
+    );
+    assert.deepEqual(
+      centralMemoryRequestedDays("Compare 2026-07-16 au jour d'avant"),
+      ["2026-07-15", "2026-07-16"],
+    );
   } finally {
     if (previous === undefined) delete process.env.OPS_BUSINESS_DATE;
     else process.env.OPS_BUSINESS_DATE = previous;

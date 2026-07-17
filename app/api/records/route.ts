@@ -30,6 +30,7 @@ import {
   type CentralUiRecord,
   type CentralUiRecordKind,
 } from "@/lib/central-memory/records";
+import { projectCentralMemoryRecordToObsidian } from "@/lib/central-memory/obsidian-projection";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -542,6 +543,12 @@ export async function PATCH(request: Request) {
     let result: ObsidianWriteResult;
     try {
       result = await persistRecordProjection(hasExistingProjection, projectionInput);
+      if (centralMutation.centralMemory) {
+        await projectCentralMemoryRecordToObsidian({
+          vaultRoot: await resolveOpsDemoVaultRoot(),
+          recordKey: record.id,
+        });
+      }
     } catch (projectionError) {
       if (centralMutation.centralMemory) {
         try {
@@ -694,6 +701,12 @@ export async function POST(request: Request) {
       approvedBy: "Marie Delmas",
       projectToObsidian: (candidate, context) => (
         projectOpsAgentActionToObsidian(candidate as OpsAgentAction, context)
+      ),
+      projectCentralRecordToObsidian: async (context) => (
+        projectCentralMemoryRecordToObsidian({
+          vaultRoot: await resolveOpsDemoVaultRoot(),
+          recordKey: context.recordId,
+        })
       ),
     });
     return NextResponse.json(

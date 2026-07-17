@@ -60,6 +60,9 @@ export type ControlledActionExecutorOptions = {
     action: ExecutableOpsAction,
     context: ControlledActionProjectionContext,
   ) => Promise<ObsidianWriteResult>;
+  projectCentralRecordToObsidian?: (
+    context: ControlledActionProjectionContext,
+  ) => Promise<unknown>;
 };
 
 export type ControlledRecordMutation = {
@@ -315,45 +318,188 @@ async function writeBusinessRecord(
       input.eventId,
       input.sourceObjectId,
     ]);
-    return;
   }
+}
 
-  if (input.actionType === "create_opportunity" || input.actionType === "create_client") {
-    const attributes = {
-      ...input.action,
-      type: input.actionType,
-      record_kind: input.actionType === "create_client" ? "client" : "opportunity",
-      central_record_id: input.recordId,
-    };
+type GraphRecordKind = "email" | "opportunity" | "task" | "client";
+
+function actionGraphKind(actionType: CanonicalOpsActionType): GraphRecordKind {
+  if (actionType === "create_opportunity") return "opportunity";
+  if (actionType === "create_task") return "task";
+  if (actionType === "create_client") return "client";
+  return "email";
+}
+
+function graphEntityType(kind: GraphRecordKind) {
+  return kind === "email" ? "email-thread" : kind;
+}
+
+function graphEntitySummary(kind: GraphRecordKind, title: string) {
+  if (kind === "client") return `${title}, compte suivi dans OPS.`;
+  if (kind === "opportunity") return `${title}, opportunité suivie dans le pipeline OPS.`;
+  if (kind === "task") return `${title}, engagement planifié et suivi dans OPS.`;
+  return `${title}, conversation suivie dans la mémoire OPS.`;
+}
+
+function graphRelationHints(attributes: Record<string, unknown>) {
+  const hints: Array<{ target: string; predicate: string }> = [];
+  const seen = new Set<string>();
+  const add = (target: unknown, predicate: string) => {
+    if (typeof target !== "string") return;
+    const normalized = target.trim();
+    if (!normalized || normalized.length > 240) return;
+    const key = `${predicate}:${normalized.toLocaleLowerCase("fr")}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    hints.push({ target: normalized, predicate });
+  };
+  if (Array.isArray(attributes.linked)) {
+    for (const target of attributes.linked.slice(0, 20)) add(target, "linked_to");
+  }
+  add(attributes.threadId, "continues_thread");
+  add(attributes.company, "concerns_company");
+  add(attributes.project, "concerns_project");
+  return hints;
+}
+
+/** Keeps the graph hot path in the same transaction as the business write. */
+async function upsertGraphEntity(
+  client: TransactionClient,
+  input: {
+    organizationId: string;
+    eventId: string;
+    sourceObjectId: string;
+    recordId: string;
+    title: string;
+    kind: GraphRecordKind;
+    attributes: Record<string, unknown>;
+    occurredAt: string;
+    archived?: boolean;
+  },
+) {
+  const entityType = graphEntityType(input.kind);
+  const attributes = {
+    ...input.attributes,
+    id: input.recordId,
+    central_record_id: input.recordId,
+    record_kind: input.kind,
+  };
+  const entity = await client.query<{ id: string }>(`
+    INSERT INTO ops_memory.entities (
+      organization_id, entity_type, canonical_key, display_name, summary,
+      attributes, confidence, status, source_event_id, source_object_id,
+      first_seen_at, last_seen_at
+    ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, 1, $7, $8, $9, $10, $10)
+    ON CONFLICT (organization_id, entity_type, canonical_key) WHERE deleted_at IS NULL
+    DO UPDATE SET
+      display_name = EXCLUDED.display_name,
+      summary = EXCLUDED.summary,
+      attributes = ops_memory.entities.attributes || EXCLUDED.attributes,
+      status = EXCLUDED.status,
+      source_event_id = EXCLUDED.source_event_id,
+      source_object_id = EXCLUDED.source_object_id,
+      last_seen_at = EXCLUDED.last_seen_at,
+      deleted_at = NULL,
+      updated_at = now()
+    RETURNING id
+  `, [
+    input.organizationId,
+    entityType,
+    // Seeded entities keep their public OPS identifier as the canonical key
+    // (for example OPP-401). PostgreSQL's unique index is case-sensitive, so
+    // normalising only UI mutations to lower case would create a second entity
+    // instead of updating the seeded one.
+    input.recordId,
+    input.title,
+    graphEntitySummary(input.kind, input.title),
+    stableJson(attributes),
+    input.archived ? "archived" : "active",
+    input.eventId,
+    input.sourceObjectId,
+    input.occurredAt,
+  ]);
+  const entityId = entity.rows[0]?.id;
+  if (!entityId) throw new ControlledActionError("action_failed", "The graph entity could not be persisted.");
+
+  await client.query(`
+    INSERT INTO ops_memory.relations (
+      organization_id, subject_entity_id, predicate, object_entity_id,
+      properties, confidence, source_event_id, source_object_id,
+      evidence_text, observed_at
+    )
+    SELECT $1, organization_entity.id, 'contains', $2,
+      $3::jsonb, 1, $4, $5, $6, $7
+    FROM ops_memory.entities organization_entity
+    WHERE organization_entity.organization_id = $1
+      AND organization_entity.entity_type = 'organization'
+      AND organization_entity.deleted_at IS NULL
+      AND organization_entity.id <> $2
+    ORDER BY organization_entity.last_seen_at DESC
+    LIMIT 1
+    ON CONFLICT (organization_id, subject_entity_id, predicate, object_entity_id)
+      WHERE deleted_at IS NULL
+    DO UPDATE SET
+      properties = EXCLUDED.properties,
+      source_event_id = EXCLUDED.source_event_id,
+      source_object_id = EXCLUDED.source_object_id,
+      evidence_text = EXCLUDED.evidence_text,
+      observed_at = EXCLUDED.observed_at,
+      deleted_at = NULL,
+      updated_at = now()
+  `, [
+    input.organizationId,
+    entityId,
+    stableJson({ provenance: "ops_ui_mutation", record_kind: input.kind }),
+    input.eventId,
+    input.sourceObjectId,
+    `Créé ou actualisé depuis l'interface OPS : ${input.recordId}.`,
+    input.occurredAt,
+  ]);
+
+  const relationHints = graphRelationHints(input.attributes);
+  if (relationHints.length) {
     await client.query(`
-      INSERT INTO ops_memory.entities (
-        organization_id, entity_type, canonical_key, display_name, summary,
-        attributes, confidence, status, source_event_id, source_object_id,
-        first_seen_at, last_seen_at
-      ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, 1, 'active', $7, $8, $9, $9)
-      ON CONFLICT (organization_id, entity_type, canonical_key) WHERE deleted_at IS NULL
+      WITH hints AS (
+        SELECT * FROM jsonb_to_recordset($3::jsonb) AS x(target text, predicate text)
+      )
+      INSERT INTO ops_memory.relations (
+        organization_id, subject_entity_id, predicate, object_entity_id,
+        properties, confidence, source_event_id, source_object_id,
+        evidence_text, observed_at
+      )
+      SELECT $1, $2, hints.predicate, related.id,
+        jsonb_build_object('provenance', 'ops_ui_mutation', 'hint', hints.target),
+        1, $4, $5, $6, $7
+      FROM hints
+      JOIN ops_memory.entities related
+        ON related.organization_id = $1
+        AND related.deleted_at IS NULL
+        AND related.id <> $2
+        AND (
+          lower(related.canonical_key) = lower(hints.target)
+          OR lower(related.display_name) = lower(hints.target)
+        )
+      ON CONFLICT (organization_id, subject_entity_id, predicate, object_entity_id)
+        WHERE deleted_at IS NULL
       DO UPDATE SET
-        display_name = EXCLUDED.display_name,
-        summary = EXCLUDED.summary,
-        attributes = ops_memory.entities.attributes || EXCLUDED.attributes,
+        properties = EXCLUDED.properties,
         source_event_id = EXCLUDED.source_event_id,
         source_object_id = EXCLUDED.source_object_id,
-        last_seen_at = EXCLUDED.last_seen_at,
-        deleted_at = NULL
+        evidence_text = EXCLUDED.evidence_text,
+        observed_at = EXCLUDED.observed_at,
+        deleted_at = NULL,
+        updated_at = now()
     `, [
       input.organizationId,
-      input.actionType === "create_client" ? "client" : "opportunity",
-      input.recordId.toLocaleLowerCase("en"),
-      input.title,
-      input.actionType === "create_client"
-        ? `${input.title}, compte suivi dans OPS.`
-        : `${input.title}, opportunité suivie dans le pipeline OPS.`,
-      stableJson(attributes),
+      entityId,
+      stableJson(relationHints),
       input.eventId,
       input.sourceObjectId,
+      `Relations métier actualisées depuis l'interface OPS : ${input.recordId}.`,
       input.occurredAt,
     ]);
   }
+  return entityId;
 }
 
 async function insertAudit(
@@ -530,6 +676,16 @@ async function writeCentralAction(
       actionType,
       occurredAt,
     });
+    await upsertGraphEntity(client, {
+      organizationId,
+      eventId,
+      sourceObjectId,
+      recordId,
+      title,
+      kind: actionGraphKind(actionType),
+      attributes: { ...action, action_type: actionType },
+      occurredAt,
+    });
 
     if (actionType === "send_email" && !receipt) {
       throw new ControlledActionError(
@@ -687,13 +843,15 @@ export async function executeControlledOpsAction(
     now,
   });
   try {
-    const projection = await options.projectToObsidian(action, {
+    const projectionContext: ControlledActionProjectionContext = {
       actionRunId: written.actionRunId,
       actionType,
       recordId: written.recordId,
       idempotencyKey,
       receipt: written.receipt,
-    });
+    };
+    const projection = await options.projectToObsidian(action, projectionContext);
+    await options.projectCentralRecordToObsidian?.(projectionContext);
     await markProjection(pool, {
       organizationSlug,
       actionRunId: written.actionRunId,
@@ -904,36 +1062,19 @@ export async function mirrorControlledRecordMutation(
         eventId,
         sourceObject.rows[0].id,
       ]);
-    } else if (mutation.kind === "client" || mutation.kind === "opportunity") {
-      await client.query(`
-        UPDATE ops_memory.entities SET
-          display_name = COALESCE($3, display_name),
-          attributes = attributes || $4::jsonb,
-          status = CASE WHEN $5 THEN 'archived' ELSE status END,
-          source_event_id = $6,
-          source_object_id = $7,
-          last_seen_at = $8
-        WHERE organization_id = $1
-          AND entity_type = $2
-          AND (
-            canonical_key = $9
-            OR attributes ->> 'central_record_id' = $10
-            OR attributes ->> 'id' = $10
-          )
-          AND deleted_at IS NULL
-      `, [
-        organizationId,
-        mutation.kind,
-        typeof mutation.patch.name === "string" ? mutation.patch.name : null,
-        stableJson(mutation.patch),
-        mutation.patch.archived === true,
-        eventId,
-        sourceObject.rows[0].id,
-        occurredAt,
-        id.toLocaleLowerCase("en"),
-        id,
-      ]);
     }
+
+    await upsertGraphEntity(client, {
+      organizationId,
+      eventId,
+      sourceObjectId: sourceObject.rows[0].id,
+      recordId: id,
+      title: mutation.title,
+      kind: mutation.kind,
+      attributes: mutation.patch,
+      occurredAt,
+      archived: mutation.patch.archived === true,
+    });
 
     await client.query(`
       INSERT INTO ops_memory.knowledge_projections (

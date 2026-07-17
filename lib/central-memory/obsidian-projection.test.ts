@@ -5,7 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import type { QueryResult, QueryResultRow } from "pg";
 import type { SqlQueryable } from "./database";
-import { projectCentralMemoryToObsidian } from "./obsidian-projection";
+import {
+  projectCentralMemoryRecordToObsidian,
+  projectCentralMemoryToObsidian,
+} from "./obsidian-projection";
 
 const organization = {
   id: "00000000-0000-4000-8000-000000000001",
@@ -73,6 +76,24 @@ function fakeQueryable(state: {
         return queryResult([organization] as unknown as Row[]);
       }
       assert.equal(values?.[0], organization.id, "every projection query must be tenant scoped");
+      if (sql.includes("lower(entities.canonical_key) = lower($2)")) {
+        const recordKey = String(values?.[1] ?? "").toLocaleLowerCase("en");
+        return queryResult(state.entities.filter((item) => (
+          item.canonical_key.toLocaleLowerCase("en") === recordKey
+          || String((item.attributes as Record<string, unknown>)?.central_record_id ?? "").toLocaleLowerCase("en") === recordKey
+          || String(item.source_id ?? "").toLocaleLowerCase("en") === recordKey
+        )).slice(0, 1) as unknown as Row[]);
+      }
+      if (sql.includes("entities.id = ANY($2::uuid[])")) {
+        const selected = new Set((values?.[1] ?? []) as string[]);
+        return queryResult(state.entities.filter((item) => selected.has(item.id)) as unknown as Row[]);
+      }
+      if (sql.includes("relations.subject_entity_id = $2 OR relations.object_entity_id = $2")) {
+        const entityId = String(values?.[1] ?? "");
+        return queryResult(state.relations.filter((item) => (
+          item.subject_id === entityId || item.object_id === entityId
+        )) as unknown as Row[]);
+      }
       if (sql.includes("FROM ops_memory.entities") && !sql.includes("FROM ops_memory.relations")) {
         return queryResult(state.entities as unknown as Row[]);
       }
@@ -214,6 +235,121 @@ test("incremental projection updates changed notes and only removes manifest-man
     assert.deepEqual(second.deleted, [contactFile]);
     assert.ok(second.updated.some((file) => file.startsWith("Clients/")));
     assert.equal(await fs.readFile(manual, "utf8"), "Cette note appartient à l'utilisateur.\n");
+  } finally {
+    await fs.rm(vault, { recursive: true, force: true });
+  }
+});
+
+test("a hot UI mutation projects only its entity and preserves the full Central manifest", async () => {
+  const vault = await fs.mkdtemp(path.join(os.tmpdir(), "ops-central-hot-record-"));
+  try {
+    const opportunityId = "00000000-0000-4000-8000-000000000020";
+    const state = {
+      entities: [
+        entity({}),
+        entity({
+          id: "00000000-0000-4000-8000-000000000011",
+          canonical_key: "CLIENT-001",
+          entity_type: "client",
+          display_name: "Vitreflam",
+        }),
+      ],
+      relations: [] as Array<ReturnType<typeof relation>>,
+    };
+    const { queryable, calls } = fakeQueryable(state);
+    const full = await projectCentralMemoryToObsidian({ vaultRoot: vault, queryable });
+    assert.equal(full.created.length, 2);
+    const previousFiles = JSON.parse(
+      await fs.readFile(path.join(vault, "Central", ".ops-central-memory-manifest.json"), "utf8"),
+    ) as { files: string[] };
+
+    state.entities.push(entity({
+      id: opportunityId,
+      canonical_key: "opp-hot-001",
+      entity_type: "opportunity",
+      display_name: "Extension Vitreflam",
+      summary: "Opportunité créée depuis le pipeline OPS.",
+      attributes: { central_record_id: "OPP-HOT-001", amount: 48_000 },
+      source_type: "ops_action",
+      source_id: "OPP-HOT-001",
+    }));
+    state.relations.push(relation({
+      id: "00000000-0000-4000-8000-000000000120",
+      subject_id: "00000000-0000-4000-8000-000000000010",
+      subject_key: "ORG-001",
+      subject_name: "Atelier Beaumarchais",
+      predicate: "contains",
+      object_id: opportunityId,
+      object_key: "opp-hot-001",
+      object_name: "Extension Vitreflam",
+    }));
+    const callCountBeforeHotPath = calls.length;
+    const projected = await projectCentralMemoryRecordToObsidian({
+      vaultRoot: vault,
+      queryable,
+      recordKey: "OPP-HOT-001",
+    });
+    assert.equal(projected.created, true);
+    assert.equal(projected.updated, false);
+    assert.match(projected.relativePath, /^Opportunites\//);
+    const hotCalls = calls.slice(callCountBeforeHotPath);
+    assert.ok(hotCalls.some(({ sql }) => sql.includes("lower(entities.canonical_key) = lower($2)")));
+    assert.ok(hotCalls.every(({ sql }) => !sql.includes("ORDER BY entities.entity_type, entities.canonical_key")));
+
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(vault, "Central", ".ops-central-memory-manifest.json"), "utf8"),
+    ) as { files: string[] };
+    for (const file of previousFiles.files) assert.ok(manifest.files.includes(file));
+    assert.ok(manifest.files.includes(projected.relativePath));
+    const note = await fs.readFile(path.join(vault, "Central", projected.relativePath), "utf8");
+    assert.match(note, /canonical_key: "opp-hot-001"/);
+    assert.match(note, /`contains`/);
+    assert.match(note, /\[\[Central\/Entreprise\//);
+
+    const replay = await projectCentralMemoryRecordToObsidian({
+      vaultRoot: vault,
+      queryable,
+      recordKey: "OPP-HOT-001",
+    });
+    assert.equal(replay.unchanged, true);
+  } finally {
+    await fs.rm(vault, { recursive: true, force: true });
+  }
+});
+
+test("a renamed hot entity replaces only its former managed file", async () => {
+  const vault = await fs.mkdtemp(path.join(os.tmpdir(), "ops-central-hot-rename-"));
+  try {
+    const state = {
+      entities: [entity({
+        id: "00000000-0000-4000-8000-000000000030",
+        canonical_key: "task-hot-001",
+        entity_type: "task",
+        display_name: "Préparer le rendez-vous",
+        attributes: { central_record_id: "TASK-HOT-001" },
+        source_type: "ops_action",
+        source_id: "TASK-HOT-001",
+      })],
+      relations: [] as Array<ReturnType<typeof relation>>,
+    };
+    const { queryable } = fakeQueryable(state);
+    const first = await projectCentralMemoryRecordToObsidian({
+      vaultRoot: vault,
+      queryable,
+      recordKey: "TASK-HOT-001",
+    });
+    const manual = path.join(vault, "Central", "Taches", "Note manuelle.md");
+    await fs.writeFile(manual, "Toujours préserver.\n", "utf8");
+    state.entities[0] = { ...state.entities[0], display_name: "Préparer le rendez-vous Vitreflam" };
+    const second = await projectCentralMemoryRecordToObsidian({
+      vaultRoot: vault,
+      queryable,
+      recordKey: "TASK-HOT-001",
+    });
+    assert.equal(second.created, true);
+    assert.deepEqual(second.deleted, [first.relativePath]);
+    await assert.rejects(() => fs.access(path.join(vault, "Central", first.relativePath)));
+    assert.equal(await fs.readFile(manual, "utf8"), "Toujours préserver.\n");
   } finally {
     await fs.rm(vault, { recursive: true, force: true });
   }

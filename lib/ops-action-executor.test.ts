@@ -51,6 +51,9 @@ class FakeCentralMemory {
   actionRun: StoredActionRun | null = null;
   sourceObjectWrites = 0;
   entityWrites = 0;
+  entityCanonicalKeys: string[] = [];
+  relationWrites = 0;
+  relationHintPayloads: Array<Array<{ target: string; predicate: string }>> = [];
   taskWrites = 0;
   insertedTaskStatus = "";
   taskUpdates = 0;
@@ -103,6 +106,14 @@ class FakeCentralMemory {
     }
     if (normalized.startsWith("INSERT INTO ops_memory.entities")) {
       this.entityWrites += 1;
+      this.entityCanonicalKeys.push(String(values[2]));
+      return { rows: [{ id: `entity-${this.entityWrites}` }], rowCount: 1, command: "INSERT", oid: 0, fields: [] };
+    }
+    if (normalized.includes("INSERT INTO ops_memory.relations")) {
+      this.relationWrites += 1;
+      if (normalized.includes("jsonb_to_recordset($3::jsonb)")) {
+        this.relationHintPayloads.push(JSON.parse(String(values[2])));
+      }
       return { rows: [], rowCount: 1, command: "INSERT", oid: 0, fields: [] };
     }
     if (normalized.startsWith("INSERT INTO ops_memory.tasks")) {
@@ -243,6 +254,10 @@ test("un email contrôlé est commité, audité et reçu avant d'être projeté"
       assert.equal(context.receipt?.networkDelivery, false);
       return projectedRecord(context.recordId, "Compte rendu");
     },
+    projectCentralRecordToObsidian: async (context) => {
+      assert.match(context.recordId, /^EMAIL-SENT-/);
+      memory.events.push("central_record_projected");
+    },
   });
 
   assert.equal(result.centralMemory, true);
@@ -252,9 +267,18 @@ test("un email contrôlé est commité, audité et reçu avant d'être projeté"
   assert.equal(result.receipt?.networkDelivery, false);
   assert.equal(memory.actionRun?.status, "succeeded");
   assert.equal(memory.sourceObjectWrites, 1);
+  assert.equal(memory.entityWrites, 1);
+  assert.match(memory.entityCanonicalKeys[0] || "", /^EMAIL-SENT-/);
+  assert.equal(memory.relationWrites, 2);
+  assert.deepEqual(memory.relationHintPayloads[0], [
+    { target: "THREAD-VITREFLAM-001", predicate: "continues_thread" },
+    { target: "Vitreflam", predicate: "concerns_company" },
+  ]);
   assert.equal(memory.auditWrites, 1);
   assert.equal(memory.projectionStatus, "projected");
   assert.ok(memory.events.indexOf("commit") < memory.events.indexOf("obsidian_projected"));
+  assert.ok(memory.events.indexOf("obsidian_projected") < memory.events.indexOf("central_record_projected"));
+  assert.ok(memory.events.indexOf("central_record_projected") < memory.events.indexOf("projection_projected"));
 });
 
 test("la même idempotency_key ne crée jamais deux actions métier", async () => {
@@ -310,6 +334,39 @@ test("une projection Obsidian en échec est marquée et peut être rejouée sans
   assert.equal(memory.projectionStatus, "projected");
 });
 
+test("une projection Central ciblée en échec reste rejouable sans dupliquer la mutation", async () => {
+  const memory = new FakeCentralMemory();
+  await assert.rejects(
+    executeControlledOpsAction(opportunity, {
+      pool: memory.pool(),
+      idempotencyKey: "central-projection-retry-001",
+      projectToObsidian: async (_action, context) => (
+        projectedRecord(context.recordId, "Extension Galerie Voltaire")
+      ),
+      projectCentralRecordToObsidian: async () => {
+        throw new Error("central vault temporarily unavailable");
+      },
+    }),
+    (error: unknown) => (
+      error instanceof ControlledActionError && error.code === "projection_failed"
+    ),
+  );
+  assert.equal(memory.projectionStatus, "failed");
+  const retried = await executeControlledOpsAction(opportunity, {
+    pool: memory.pool(),
+    idempotencyKey: "central-projection-retry-001",
+    projectToObsidian: async (_action, context) => (
+      projectedRecord(context.recordId, "Extension Galerie Voltaire")
+    ),
+    projectCentralRecordToObsidian: async () => undefined,
+  });
+  assert.equal(retried.replayed, true);
+  assert.equal(memory.sourceObjectWrites, 1);
+  assert.equal(memory.entityWrites, 1);
+  assert.equal(memory.relationWrites, 2);
+  assert.equal(memory.projectionStatus, "projected");
+});
+
 test("create_task écrit la table métier dédiée dans la même transaction", async () => {
   const memory = new FakeCentralMemory();
   const task: ExecutableOpsAction = {
@@ -334,6 +391,12 @@ test("create_task écrit la table métier dédiée dans la même transaction", a
     ),
   });
   assert.equal(memory.taskWrites, 1);
+  assert.equal(memory.entityWrites, 1);
+  assert.equal(memory.relationWrites, 2);
+  assert.deepEqual(memory.relationHintPayloads[0], [
+    { target: "PROJET-241", predicate: "linked_to" },
+    { target: "Rivoli", predicate: "concerns_project" },
+  ]);
   assert.equal(memory.insertedTaskStatus, "in_progress");
   assert.equal(memory.sourceObjectWrites, 1);
   assert.equal(memory.auditWrites, 1);
@@ -365,6 +428,9 @@ test("un PATCH UI est journalisé dans action_runs et répercuté dans la mémoi
   assert.equal(first.replayed, false);
   assert.equal(replay.replayed, true);
   assert.equal(memory.taskUpdates, 1);
+  assert.equal(memory.entityWrites, 1);
+  assert.deepEqual(memory.entityCanonicalKeys, ["TASK-RIVOLI-001"]);
+  assert.equal(memory.relationWrites, 1);
   assert.equal(memory.sourceObjectWrites, 1);
   assert.equal(memory.auditWrites, 1);
 });
